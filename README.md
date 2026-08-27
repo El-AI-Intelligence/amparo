@@ -35,6 +35,12 @@ commercial implementation of the same interface. Anyone can write another. The
 default is **deny**, not allow — an agent whose policy engine waves everything
 through is worse than one with no policy engine, because it looks safe.
 
+**Engram is recommended, never required.** Memory is an interface with a
+built-in default store; [Engram](https://github.com/El-AI-Intelligence/Engram)
+is the recommended memory backend — durable, private, syncable across devices —
+but Amparo runs without it. Amparo must never hard-depend on a memory product,
+its own or anyone else's.
+
 **Deployable anywhere.** A standalone server, a container, a systemd unit, a
 chat bot. Not welded to a desktop session, not dependent on a GUI.
 
