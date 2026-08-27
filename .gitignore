@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment / secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Local agent state
+/data/
+/state/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
