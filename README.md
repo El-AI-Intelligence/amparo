@@ -74,4 +74,4 @@ matters more than usual for software that executes arbitrary code.
 
 Apache License 2.0 — see [LICENSE](LICENSE).
 
-Copyright 2026 El AI Intelligence, LLC.
+Copyright 2026 EL AI Intelligence, LLC.
