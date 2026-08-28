@@ -192,6 +192,10 @@ pub trait ToolExecutor: Send + Sync {
 // ─────────────────────────────────────────────── ToolRegistry ────────────────
 
 /// Central registry — holds all available tools, dispatches calls, exposes schemas.
+///
+/// Cheap to clone (the executors are `Arc`s behind one map), which is what
+/// lets hosts build one registry and hand a copy to each per-task agent.
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn ToolExecutor>>,
 }

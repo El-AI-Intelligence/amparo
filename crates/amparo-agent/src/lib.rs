@@ -68,4 +68,4 @@ pub use agent::{
     extract_target, Agent, AgentConfig, AgentReport, AgentStep, TaskStatus, Verification,
 };
 pub use approval::{ApprovalGate, ApprovalRequest, AutoApprove, AutoDeny};
-pub use events::{AgentEvent, EventSink, InMemoryEventSink};
+pub use events::{format_event, AgentEvent, EventSink, InMemoryEventSink};

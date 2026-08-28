@@ -136,6 +136,72 @@ impl EventSink for InMemoryEventSink {
     }
 }
 
+/// Long content is truncated to this many chars, plus an ellipsis.
+pub const TRUNCATE: usize = 200;
+
+/// Truncate `s` to [`TRUNCATE`] chars, appending `…` when anything was cut.
+pub fn truncate(s: &str) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(TRUNCATE).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// Render one event as one `[tag]` line. Pure — unit-testable without a sink.
+///
+/// This is the canonical human-readable form of an [`AgentEvent`]: the CLI
+/// prints it to stderr and chat adapters forward it to the chat.
+pub fn format_event(event: &AgentEvent) -> String {
+    match event {
+        AgentEvent::TaskStarted { prompt } => format!("[task] {}", truncate(prompt)),
+        AgentEvent::AssistantTurn { step, content, tool_calls } => {
+            let calls = if *tool_calls > 0 {
+                format!(" ({tool_calls} tool call(s))")
+            } else {
+                String::new()
+            };
+            format!("[turn {step}] {}{calls}", truncate(content))
+        }
+        AgentEvent::ToolCallRequested { call } => format!(
+            "[call] {} {}",
+            call.name,
+            truncate(&serde_json::to_string(&call.arguments).unwrap_or_default())
+        ),
+        AgentEvent::ToolGate { tool_name, decision, reasons, .. } => {
+            let why = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", truncate(&reasons.join("; ")))
+            };
+            format!("[gate] {tool_name}: {decision}{why}")
+        }
+        AgentEvent::ApprovalRequested { tool_name, reasons, .. } => {
+            format!("[approval] {tool_name}: {}", truncate(&reasons.join("; ")))
+        }
+        AgentEvent::ApprovalResolved { approved, .. } => {
+            format!("[approval] {}", if *approved { "granted" } else { "denied" })
+        }
+        AgentEvent::ToolExecuted { result } => {
+            format!("[exec] {} ({}ms)", result.tool_name, result.duration_ms)
+        }
+        AgentEvent::FinalAnswer { content } => format!("[answer] {}", truncate(content)),
+        AgentEvent::Verification { decision, feedback } => {
+            let detail = feedback
+                .as_ref()
+                .map(|f| format!(": {}", truncate(f)))
+                .unwrap_or_default();
+            format!("[verify] {decision}{detail}")
+        }
+        AgentEvent::TaskComplete { final_answer } => {
+            format!("[complete] {}", truncate(final_answer))
+        }
+        AgentEvent::TaskFailed { message } => format!("[failed] {}", truncate(message)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +253,93 @@ mod tests {
         assert_eq!(v["event"], "tool_gate");
         assert_eq!(v["decision"], "policy_denied");
         assert_eq!(v["reasons"][0], "rm with destructive flags");
+    }
+
+    fn make_call() -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: "run_command".into(),
+            arguments: json!({"command": "echo hi"}),
+        }
+    }
+
+    fn make_result() -> ToolResult {
+        ToolResult {
+            tool_call_id: "c1".into(),
+            tool_name: "run_command".into(),
+            success: true,
+            output: json!({}),
+            display_summary: "ok".into(),
+            duration_ms: 4,
+        }
+    }
+
+    #[test]
+    fn every_variant_renders_as_one_tagged_line() {
+        let cases: Vec<(&str, String)> = vec![
+            ("[task]", format_event(&AgentEvent::TaskStarted { prompt: "p".into() })),
+            (
+                "[turn",
+                format_event(&AgentEvent::AssistantTurn {
+                    step: 2,
+                    content: "hi".into(),
+                    tool_calls: 1,
+                }),
+            ),
+            ("[call]", format_event(&AgentEvent::ToolCallRequested { call: make_call() })),
+            (
+                "[gate]",
+                format_event(&AgentEvent::ToolGate {
+                    call_id: "c1".into(),
+                    tool_name: "run_command".into(),
+                    decision: "policy_denied".into(),
+                    reasons: vec!["rm".into()],
+                }),
+            ),
+            (
+                "[approval]",
+                format_event(&AgentEvent::ApprovalRequested {
+                    call_id: "c1".into(),
+                    tool_name: "run_command".into(),
+                    reasons: vec!["r".into()],
+                }),
+            ),
+            (
+                "[approval] granted",
+                format_event(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: true }),
+            ),
+            ("[exec] run_command", format_event(&AgentEvent::ToolExecuted { result: make_result() })),
+            ("[answer]", format_event(&AgentEvent::FinalAnswer { content: "a".into() })),
+            (
+                "[verify]",
+                format_event(&AgentEvent::Verification {
+                    decision: "complete".into(),
+                    feedback: Some("f".into()),
+                }),
+            ),
+            ("[complete]", format_event(&AgentEvent::TaskComplete { final_answer: "a".into() })),
+            ("[failed]", format_event(&AgentEvent::TaskFailed { message: "m".into() })),
+        ];
+        for (tag, line) in cases {
+            assert!(line.starts_with(tag), "{tag} vs {line}");
+        }
+    }
+
+    #[test]
+    fn content_truncates_to_the_limit_with_an_ellipsis() {
+        let long = "x".repeat(500);
+        let line = format_event(&AgentEvent::FinalAnswer { content: long });
+        assert!(line.ends_with('…'));
+        // Count chars, not bytes — the ellipsis is multi-byte.
+        assert_eq!(line.chars().count(), "[answer] ".chars().count() + TRUNCATE + 1);
+
+        let line = format_event(&AgentEvent::FinalAnswer { content: "short".into() });
+        assert_eq!(line, "[answer] short");
+    }
+
+    #[test]
+    fn denied_approvals_say_denied() {
+        let line = format_event(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: false });
+        assert_eq!(line, "[approval] denied");
     }
 }
