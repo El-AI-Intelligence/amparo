@@ -1,0 +1,50 @@
+//! Amparo Chat — the chat adapter layer: one transport seam, three platforms.
+//!
+//! M4 gives the agent a chat face. This crate owns everything platform
+//! neutral so the per-platform adapters stay thin:
+//!
+//! - [`transport::ChatTransport`] is the seam every adapter implements —
+//!   text out, approval messages with inline buttons, approval edits, and a
+//!   receive loop that feeds a [`driver::ChatDriver`]. The normalized wire
+//!   types ([`transport::ChatRef`], [`transport::IncomingMessage`],
+//!   [`transport::ApprovalButtonPress`], [`transport::ApprovalMessage`])
+//!   live beside it.
+//! - [`driver::ChatDriver`] turns a normalized message into a per-task
+//!   agent run: allowlist check, one task per chat, a fresh
+//!   [`amparo_agent::Agent`] per task built from the shared parts, and a
+//!   panic-proof task boundary.
+//! - [`gate::ChatApprovalGate`] asks a human via inline Approve/Deny
+//!   buttons and auto-denies on timeout; [`router::ApprovalRouter`] routes
+//!   the button press back to the waiting gate (an atomic take — a second
+//!   press on the same approval is already decided).
+//! - [`sink::ChatEventSink`] forwards the agent's events into the chat as
+//!   best-effort progress lines; the final answer bypasses the sink
+//!   entirely, so it can never be lost.
+//!
+//! The Telegram, Discord and Slack adapters land in later commits
+//! ([`telegram`], [`discord`], [`slack`]); [`dispatch`] hosts them behind
+//! the `amparo chat` subcommand.
+
+#![warn(missing_docs)]
+
+// The crate name is hyphenated (`amparo-chat`), so the crate cannot refer to
+// itself by name unless it declares the alias — unit tests include
+// `tests/common/mod.rs`, which imports `amparo_chat::...` exactly like the
+// integration tests do.
+extern crate self as amparo_chat;
+
+pub mod transport;
+pub mod router;
+pub mod gate;
+pub mod sink;
+pub mod driver;
+pub mod dispatch;
+pub mod telegram;
+pub mod discord;
+pub mod slack;
+
+pub use transport::{ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport, IncomingMessage};
+pub use router::ApprovalRouter;
+pub use gate::ChatApprovalGate;
+pub use sink::ChatEventSink;
+pub use driver::ChatDriver;

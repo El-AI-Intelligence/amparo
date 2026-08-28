@@ -1,0 +1,27 @@
+[package]
+name = "amparo-chat"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Amparo's chat adapter layer: a platform-neutral transport seam, a per-chat driver and inline-button approval — Telegram, Discord and Slack behind one trait"
+
+[dependencies]
+amparo-agent = { path = "../amparo-agent" }
+amparo-inference = { path = "../amparo-inference" }
+amparo-policy = { path = "../amparo-policy" }
+amparo-privacy = { path = "../amparo-privacy" }
+amparo-tools = { path = "../amparo-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/amparo-inference", "crates/amparo-memory", "crates/amparo-privacy", "crates/amparo-policy", "crates/amparo-tools", "crates/amparo-agent", "crates/amparo-mcp", "crates/amparo-cli"]
+members = ["crates/amparo-inference", "crates/amparo-memory", "crates/amparo-privacy", "crates/amparo-policy", "crates/amparo-tools", "crates/amparo-agent", "crates/amparo-mcp", "crates/amparo-cli", "crates/amparo-chat"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,7 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 async-trait = "0.1"
-tokio = { version = "1.40", features = ["rt-multi-thread", "time", "sync", "macros", "io-util", "io-std", "process", "fs"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "time", "sync", "macros", "io-util", "io-std", "process", "fs", "net", "signal"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 futures-util = "0.3"
 bytes = "1"
