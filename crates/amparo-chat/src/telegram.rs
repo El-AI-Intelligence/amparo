@@ -21,7 +21,9 @@
 
 use crate::dispatch::{build_driver, ChatFlags, ChatServeError};
 use crate::driver::ChatDriver;
-use crate::transport::{ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport};
+use crate::transport::{
+    ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport, PressOutcome,
+};
 use amparo_agent::ApprovalRequest;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -147,15 +149,22 @@ impl TelegramTransport {
                     .as_ref()
                     .map(|message| message.chat.id.to_string())
                     .unwrap_or_else(|| query.from.id.to_string());
-                let press = ApprovalButtonPress { chat_id, approval_id, approved };
-                if driver.on_approval(press).await {
-                    if approved {
-                        "Approved"
-                    } else {
-                        "Denied"
+                let press = ApprovalButtonPress {
+                    chat_id,
+                    approval_id,
+                    approved,
+                    user_id: query.from.id.to_string(),
+                };
+                match driver.on_approval(press).await {
+                    PressOutcome::Routed => {
+                        if approved {
+                            "Approved"
+                        } else {
+                            "Denied"
+                        }
                     }
-                } else {
-                    "Already decided — no longer pending"
+                    PressOutcome::AlreadyDecided => "Already decided — no longer pending",
+                    PressOutcome::WrongUser => crate::driver::WRONG_USER_TOAST,
                 }
             }
             None => "Unknown action",

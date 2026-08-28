@@ -29,6 +29,7 @@ use crate::dispatch::{build_driver, ChatFlags};
 use crate::driver::ChatDriver;
 use crate::transport::{
     ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport, IncomingMessage,
+    PressOutcome,
 };
 use amparo_agent::ApprovalRequest;
 use async_trait::async_trait;
@@ -159,6 +160,12 @@ struct InteractionCreate {
     channel_id: String,
     #[serde(default)]
     data: Option<InteractionData>,
+    /// The presser — present on DM interactions.
+    #[serde(default)]
+    user: Option<User>,
+    /// The guild member who pressed; `member.user` is the presser in guilds.
+    #[serde(default)]
+    member: Option<Member>,
 }
 
 /// The interaction's component data.
@@ -446,6 +453,13 @@ impl DiscordTransport {
                                     "deny" => false,
                                     _ => continue,
                                 };
+                                // The presser mirrors the message path: DMs
+                                // carry `user`, guild messages
+                                // `member.user`.
+                                let user_id = match interaction.member.and_then(|m| m.user) {
+                                    Some(user) => user.id,
+                                    None => interaction.user.map(|u| u.id).unwrap_or_default(),
+                                };
                                 // Receiver-only acknowledgement: the
                                 // interaction token in the URL is the
                                 // credential — deliberately no
@@ -457,13 +471,28 @@ impl DiscordTransport {
                                 let _ = self
                                     .post_json(&callback, json!({ "type": 6 }), false)
                                     .await;
-                                driver
-                                    .on_approval(ApprovalButtonPress {
-                                        chat_id: interaction.channel_id,
-                                        approval_id: approval_id.to_string(),
-                                        approved,
-                                    })
-                                    .await;
+                                let channel_id = interaction.channel_id.clone();
+                                let press = ApprovalButtonPress {
+                                    chat_id: interaction.channel_id,
+                                    approval_id: approval_id.to_string(),
+                                    approved,
+                                    user_id,
+                                };
+                                let outcome = driver.on_approval(press).await;
+                                if let PressOutcome::WrongUser = outcome {
+                                    // The requester's buttons must stay — a
+                                    // polite toast, never an edit of their
+                                    // message.
+                                    let _ = self
+                                        .post_json(
+                                            &format!("/channels/{channel_id}/messages"),
+                                            json!({
+                                                "content": crate::driver::WRONG_USER_TOAST
+                                            }),
+                                            true,
+                                        )
+                                        .await;
+                                }
                             }
                             _ => {}
                         }

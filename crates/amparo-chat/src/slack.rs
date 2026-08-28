@@ -22,7 +22,9 @@
 //! - `interactive` `block_actions` presses become
 //!   [`ApprovalButtonPress`]es; a press that reaches no waiting gate
 //!   (already decided) replaces the message through the payload's
-//!   `response_url` so its stale buttons stop dangling.
+//!   `response_url` so its stale buttons stop dangling, and a press from a
+//!   user who did not start the task gets an ephemeral toast on that same
+//!   `response_url` — the requester's buttons stay.
 //! - Outbound: `chat.postMessage` for text (truncated to 39000 chars,
 //!   Slack's message limit) and for Block Kit approval messages carrying
 //!   Approve/Deny buttons (`approve:<call_id>` / `deny:<call_id>`);
@@ -32,7 +34,9 @@
 //! the crate.
 
 use crate::driver::ChatDriver;
-use crate::transport::{ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport};
+use crate::transport::{
+    ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport, PressOutcome,
+};
 use amparo_agent::ApprovalRequest;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -88,14 +92,17 @@ struct EventPayload {
 }
 
 /// The `interactive` payload: a `block_actions` press with the button's
-/// `action_id` (`approve:<call_id>` / `deny:<call_id>`), the channel the
-/// message lives in, and the `response_url` for cleanup edits.
+/// `action_id` (`approve:<call_id>` / `deny:<call_id>`), the user who
+/// pressed, the channel the message lives in, and the `response_url` for
+/// cleanup edits.
 #[derive(Deserialize)]
 struct InteractivePayload {
     #[serde(rename = "type")]
     r#type: String,
     #[serde(default)]
     actions: Vec<Action>,
+    #[serde(default)]
+    user: Option<InteractionUser>,
     #[serde(default)]
     channel: Option<ChannelId>,
     #[serde(default)]
@@ -106,6 +113,12 @@ struct InteractivePayload {
 #[derive(Deserialize)]
 struct Action {
     action_id: String,
+}
+
+/// The user who pressed a button — Slack's raw user id.
+#[derive(Deserialize)]
+struct InteractionUser {
+    id: String,
 }
 
 /// The channel id of an interactive message.
@@ -265,18 +278,31 @@ impl SlackTransport {
             "deny" => false,
             _ => return,
         };
-        let reached = driver
-            .on_approval(ApprovalButtonPress {
-                chat_id: channel_id,
-                approval_id: approval_id.to_string(),
-                approved,
-            })
-            .await;
-        if !reached {
-            // Already decided — replace the message so its buttons vanish.
-            if let Some(url) = interactive.response_url {
-                let body = json!({"replace_original": true, "text": "Already decided"});
-                let _ = self.http.post(url).json(&body).send().await;
+        let press = ApprovalButtonPress {
+            chat_id: channel_id,
+            approval_id: approval_id.to_string(),
+            approved,
+            user_id: interactive.user.map(|u| u.id).unwrap_or_default(),
+        };
+        match driver.on_approval(press).await {
+            PressOutcome::Routed => {}
+            PressOutcome::AlreadyDecided => {
+                // Already decided — replace the message so its buttons vanish.
+                if let Some(url) = interactive.response_url {
+                    let body = json!({"replace_original": true, "text": "Already decided"});
+                    let _ = self.http.post(url).json(&body).send().await;
+                }
+            }
+            PressOutcome::WrongUser => {
+                // The requester's buttons must stay — an ephemeral toast,
+                // never a replace_original.
+                if let Some(url) = interactive.response_url {
+                    let body = json!({
+                        "response_type": "ephemeral",
+                        "text": crate::driver::WRONG_USER_TOAST,
+                    });
+                    let _ = self.http.post(url).json(&body).send().await;
+                }
             }
         }
     }

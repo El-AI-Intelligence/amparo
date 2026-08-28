@@ -42,8 +42,8 @@ pub struct IncomingMessage {
     pub text: String,
 }
 
-/// A normalized inline-button press: the chat, which approval, and the
-/// decision.
+/// A normalized inline-button press: the chat, the presser, which approval,
+/// and the decision.
 #[derive(Debug, Clone)]
 pub struct ApprovalButtonPress {
     /// The chat the approval message was sent to.
@@ -52,6 +52,19 @@ pub struct ApprovalButtonPress {
     pub approval_id: String,
     /// Whether the human pressed Approve (`true`) or Deny (`false`).
     pub approved: bool,
+    /// The platform id of the user who pressed.
+    pub user_id: String,
+}
+
+/// The outcome of routing one button press to the waiting gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressOutcome {
+    /// The press reached the waiting gate and the decision was delivered.
+    Routed,
+    /// No pending approval — double press, timeout, or never registered.
+    AlreadyDecided,
+    /// A pending approval exists, but a different user pressed.
+    WrongUser,
 }
 
 /// A platform handle to an approval message — what

@@ -6,9 +6,9 @@
 //! can never take down a receive loop.
 
 use crate::gate::ChatApprovalGate;
-use crate::router::ApprovalRouter;
+use crate::router::{ApprovalRouter, TakeResult};
 use crate::sink::ChatEventSink;
-use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport};
+use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport, PressOutcome};
 use amparo_agent::{Agent, AgentConfig};
 use amparo_inference::InferenceProvider;
 use amparo_policy::PolicyEngine;
@@ -17,6 +17,11 @@ use amparo_tools::{ToolRegistry, ToolTrustTier};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// The toast shown to a user who presses a button on someone else's
+/// pending approval — their press is ignored, the buttons stay, and the
+/// requester's own press still routes.
+pub const WRONG_USER_TOAST: &str = "Only the user who started the task can decide.";
 
 /// A claim on a chat: while it lives, no second task may start in that
 /// chat. Dropping it — however the task ends — releases the claim, so the
@@ -243,19 +248,24 @@ impl ChatDriver {
         });
     }
 
-    /// Handle one inline-button press. Returns whether the press reached a
-    /// waiting gate — `false` means already decided (or never registered),
-    /// which the platform adapter reports as "already decided".
-    pub async fn on_approval(&self, press: ApprovalButtonPress) -> bool {
-        match self.router.take(&press.chat_id, &press.approval_id).await {
-            Some(tx) => {
+    /// Handle one inline-button press.
+    ///
+    /// Returns how the press was resolved: [`PressOutcome::Routed`] when the
+    /// decision reached a waiting gate, [`PressOutcome::AlreadyDecided`]
+    /// when no entry exists (double press, timeout, or never registered),
+    /// and [`PressOutcome::WrongUser`] when the presser is not the user who
+    /// started the task — the entry stays for the requester's own press.
+    pub async fn on_approval(&self, press: ApprovalButtonPress) -> PressOutcome {
+        match self.router.take(&press.chat_id, &press.approval_id, &press.user_id).await {
+            TakeResult::Routed(tx) => {
                 // The gate may have timed out and dropped its receiver just
                 // now — the press is still consumed (already decided), never
                 // replayed.
                 let _ = tx.send(press.approved);
-                true
+                PressOutcome::Routed
             }
-            None => false,
+            TakeResult::AlreadyDecided => PressOutcome::AlreadyDecided,
+            TakeResult::WrongUser => PressOutcome::WrongUser,
         }
     }
 }
@@ -366,8 +376,13 @@ mod tests {
             chat_id: "chat_1".into(),
             approval_id: "call_1".into(),
             approved: true,
+            user_id: "user_1".into(),
         };
-        assert!(driver.on_approval(press).await, "the press reached the waiting gate");
+        assert_eq!(
+            driver.on_approval(press).await,
+            PressOutcome::Routed,
+            "the press reached the waiting gate"
+        );
         wait_for_text(&transport, "Done.").await;
     }
 
@@ -379,8 +394,46 @@ mod tests {
             chat_id: "chat_1".into(),
             approval_id: "never_registered".into(),
             approved: true,
+            user_id: "user_1".into(),
         };
-        assert!(!driver.on_approval(press).await);
+        assert_eq!(driver.on_approval(press).await, PressOutcome::AlreadyDecided);
+    }
+
+    #[tokio::test]
+    async fn wrong_user_press_is_reported_and_requester_still_decides() {
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![
+            turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#),
+            turn_text("Done."),
+        ]);
+        let driver = driver_with(
+            HashSet::from(["user_1".to_string()]),
+            transport.clone(),
+            provider,
+            false, // approvals must be pressed, not auto-granted
+            ToolTrustTier::ExternalEffector, // tier forces the approval gate
+        );
+        driver.on_message(chat(), "do a thing".into()).await;
+        wait_until(|| !transport.approvals().is_empty()).await;
+
+        // Another user presses Approve: refused, and the entry is kept.
+        let wrong = ApprovalButtonPress {
+            chat_id: "chat_1".into(),
+            approval_id: "call_1".into(),
+            approved: true,
+            user_id: "user_2".into(),
+        };
+        assert_eq!(driver.on_approval(wrong).await, PressOutcome::WrongUser);
+
+        // The requester's own press still routes and the task finishes.
+        let requester = ApprovalButtonPress {
+            chat_id: "chat_1".into(),
+            approval_id: "call_1".into(),
+            approved: true,
+            user_id: "user_1".into(),
+        };
+        assert_eq!(driver.on_approval(requester).await, PressOutcome::Routed);
+        wait_for_text(&transport, "Done.").await;
     }
 
     #[tokio::test]

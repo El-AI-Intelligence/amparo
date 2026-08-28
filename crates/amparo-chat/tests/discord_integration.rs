@@ -542,3 +542,98 @@ async fn driver_runs_a_task_through_the_gateway_and_button_press() {
     let posts = posts_to(&rest, "/channels/c1/messages");
     assert!(posts.iter().any(|r| r.body.contains("Done.")), "final answer delivered");
 }
+
+/// A press from a user who did not start the task is refused with a polite
+/// toast — the requester's buttons stay — and the requester's own later
+/// press still routes the decision.
+#[tokio::test]
+async fn wrong_user_press_gets_toast_and_requester_still_decides() {
+    let rest = MockRest::start(false).await;
+    let gw = MockGateway::start(
+        vec![
+            expect(2, |d| {
+                check(d["token"] == "test-token", "IDENTIFY carried the wrong token")?;
+                check(d["intents"] == 37376, "IDENTIFY carried the wrong intents")?;
+                Ok(())
+            }),
+            GwStep::Send(json!({ "op": 0, "t": "READY", "s": 1, "d": { "session_id": "sess-1" } })),
+            GwStep::Send(json!({
+                "op": 0, "t": "MESSAGE_CREATE", "s": 2, "d": {
+                    "id": "m1", "channel_id": "c1", "content": "do the thing",
+                    "author": { "id": "222", "bot": false },
+                    "member": { "user": { "id": "222", "bot": false } }
+                }
+            })),
+            wait_rest(|reqs| reqs.iter().any(|r| r.body.contains("approve:call_1"))),
+            GwStep::Send(json!({
+                "op": 0, "t": "INTERACTION_CREATE", "s": 3, "d": {
+                    "id": "i2", "type": 3, "token": "tok123", "channel_id": "c1",
+                    "data": { "custom_id": "approve:call_1", "component_type": 2 },
+                    "message": { "id": "m1" },
+                    "member": { "user": { "id": "333", "bot": false } }
+                }
+            })),
+            wait_rest(|reqs| {
+                reqs.iter().any(|r| {
+                    r.method == "POST"
+                        && r.path == "/channels/c1/messages"
+                        && r.body.contains("Only the user who started the task can decide.")
+                })
+            }),
+            GwStep::Send(json!({
+                "op": 0, "t": "INTERACTION_CREATE", "s": 4, "d": {
+                    "id": "i3", "type": 3, "token": "tok123", "channel_id": "c1",
+                    "data": { "custom_id": "approve:call_1", "component_type": 2 },
+                    "message": { "id": "m1" },
+                    "member": { "user": { "id": "222", "bot": false } }
+                }
+            })),
+            wait_rest(|reqs| {
+                reqs.iter().any(|r| r.method == "POST" && r.body.contains("Done."))
+            }),
+        ],
+        Arc::clone(&rest.log),
+    )
+    .await;
+
+    let transport: Arc<dyn ChatTransport> =
+        Arc::new(DiscordTransport::with_urls("test-token".into(), gw.ws_url(), rest.url()));
+    let driver = Arc::new(ChatDriver::new(
+        HashSet::from(["222".to_string()]),
+        StubProvider::new(vec![
+            turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#),
+            turn_text("Done."),
+        ]),
+        Arc::new(AllowAllPolicyEngine),
+        registry_with_echo(ToolTrustTier::ExternalEffector),
+        std::env::temp_dir().join(format!("amparo-chat-discord-{}", std::process::id())),
+        Arc::clone(&transport),
+        Arc::new(ApprovalRouter::new()),
+        false,
+    ));
+    tokio::spawn(transport.receive(driver));
+    gw.finished().await.expect("gateway script");
+
+    // Exactly one wrong-user toast, posted like any authorized message.
+    let toasts: Vec<_> = posts_to(&rest, "/channels/c1/messages")
+        .into_iter()
+        .filter(|r| r.body.contains("Only the user who started the task can decide."))
+        .collect();
+    assert_eq!(toasts.len(), 1, "one wrong-user toast");
+    assert!(
+        toasts[0].head.to_lowercase().contains("authorization: bot test-token"),
+        "the toast is an authorized message post"
+    );
+
+    // The requester's press routed: the gate edited the message and the
+    // final answer was delivered.
+    let edits: Vec<_> = rest
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH" && r.path.starts_with("/channels/c1/messages/"))
+        .collect();
+    assert_eq!(edits.len(), 1, "the gate is the message's single editor");
+    assert!(edits[0].body.contains("\"Approved\""), "edit body: {}", edits[0].body);
+    let posts = posts_to(&rest, "/channels/c1/messages");
+    assert!(posts.iter().any(|r| r.body.contains("Done.")), "final answer delivered");
+}

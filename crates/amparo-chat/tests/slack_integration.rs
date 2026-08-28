@@ -171,14 +171,15 @@ fn bot_message(id: &str, channel: &str, text: &str) -> String {
     )
 }
 
-/// An `interactive` envelope carrying a `block_actions` button press.
-fn button_press(id: &str, action_id: &str, channel: &str, response_url: &str) -> String {
+/// An `interactive` envelope carrying a `block_actions` button press from
+/// `user`.
+fn button_press(id: &str, user: &str, action_id: &str, channel: &str, response_url: &str) -> String {
     envelope(
         id,
         "interactive",
         Some(json!({
             "type": "block_actions",
-            "user": {"id": "U333", "username": "tester"},
+            "user": {"id": user, "username": "tester"},
             "channel": {"id": channel},
             "actions": [{"action_id": action_id, "block_id": "b1"}],
             "response_url": response_url,
@@ -236,11 +237,13 @@ fn body_of(state: &MockState, path: &str, needle: &str) -> String {
         .unwrap_or_else(|| panic!("no recorded call to {path} containing {needle:?}"))
 }
 
-/// A real driver: allowlist {"333"}, an echo tool at ExternalEffector tier
-/// (so the approval gate fires), approvals NOT auto-granted.
+/// A real driver: allowlist {"U333"} — the user whose presses may decide
+/// approvals, matching the button-press envelopes — an echo tool at
+/// ExternalEffector tier (so the approval gate fires), approvals NOT
+/// auto-granted.
 fn driver(transport: Arc<dyn ChatTransport>) -> Arc<ChatDriver> {
     Arc::new(ChatDriver::new(
-        HashSet::from(["333".to_string()]),
+        HashSet::from(["U333".to_string()]),
         StubProvider::new(vec![
             turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#),
             turn_text("Done."),
@@ -302,7 +305,7 @@ async fn socket_mode_acks_before_processing_and_round_trips_approval() {
             .expect("send hello");
 
         // 1. A real user message: the ack must be logged before ANY outbound.
-        ws.send(Message::text(user_message("ev_1", "C1", "333", "do a thing")))
+        ws.send(Message::text(user_message("ev_1", "C1", "U333", "do a thing")))
             .await
             .expect("send ev_1");
         read_ack(&mut ws, &ws_state.log).await; // "ack:ev_1"
@@ -311,7 +314,7 @@ async fn socket_mode_acks_before_processing_and_round_trips_approval() {
         // the gate registered it, then press Approve.
         wait_for_body(&ws_state, "/api/chat.postMessage", "approve:call_1").await;
         wait_quiet(&ws_state, Duration::from_millis(200)).await;
-        ws.send(Message::text(button_press("act_1", "approve:call_1", "C1", &response_url)))
+        ws.send(Message::text(button_press("act_1", "U333", "approve:call_1", "C1", &response_url)))
             .await
             .expect("send act_1");
         read_ack(&mut ws, &ws_state.log).await; // "ack:act_1"
@@ -400,7 +403,7 @@ async fn already_decided_press_cleans_up_via_response_url() {
         ws.send(Message::text(r#"{"type":"hello"}"#.to_string()))
             .await
             .expect("send hello");
-        ws.send(Message::text(button_press("act_ghost", "approve:ghost", "C1", &response_url)))
+        ws.send(Message::text(button_press("act_ghost", "U333", "approve:ghost", "C1", &response_url)))
             .await
             .expect("send press");
         read_ack(&mut ws, &ws_state.log).await; // "ack:act_ghost"
@@ -470,4 +473,78 @@ async fn serve_fails_closed_without_tokens() {
             None => std::env::remove_var(key),
         }
     }
+}
+
+/// A press from a user who did not start the task is answered with an
+/// ephemeral toast on the response_url — never a replace_original, which
+/// would strip the requester's buttons — and the requester's own press
+/// still routes.
+#[tokio::test]
+async fn wrong_user_press_gets_ephemeral_toast_and_requester_still_decides() {
+    let state = Arc::new(MockState::default());
+    let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ws mock");
+    let ws_port = ws_listener.local_addr().expect("ws addr").port();
+    let http_port =
+        start_http_mock(Arc::clone(&state), format!("ws://127.0.0.1:{ws_port}/link")).await;
+    let response_url = format!("http://127.0.0.1:{http_port}/responses/hooks/xyz");
+    let transport = test_transport(format!("http://127.0.0.1:{http_port}/api"));
+    let driver = driver(Arc::clone(&transport));
+
+    let ws_state = Arc::clone(&state);
+    let ws_handle = tokio::spawn(async move {
+        let (stream, _) = ws_listener.accept().await.expect("ws client connected");
+        let mut ws = tokio_tungstenite::accept_async(stream).await.expect("ws handshake");
+        ws.send(Message::text(r#"{"type":"hello"}"#.to_string()))
+            .await
+            .expect("send hello");
+
+        ws.send(Message::text(user_message("ev_1", "C1", "U333", "do a thing")))
+            .await
+            .expect("send ev_1");
+        read_ack(&mut ws, &ws_state.log).await; // "ack:ev_1"
+
+        wait_for_body(&ws_state, "/api/chat.postMessage", "approve:call_1").await;
+        wait_quiet(&ws_state, Duration::from_millis(200)).await;
+
+        // A different user presses Approve — refused with an ephemeral
+        // toast; the pending approval is not consumed.
+        ws.send(Message::text(button_press("act_1", "U999", "approve:call_1", "C1", &response_url)))
+            .await
+            .expect("send act_1");
+        read_ack(&mut ws, &ws_state.log).await; // "ack:act_1"
+        wait_for_body(&ws_state, "/responses/hooks/xyz", "ephemeral").await;
+
+        // The requester's own press still routes the decision.
+        ws.send(Message::text(button_press("act_2", "U333", "approve:call_1", "C1", &response_url)))
+            .await
+            .expect("send act_2");
+        read_ack(&mut ws, &ws_state.log).await; // "ack:act_2"
+        wait_for_body(&ws_state, "/api/chat.update", "\"Approved\"").await;
+        wait_for_body(&ws_state, "/api/chat.postMessage", "\"text\":\"Done.\"").await;
+    });
+
+    let recv = Arc::clone(&transport);
+    tokio::spawn(async move { recv.receive(Arc::clone(&driver)).await });
+
+    tokio::time::timeout(Duration::from_secs(15), ws_handle)
+        .await
+        .expect("ws mock script timed out")
+        .expect("ws mock script failed");
+    wait_quiet(&state, Duration::from_millis(300)).await;
+
+    let toast = body_of(&state, "/responses/hooks/xyz", "response_type");
+    assert!(
+        toast.contains("\"response_type\":\"ephemeral\"")
+            && toast.contains("Only the user who started the task can decide."),
+        "ephemeral toast body: {toast}"
+    );
+    assert!(
+        !toast.contains("replace_original"),
+        "never replace the requester's buttons: {toast}"
+    );
+
+    let update = body_of(&state, "/api/chat.update", "\"Approved\"");
+    assert!(update.contains("\"blocks\":[]"), "the requester's press routed: {update}");
+    let answer = body_of(&state, "/api/chat.postMessage", "\"text\":\"Done.\"");
+    assert!(answer.contains("Done."), "final answer: {answer}");
 }

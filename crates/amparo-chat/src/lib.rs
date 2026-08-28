@@ -15,8 +15,10 @@
 //!   panic-proof task boundary.
 //! - [`gate::ChatApprovalGate`] asks a human via inline Approve/Deny
 //!   buttons and auto-denies on timeout; [`router::ApprovalRouter`] routes
-//!   the button press back to the waiting gate (an atomic take — a second
-//!   press on the same approval is already decided).
+//!   the button press back to the waiting gate — only the requester's own
+//!   press is accepted (a second press on the same approval is already
+//!   decided, a foreign press is refused with a toast and keeps the entry
+//!   pending).
 //! - [`sink::ChatEventSink`] forwards the agent's events into the chat as
 //!   best-effort progress lines; the final answer bypasses the sink
 //!   entirely, so it can never be lost.
@@ -43,8 +45,11 @@ pub mod telegram;
 pub mod discord;
 pub mod slack;
 
-pub use transport::{ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport, IncomingMessage};
-pub use router::ApprovalRouter;
+pub use router::{ApprovalRouter, TakeResult};
+pub use transport::{
+    ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport, IncomingMessage,
+    PressOutcome,
+};
 pub use gate::ChatApprovalGate;
 pub use sink::ChatEventSink;
 pub use driver::ChatDriver;

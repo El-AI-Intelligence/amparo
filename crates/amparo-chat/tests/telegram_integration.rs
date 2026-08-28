@@ -17,7 +17,9 @@ use common::{registry_with_echo, turn_text, turn_tool_call, wait_until, StubProv
 use amparo_chat::driver::ChatDriver;
 use amparo_chat::router::ApprovalRouter;
 use amparo_chat::telegram::TelegramTransport;
-use amparo_chat::transport::{ApprovalButtonPress, ChatError, ChatRef, ChatTransport};
+use amparo_chat::transport::{
+    ApprovalButtonPress, ChatError, ChatRef, ChatTransport, PressOutcome,
+};
 use amparo_policy::AllowAllPolicyEngine;
 use amparo_tools::ToolTrustTier;
 use serde_json::{json, Value};
@@ -25,6 +27,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -357,8 +360,13 @@ async fn message_to_approval_to_answer_roundtrip() {
         chat_id: "222".into(),
         approval_id: "call_1".into(),
         approved: true,
+        user_id: "111".into(),
     };
-    assert!(driver.on_approval(press).await, "the press reached the waiting gate");
+    assert_eq!(
+        driver.on_approval(press).await,
+        PressOutcome::Routed,
+        "the press reached the waiting gate"
+    );
 
     // The gate edits the approval message with the outcome (removing the
     // buttons) and the final answer arrives as a plain sendMessage.
@@ -425,6 +433,65 @@ async fn receive_loop_polls_offsets_and_feeds_the_driver() {
             r.path.contains("/answerCallbackQuery")
                 && body_contains(&r.body, "Already decided")
         })
+    })
+    .await;
+
+    loop_task.abort();
+    let _ = loop_task.await;
+    mock.stop();
+}
+
+/// A callback from a user who did not start the task is answered with the
+/// wrong-user toast, the pending approval is NOT consumed, and the
+/// requester's own later callback still routes the decision.
+#[tokio::test]
+async fn callback_from_another_user_gets_the_wrong_user_toast() {
+    let mock = MockTelegram::start().await;
+    mock.push_update(message_update(201, 111, 222, "do a thing"));
+
+    let transport: Arc<dyn ChatTransport> =
+        Arc::new(TelegramTransport::new(mock.url(), "TEST-TOKEN-4"));
+    let driver = test_driver(
+        HashSet::from(["111".to_string()]),
+        StubProvider::new(vec![
+            turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#),
+            turn_text("Done."),
+        ]),
+        transport.clone(),
+        false, // no auto-approve — the gate must fire
+    );
+
+    let loop_task = tokio::spawn({
+        let transport = Arc::clone(&transport);
+        async move { transport.receive(driver).await }
+    });
+
+    // The task's inline keyboard is on screen (and the gate registered).
+    wait_until(|| {
+        mock.log().iter().any(|r| {
+            r.path.contains("/sendMessage") && body_contains(&r.body, "approve:call_1")
+        })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A different user presses Approve: the toast tells them the decision
+    // is not theirs — the pending approval survives.
+    mock.push_update(callback_update(202, 222, 222, "approve:call_1"));
+    wait_until(|| {
+        mock.log().iter().any(|r| {
+            r.path.contains("/answerCallbackQuery")
+                && body_contains(&r.body, amparo_chat::driver::WRONG_USER_TOAST)
+        })
+    })
+    .await;
+
+    // The requester's own press still routes and the task finishes.
+    mock.push_update(callback_update(203, 111, 222, "approve:call_1"));
+    wait_until(|| {
+        mock.log()
+            .iter()
+            .any(|r| r.path.contains("/sendMessage") && body_contains(&r.body, "Done."))
     })
     .await;
 

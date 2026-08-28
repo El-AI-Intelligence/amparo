@@ -74,8 +74,12 @@ impl ApprovalGate for ChatApprovalGate {
         };
 
         // Register only after the message exists, so a press can never find
-        // an entry before the buttons are on screen.
-        let rx = self.router.register(&self.chat.chat_id, &approval_id).await;
+        // an entry before the buttons are on screen. The chat's user is the
+        // requester: only their press may decide this approval.
+        let rx = self
+            .router
+            .register(&self.chat.chat_id, &approval_id, &self.chat.user_id)
+            .await;
 
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(true)) => {
@@ -161,7 +165,10 @@ mod tests {
             transport.edits()
         );
         // The entry was unregistered, so a late press is already decided.
-        assert!(router.take("chat_1", "call_1").await.is_none());
+        assert!(matches!(
+            router.take("chat_1", "call_1", "user_1").await,
+            crate::router::TakeResult::AlreadyDecided
+        ));
     }
 
     #[tokio::test]
@@ -172,7 +179,10 @@ mod tests {
         let g = Arc::clone(&gate);
         let handle = tokio::spawn(async move { g.request(&request()).await });
         wait_until(|| !transport.approvals().is_empty()).await;
-        let tx = router.take("chat_1", "call_1").await.expect("approval registered");
+        let tx = match router.take("chat_1", "call_1", "user_1").await {
+            crate::router::TakeResult::Routed(tx) => tx,
+            other => panic!("approval must be registered, got {other:?}"),
+        };
         tx.send(true).unwrap();
         assert!(handle.await.unwrap(), "approved press must approve");
         assert!(transport.edits().iter().any(|(_, outcome)| outcome == "Approved"));
@@ -186,7 +196,10 @@ mod tests {
         let g = Arc::clone(&gate);
         let handle = tokio::spawn(async move { g.request(&request()).await });
         wait_until(|| !transport.approvals().is_empty()).await;
-        let tx = router.take("chat_1", "call_1").await.expect("approval registered");
+        let tx = match router.take("chat_1", "call_1", "user_1").await {
+            crate::router::TakeResult::Routed(tx) => tx,
+            other => panic!("approval must be registered, got {other:?}"),
+        };
         tx.send(false).unwrap();
         assert!(!handle.await.unwrap(), "denied press must deny");
         assert!(transport.edits().iter().any(|(_, outcome)| outcome == "Denied"));
@@ -201,6 +214,9 @@ mod tests {
         assert!(!gate.request(&request()).await, "send failure must deny");
         assert!(transport.approvals().is_empty(), "nothing was sent");
         assert!(transport.edits().is_empty(), "no message to edit");
-        assert!(router.take("chat_1", "call_1").await.is_none(), "nothing was registered");
+        assert!(matches!(
+            router.take("chat_1", "call_1", "user_1").await,
+            crate::router::TakeResult::AlreadyDecided
+        ), "nothing was registered");
     }
 }
