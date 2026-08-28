@@ -11,7 +11,7 @@
 mod common;
 
 use amparo_chat::dispatch::{ChatFlags, Platform};
-use amparo_chat::driver::ChatDriver;
+use amparo_chat::driver::{ChatDriver, PolicySource, Tenants};
 use amparo_chat::router::ApprovalRouter;
 use amparo_chat::slack::SlackTransport;
 use amparo_chat::transport::{ChatError, ChatTransport};
@@ -243,12 +243,12 @@ fn body_of(state: &MockState, path: &str, needle: &str) -> String {
 /// auto-granted.
 fn driver(transport: Arc<dyn ChatTransport>) -> Arc<ChatDriver> {
     Arc::new(ChatDriver::new(
-        HashSet::from(["U333".to_string()]),
+        Tenants::LegacyAllowlist(HashSet::from(["U333".to_string()])),
         StubProvider::new(vec![
             turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#),
             turn_text("Done."),
         ]),
-        Arc::new(AllowAllPolicyEngine),
+        PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
         registry_with_echo(ToolTrustTier::ExternalEffector),
         PathBuf::from("/tmp/amparo-chat-test"),
         transport,
@@ -443,6 +443,7 @@ fn flags() -> ChatFlags {
         allow_all: true,
         auto_approve: true,
         trust_ceiling: ToolTrustTier::SystemControl,
+        chat_config: None,
     }
 }
 

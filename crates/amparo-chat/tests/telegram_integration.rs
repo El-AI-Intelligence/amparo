@@ -14,7 +14,7 @@
 mod common;
 use common::{registry_with_echo, turn_text, turn_tool_call, wait_until, StubProvider};
 
-use amparo_chat::driver::ChatDriver;
+use amparo_chat::driver::{ChatDriver, PolicySource, Tenants};
 use amparo_chat::router::ApprovalRouter;
 use amparo_chat::telegram::TelegramTransport;
 use amparo_chat::transport::{
@@ -303,9 +303,9 @@ fn test_driver(
 ) -> Arc<ChatDriver> {
     Arc::new(
         ChatDriver::new(
-            allowlist,
+            Tenants::LegacyAllowlist(allowlist),
             provider,
-            Arc::new(AllowAllPolicyEngine),
+            PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
             registry_with_echo(ToolTrustTier::ExternalEffector),
             PathBuf::from("."),
             transport,

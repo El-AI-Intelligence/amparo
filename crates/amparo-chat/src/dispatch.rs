@@ -3,27 +3,29 @@
 //!
 //! [`parse_chat_flags`] follows the `amparo run` idiom: one positional
 //! platform (`telegram` | `discord` | `slack`), then `--policy-url` /
-//! `--allow-all` (mutually exclusive), `--auto-approve`, `--trust-ceiling`
-//! and `--help`. [`build_driver`] is the shared assembly the adapters use so
-//! Discord and Slack do not duplicate it: the inference provider from the
-//! environment (fail-closed, with the same README-pointer hint as
-//! `amparo run`), the policy match with byte-identical strings to
-//! `amparo run`, the shared tool registry, and the `AMPARO_CHAT_ALLOWLIST`
-//! user allowlist — absent or empty means nobody, and the startup warning
-//! says so.
+//! `--allow-all` (mutually exclusive), `--auto-approve`,
+//! `--trust-ceiling`, `--chat-config` and `--help`. [`build_driver`] is the
+//! shared assembly the adapters use so Discord and Slack do not duplicate
+//! it: the inference provider from the environment (fail-closed, with the
+//! same README-pointer hint as `amparo run`), the policy match with
+//! byte-identical strings to `amparo run`, the shared tool registry, and
+//! the tenancy — a `--chat-config`/`AMPARO_CHAT_CONFIG` TOML tenant
+//! directory (per-user workspaces and ceilings), or the
+//! `AMPARO_CHAT_ALLOWLIST` user allowlist — absent or empty means nobody,
+//! and the startup warning says so.
 //!
 //! Fail-closed everywhere: a missing bot token is exit 2, a missing
-//! inference configuration is exit 1, and an empty allowlist refuses every
+//! inference configuration is exit 1, a config file that fails to load is
+//! exit 2, and an empty tenant directory or allowlist refuses every
 //! message. [`dispatch`] turns a [`ChatServeError`] into the process exit
 //! code it carries.
 
-use crate::driver::ChatDriver;
+use crate::config::ChatConfig;
+use crate::driver::{ChatDriver, PolicySource, Tenants};
 use crate::router::ApprovalRouter;
 use crate::transport::ChatTransport;
 use amparo_inference::InferenceConfig;
-use amparo_policy::{
-    wire::WirePolicyEngine, AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine,
-};
+use amparo_policy::{AllowAllPolicyEngine, DenyAllPolicyEngine};
 use amparo_tools::{default_registry, ToolTrustTier};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -48,15 +50,21 @@ FLAGS:
   --auto-approve      approve escalated/external-effector calls without a human
   --trust-ceiling T   observational | local_mutating |
                       external_effector | system_control (default)
+  --chat-config PATH  load the tenant directory from a TOML config file
   --help              print this help and exit
 
 Deny-by-default: without --policy-url or --allow-all every tool call is
 refused, and escalated/external-effector calls ask for approval unless
---auto-approve overrides. Only the users listed in AMPARO_CHAT_ALLOWLIST
-(comma-separated ids) may start tasks — absent or empty means every message
-is refused. The bot token comes from AMPARO_CHAT_TELEGRAM_TOKEN (Telegram),
-the workspace from AMPARO_WORKSPACE, and the inference endpoint from the
-AMPARO_INFERENCE_* environment surface — see the README chat section.";
+--auto-approve overrides. Without --chat-config, only the users listed in
+AMPARO_CHAT_ALLOWLIST (comma-separated ids) may start tasks — absent or
+empty means every message is refused. With a chat config (the flag wins
+over the AMPARO_CHAT_CONFIG environment variable), the file is the tenant
+directory: [users.\"platform:user_id\"] sections, each with an optional
+per-user trust_ceiling and workspace subpath; AMPARO_CHAT_ALLOWLIST is
+ignored while one is set. The bot token comes from AMPARO_CHAT_TELEGRAM_TOKEN
+(Telegram), the workspace root from AMPARO_WORKSPACE, and the inference
+endpoint from the AMPARO_INFERENCE_* environment surface — see the README
+chat section.";
 
 /// The messaging platform `amparo chat` serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +111,8 @@ pub struct ChatFlags {
     pub auto_approve: bool,
     /// The trust ceiling every task's agent runs with.
     pub trust_ceiling: ToolTrustTier,
+    /// The tenant-directory config file (flag form of `AMPARO_CHAT_CONFIG`).
+    pub chat_config: Option<PathBuf>,
 }
 
 impl Default for ChatFlags {
@@ -113,6 +123,7 @@ impl Default for ChatFlags {
             allow_all: false,
             auto_approve: false,
             trust_ceiling: ToolTrustTier::SystemControl,
+            chat_config: None,
         }
     }
 }
@@ -168,6 +179,10 @@ pub fn parse_chat_flags(args: impl Iterator<Item = String>) -> ParseChatResult {
                 None => return ParseChatResult::Error("--policy-url requires a URL".into()),
             },
             "--allow-all" => flags.allow_all = true,
+            "--chat-config" => match args.next() {
+                Some(path) => flags.chat_config = Some(PathBuf::from(path)),
+                None => return ParseChatResult::Error("--chat-config requires a path".into()),
+            },
             "--auto-approve" => flags.auto_approve = true,
             "--trust-ceiling" => match args.next() {
                 Some(tier) => match tier.as_str() {
@@ -220,17 +235,19 @@ pub fn parse_chat_flags(args: impl Iterator<Item = String>) -> ParseChatResult {
 ///
 /// Wiring order (identical to `amparo run`'s `execute`): the inference
 /// provider fails closed from `AMPARO_INFERENCE_*`, the policy match wires
-/// a [`WirePolicyEngine`] with `AMPARO_POLICY_KEY`, an explicit
-/// [`AllowAllPolicyEngine`], or a [`DenyAllPolicyEngine`] with the same
-/// reason string as `amparo run`, then the shared [`default_registry`]
-/// (the registry itself reads `AMPARO_WORKSPACE`; there is no `--workspace`
-/// flag in chat flags). The user allowlist comes from
-/// `AMPARO_CHAT_ALLOWLIST` — comma-separated ids, trimmed, empties
-/// dropped; absent or empty means every message is refused, which is
-/// reported at startup. `transport` is the platform's outbound handle; the
-/// approval router is platform-neutral and built here.
-///
-/// M4 is single-operator: one shared registry and workspace across chats.
+/// a [`PolicySource::Wire`] engine (`--policy-url` plus `AMPARO_POLICY_KEY`),
+/// an explicit [`AllowAllPolicyEngine`], or a [`DenyAllPolicyEngine`] with
+/// the same reason string as `amparo run`, then the shared
+/// [`default_registry`] (the registry itself reads `AMPARO_WORKSPACE` as
+/// its root; there is no `--workspace` flag in chat flags). Tenancy: a
+/// `--chat-config <path>` flag (winning over `AMPARO_CHAT_CONFIG`) loads
+/// the TOML tenant directory — [`Tenants::Directory`]; a load failure is a
+/// configuration problem (exit 2), and an empty directory is reported at
+/// startup. Without either, the allowlist comes from `AMPARO_CHAT_ALLOWLIST`
+/// — comma-separated ids, trimmed, empties dropped; absent or empty means
+/// every message is refused, which is reported at startup. `transport` is
+/// the platform's outbound handle; the approval router is platform-neutral
+/// and built here.
 pub async fn build_driver(
     flags: &ChatFlags,
     transport: Arc<dyn ChatTransport>,
@@ -248,33 +265,56 @@ pub async fn build_driver(
 
     let registry = default_registry();
 
-    let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
+    let policy_source = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {
             let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
-            Arc::new(WirePolicyEngine::new(url.clone(), api_key))
+            PolicySource::Wire { base_url: url.clone(), api_key }
         }
-        (None, true) => Arc::new(AllowAllPolicyEngine),
-        (None, false) => Arc::new(DenyAllPolicyEngine::new(
+        (None, true) => PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
+        (None, false) => PolicySource::Shared(Arc::new(DenyAllPolicyEngine::new(
             "no policy configured (--policy-url or --allow-all)",
-        )),
+        ))),
         (Some(_), true) => unreachable!("rejected by parse_chat_flags"),
     };
 
-    let allowlist = allowlist_from_env();
-    if allowlist.is_empty() {
-        eprintln!("no users in AMPARO_CHAT_ALLOWLIST — every message will be refused");
-    }
+    let tenants = match flags
+        .chat_config
+        .clone()
+        .or_else(|| std::env::var("AMPARO_CHAT_CONFIG").ok().map(PathBuf::from))
+    {
+        Some(path) => {
+            let config = ChatConfig::load(&path)
+                .map_err(|e| ChatServeError::new(e.to_string(), 2))?;
+            if config.is_empty() {
+                eprintln!(
+                    "warning: no users in chat config {} — every message will be refused",
+                    path.display()
+                );
+            }
+            if std::env::var("AMPARO_CHAT_ALLOWLIST").is_ok() {
+                eprintln!("warning: AMPARO_CHAT_ALLOWLIST is ignored while a chat config is set");
+            }
+            Tenants::Directory(Arc::new(config))
+        }
+        None => {
+            let allowlist = allowlist_from_env();
+            if allowlist.is_empty() {
+                eprintln!("no users in AMPARO_CHAT_ALLOWLIST — every message will be refused");
+            }
+            Tenants::LegacyAllowlist(allowlist)
+        }
+    };
 
     let router = Arc::new(ApprovalRouter::new());
-    let workspace =
+    let workspace_root =
         std::env::var("AMPARO_WORKSPACE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
 
     let driver = ChatDriver::new(
-        allowlist,
+        tenants,
         provider,
-        policy,
+        policy_source,
         registry,
-        workspace,
+        workspace_root,
         transport,
         router,
         flags.auto_approve,
@@ -396,6 +436,26 @@ mod tests {
             error(parse(&["telegram", "--trust-ceiling", "nonsense"])),
             "unknown trust tier nonsense"
         );
+    }
+
+    #[test]
+    fn chat_config_flag_parses() {
+        let f = flags(parse(&["telegram", "--chat-config", "/tmp/tenants.toml"]));
+        assert_eq!(f.chat_config, Some(PathBuf::from("/tmp/tenants.toml")));
+        let f = flags(parse(&["telegram"]));
+        assert_eq!(f.chat_config, None, "absent by default");
+    }
+
+    #[test]
+    fn chat_config_flag_requires_a_value() {
+        let message = error(parse(&["telegram", "--chat-config"]));
+        assert!(message.contains("requires a path"), "{message}");
+    }
+
+    #[test]
+    fn usage_mentions_chat_config() {
+        assert!(CHAT_USAGE.contains("--chat-config"), "usage documents the flag");
+        assert!(CHAT_USAGE.contains("AMPARO_CHAT_CONFIG"), "usage documents the env var");
     }
 
     #[test]

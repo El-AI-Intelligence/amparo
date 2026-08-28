@@ -137,6 +137,7 @@ impl ChatTransport for MockTransport {
 pub struct StubProvider {
     scripts: Mutex<VecDeque<Vec<String>>>,
     panicking: AtomicBool,
+    requests: Mutex<Vec<String>>,
 }
 
 impl StubProvider {
@@ -145,13 +146,24 @@ impl StubProvider {
         Arc::new(Self {
             scripts: Mutex::new(script.into()),
             panicking: AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
         })
     }
 
     /// A provider that panics on its first chat call — the driver's
     /// panic-containment test.
     pub fn panicking() -> Arc<Self> {
-        Arc::new(Self { scripts: Mutex::new(VecDeque::new()), panicking: AtomicBool::new(true) })
+        Arc::new(Self {
+            scripts: Mutex::new(VecDeque::new()),
+            panicking: AtomicBool::new(true),
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Every chat request answered so far, serialized — lets tests observe
+    /// what the LLM was told (tool results, workspace paths).
+    pub fn recorded_requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -204,11 +216,15 @@ impl InferenceProvider for StubProvider {
 
     async fn complete_chat_stream(
         &self,
-        _request: ChatRequest,
+        request: ChatRequest,
     ) -> Result<InferenceStream, InferenceError> {
         if self.panicking.load(Ordering::SeqCst) {
             panic!("stub provider panicked in complete_chat_stream");
         }
+        self.requests
+            .lock()
+            .unwrap()
+            .push(serde_json::to_string(&request).unwrap_or_default());
         let script = self
             .scripts
             .lock()

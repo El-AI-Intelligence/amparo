@@ -17,7 +17,7 @@ mod common;
 
 use amparo_agent::ApprovalRequest;
 use amparo_chat::discord::DiscordTransport;
-use amparo_chat::driver::ChatDriver;
+use amparo_chat::driver::{ChatDriver, PolicySource, Tenants};
 use amparo_chat::router::ApprovalRouter;
 use amparo_chat::transport::{ChatRef, ChatTransport};
 use amparo_policy::AllowAllPolicyEngine;
@@ -339,9 +339,9 @@ async fn read_request(sock: &mut TcpStream) -> Option<RecordedRequest> {
 /// ever starts — the refusal itself is still observable on the REST mock.
 fn deny_all_driver(transport: Arc<dyn ChatTransport>) -> Arc<ChatDriver> {
     Arc::new(ChatDriver::new(
-        HashSet::new(),
+        Tenants::LegacyAllowlist(HashSet::new()),
         StubProvider::new(vec![]),
-        Arc::new(AllowAllPolicyEngine),
+        PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
         registry_with_echo(ToolTrustTier::Observational),
         PathBuf::from("/tmp/amparo-chat-discord-test"),
         transport,
@@ -503,12 +503,12 @@ async fn driver_runs_a_task_through_the_gateway_and_button_press() {
     let transport: Arc<dyn ChatTransport> =
         Arc::new(DiscordTransport::with_urls("test-token".into(), gw.ws_url(), rest.url()));
     let driver = Arc::new(ChatDriver::new(
-        HashSet::from(["222".to_string()]),
+        Tenants::LegacyAllowlist(HashSet::from(["222".to_string()])),
         StubProvider::new(vec![
             turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#),
             turn_text("Done."),
         ]),
-        Arc::new(AllowAllPolicyEngine),
+        PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
         registry_with_echo(ToolTrustTier::ExternalEffector),
         std::env::temp_dir().join(format!("amparo-chat-discord-{}", std::process::id())),
         Arc::clone(&transport),
@@ -599,12 +599,12 @@ async fn wrong_user_press_gets_toast_and_requester_still_decides() {
     let transport: Arc<dyn ChatTransport> =
         Arc::new(DiscordTransport::with_urls("test-token".into(), gw.ws_url(), rest.url()));
     let driver = Arc::new(ChatDriver::new(
-        HashSet::from(["222".to_string()]),
+        Tenants::LegacyAllowlist(HashSet::from(["222".to_string()])),
         StubProvider::new(vec![
             turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#),
             turn_text("Done."),
         ]),
-        Arc::new(AllowAllPolicyEngine),
+        PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
         registry_with_echo(ToolTrustTier::ExternalEffector),
         std::env::temp_dir().join(format!("amparo-chat-discord-{}", std::process::id())),
         Arc::clone(&transport),

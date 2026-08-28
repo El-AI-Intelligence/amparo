@@ -54,4 +54,4 @@ pub use transport::{
 };
 pub use gate::ChatApprovalGate;
 pub use sink::ChatEventSink;
-pub use driver::ChatDriver;
+pub use driver::{ChatDriver, PolicySource, Tenants};
