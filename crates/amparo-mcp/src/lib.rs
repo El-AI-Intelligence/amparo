@@ -19,6 +19,7 @@
 
 pub mod client;
 pub mod jsonrpc;
+pub mod serve;
 pub mod server;
 pub mod types;
 

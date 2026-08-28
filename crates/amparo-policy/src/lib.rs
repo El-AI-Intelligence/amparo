@@ -12,6 +12,8 @@
 //!   (`POST /check {tool_name, target} → {verdict, reason, enforced}`), so a
 //!   remote engine — [Guardrail](https://elai-intelligence.com) is the
 //!   commercial implementation — plugs in over HTTP. Anyone can write another.
+//! - [`AllowAllPolicyEngine`] is the explicit opt-in for local experiments.
+//!   It never becomes the default — an operator has to name it.
 //!
 //! **Caller contract** (from the wire spec, implemented here):
 //!
@@ -117,6 +119,27 @@ impl PolicyEngine for DenyAllPolicyEngine {
     }
 }
 
+/// Explicit opt-in engine: allows every call, with no fired rules.
+///
+/// Never the default — wiring this in means the operator has decided no
+/// policy checks are wanted (local experiments, sandboxed environments).
+/// An agent with no configured policy must use [`DenyAllPolicyEngine`] —
+/// allow-all only ever appears by name.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllowAllPolicyEngine;
+
+#[async_trait]
+impl PolicyEngine for AllowAllPolicyEngine {
+    async fn judge_tool(
+        &self,
+        _tool_name: &str,
+        _target: &str,
+        _params: &[(&str, &str)],
+    ) -> PolicyDecision {
+        PolicyDecision::allow()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +164,14 @@ mod tests {
             let d = engine.judge_tool(tool, "anything", &[]).await;
             assert_eq!(d.verdict, PolicyVerdict::Deny, "{} must be denied", tool);
         }
+    }
+
+    #[tokio::test]
+    async fn allow_all_engine_is_the_explicit_named_opt_in() {
+        let engine = AllowAllPolicyEngine;
+        let d = engine.judge_tool("run_command", "rm -rf /", &[]).await;
+        assert_eq!(d.verdict, PolicyVerdict::Allow);
+        assert!(d.fired.is_empty(), "allow-all fires no rules");
     }
 
     #[test]
