@@ -14,6 +14,7 @@ repository = "https://github.com/El-AI-Intelligence/amparo"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
+toml = "0.8"
 async-trait = "0.1"
 tokio = { version = "1.40", features = ["rt-multi-thread", "time", "sync", "macros", "io-util", "io-std", "process", "fs", "net", "signal"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }

@@ -35,6 +35,7 @@
 // integration tests do.
 extern crate self as amparo_chat;
 
+pub mod config;
 pub mod transport;
 pub mod router;
 pub mod gate;
@@ -45,6 +46,7 @@ pub mod telegram;
 pub mod discord;
 pub mod slack;
 
+pub use config::{ChatConfig, ConfigError, UserProfile};
 pub use router::{ApprovalRouter, TakeResult};
 pub use transport::{
     ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport, IncomingMessage,

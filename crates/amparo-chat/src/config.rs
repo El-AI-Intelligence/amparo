@@ -1,0 +1,296 @@
+//! Chat config — the tenant directory for the chat face.
+//!
+//! [`ChatConfig`] decides who may start tasks in chat: one
+//! `platform:user_id` profile per tenant, each with an optional trust
+//! ceiling (the per-user `--trust-ceiling`) and an optional workspace
+//! subpath. It loads from a TOML file at startup, so the operator's config
+//! file — not a compile flag — decides who gets a chat face and how far
+//! they can go.
+
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+
+use amparo_tools::registry::ToolTrustTier;
+use serde::Deserialize;
+use thiserror::Error;
+
+/// One tenant's profile in a [`ChatConfig`] file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserProfile {
+    /// Per-user trust ceiling; absent → the driver's default (the
+    /// `--trust-ceiling` flag).
+    #[serde(default)]
+    pub trust_ceiling: Option<ToolTrustTier>,
+    /// Workspace subpath relative to the workspace root; absent →
+    /// `users/<platform>-<user_id>`. Absolute paths and paths containing
+    /// `..` are rejected at load.
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
+}
+
+/// The parsed chat config: the tenant directory — the only users who may
+/// start tasks.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatConfig {
+    /// Tenant directory, keyed `"platform:user_id"`.
+    #[serde(default)]
+    pub users: BTreeMap<String, UserProfile>,
+}
+
+impl ChatConfig {
+    /// Loads and validates `path`: reads the file, parses TOML, then
+    /// validates every tenant key (`platform:user_id` — a `:` with both
+    /// parts non-empty) and every profile workspace (relative, no `..`).
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        for (key, profile) in &config.users {
+            let (platform, user_id) = key.split_once(':').ok_or_else(|| ConfigError::Key {
+                path: path.to_path_buf(),
+                key: key.clone(),
+            })?;
+            if platform.is_empty() || user_id.is_empty() {
+                return Err(ConfigError::Key {
+                    path: path.to_path_buf(),
+                    key: key.clone(),
+                });
+            }
+            if let Some(workspace) = &profile.workspace {
+                if workspace.is_absolute()
+                    || workspace.components().any(|c| matches!(c, Component::ParentDir))
+                {
+                    return Err(ConfigError::WorkspacePath {
+                        path: path.to_path_buf(),
+                        key: key.clone(),
+                        value: workspace.clone(),
+                    });
+                }
+            }
+        }
+        Ok(config)
+    }
+
+    /// True when there are no tenants — startup should warn rather than
+    /// run mute.
+    pub fn is_empty(&self) -> bool {
+        self.users.is_empty()
+    }
+}
+
+/// Why a chat config failed to load or validate.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// The config file could not be read.
+    #[error("chat config {path}: {source}")]
+    Io {
+        /// The path that could not be read.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The config file is not valid TOML, or does not match the schema.
+    #[error("chat config {path}: {source}")]
+    Parse {
+        /// The path whose content failed to parse.
+        path: PathBuf,
+        /// The underlying TOML/serde failure.
+        #[source]
+        source: toml::de::Error,
+    },
+    /// A tenant key is not `platform:user_id`.
+    #[error("chat config {path}: tenant key {key:?} is not \"platform:user_id\"")]
+    Key {
+        /// The path that failed validation.
+        path: PathBuf,
+        /// The offending tenant key.
+        key: String,
+    },
+    /// A profile workspace is absolute or escapes the workspace root.
+    #[error(
+        "chat config {path}: tenant {key}: workspace must be a relative path without \"..\" (got {value:?})"
+    )]
+    WorkspacePath {
+        /// The path that failed validation.
+        path: PathBuf,
+        /// The offending tenant's key.
+        key: String,
+        /// The workspace value that was rejected.
+        value: PathBuf,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes `body` to a uniquely named temp file outside the repo tree
+    /// and returns its path; the caller removes the file when done.
+    fn write_cfg(name: &str, body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("amparo-chat-config-{name}.toml"));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn happy_path_two_sections_one_all_defaults() {
+        let path = write_cfg(
+            "happy_path",
+            "[users.\"telegram:111\"]\n[users.\"discord:222\"]\ntrust_ceiling = \"external_effector\"\n",
+        );
+        let config = ChatConfig::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(config.users.len(), 2);
+        assert_eq!(config.users["telegram:111"].trust_ceiling, None);
+        assert_eq!(config.users["telegram:111"].workspace, None);
+        assert_eq!(
+            config.users["discord:222"].trust_ceiling,
+            Some(ToolTrustTier::ExternalEffector)
+        );
+        assert_eq!(config.users["discord:222"].workspace, None);
+    }
+
+    #[test]
+    fn empty_users_table_is_empty_config() {
+        let path = write_cfg("empty_users", "[users]\n");
+        let config = ChatConfig::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(config.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_file_parses_empty() {
+        let path = write_cfg("whitespace_only", "   \n\t\n  ");
+        let config = ChatConfig::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(config.is_empty());
+    }
+
+    #[test]
+    fn unknown_field_is_a_parse_error() {
+        let path = write_cfg("unknown_field", "[users.\"telegram:111\"]\nno_such_field = 1\n");
+        let err = ChatConfig::load(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match &err {
+            ConfigError::Parse { .. } => {}
+            other => panic!("expected Parse, got {other:?}"),
+        }
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn unknown_top_level_table_is_a_parse_error() {
+        let path = write_cfg("unknown_top_level", "[wat]\n");
+        let err = ChatConfig::load(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match &err {
+            ConfigError::Parse { .. } => {}
+            other => panic!("expected Parse, got {other:?}"),
+        }
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn bogus_tier_is_a_parse_error() {
+        let path = write_cfg(
+            "bogus_tier",
+            "[users.\"telegram:111\"]\ntrust_ceiling = \"bogus\"\n",
+        );
+        let err = ChatConfig::load(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match &err {
+            ConfigError::Parse { .. } => {}
+            other => panic!("expected Parse, got {other:?}"),
+        }
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn absolute_workspace_is_rejected() {
+        let path = write_cfg(
+            "absolute_ws",
+            "[users.\"telegram:111\"]\nworkspace = \"/etc/passwd\"\n",
+        );
+        let err = ChatConfig::load(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match &err {
+            ConfigError::WorkspacePath { value, .. } => {
+                assert_eq!(value, &PathBuf::from("/etc/passwd"))
+            }
+            other => panic!("expected WorkspacePath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotdot_workspace_is_rejected() {
+        let path = write_cfg(
+            "dotdot_ws",
+            "[users.\"telegram:111\"]\nworkspace = \"../escape\"\n",
+        );
+        let err = ChatConfig::load(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match &err {
+            ConfigError::WorkspacePath { value, .. } => {
+                assert_eq!(value, &PathBuf::from("../escape"))
+            }
+            other => panic!("expected WorkspacePath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_workspace_is_accepted() {
+        let path = write_cfg(
+            "relative_ws",
+            "[users.\"telegram:111\"]\nworkspace = \"team-a\"\n",
+        );
+        let config = ChatConfig::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            config.users["telegram:111"].workspace,
+            Some(PathBuf::from("team-a"))
+        );
+    }
+
+    #[test]
+    fn key_without_colon_is_rejected() {
+        let path = write_cfg("no_colon", "[users.\"telegram111\"]\n");
+        let err = ChatConfig::load(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match &err {
+            ConfigError::Key { key, .. } => assert_eq!(key, "telegram111"),
+            other => panic!("expected Key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_with_empty_platform_is_rejected() {
+        for body in ["[users.\":111\"]\n", "[users.\"telegram:\"]\n"] {
+            let path = write_cfg("empty_platform", body);
+            let err = ChatConfig::load(&path).unwrap_err();
+            std::fs::remove_file(&path).unwrap();
+            match &err {
+                ConfigError::Key { .. } => {}
+                other => panic!("expected Key, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_file_is_an_io_error() {
+        let path = std::env::temp_dir().join("amparo-chat-config-definitely-not-here.toml");
+        let err = ChatConfig::load(&path).unwrap_err();
+        match &err {
+            ConfigError::Io { .. } => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+}
