@@ -1,0 +1,23 @@
+[package]
+name = "amparo-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The amparo CLI: drive the agent loop end-to-end, serve tools over MCP — one binary, deny-by-default"
+
+[[bin]]
+name = "amparo"
+path = "src/main.rs"
+
+[dependencies]
+amparo-agent = { path = "../amparo-agent" }
+amparo-inference = { path = "../amparo-inference" }
+amparo-mcp = { path = "../amparo-mcp" }
+amparo-policy = { path = "../amparo-policy" }
+amparo-privacy = { path = "../amparo-privacy" }
+amparo-tools = { path = "../amparo-tools" }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
