@@ -9,18 +9,8 @@ use super::{ToolCall, ToolExecutor, ToolParam, ToolResult, ToolSchema, ToolTrust
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::process::Command;
-
-fn sandbox_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("AMPARO_WORKSPACE") {
-        PathBuf::from(dir)
-    } else {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join("amparo-workspace")
-    }
-}
 
 fn make_result(call: &ToolCall, success: bool, output: Value, summary: String) -> ToolResult {
     ToolResult {
@@ -56,10 +46,23 @@ async fn run_git(args: &[&str], cwd: &PathBuf) -> std::result::Result<String, St
 
 /// Shows the working-tree status of the git repository in the Amparo
 /// workspace. Trusted at `Observational`.
-pub struct GitStatusTool;
+pub struct GitStatusTool {
+    policy: Arc<crate::paths::PathPolicy>,
+}
 impl GitStatusTool {
     /// Creates a new [`GitStatusTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`GitStatusTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`GitStatusTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 #[async_trait]
@@ -74,7 +77,7 @@ impl ToolExecutor for GitStatusTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let root = sandbox_root();
+        let root = self.policy.workspace_root.clone();
         match run_git(&["status", "--porcelain", "-b"], &root).await {
             Ok(output) => {
                 let lines: Vec<&str> = output.lines().collect();
@@ -102,10 +105,23 @@ impl ToolExecutor for GitStatusTool {
 
 /// Shows the diff of working-tree changes (staged, unstaged, or between
 /// commits) in the workspace repository. Trusted at `Observational`.
-pub struct GitDiffTool;
+pub struct GitDiffTool {
+    policy: Arc<crate::paths::PathPolicy>,
+}
 impl GitDiffTool {
     /// Creates a new [`GitDiffTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`GitDiffTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`GitDiffTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 #[async_trait]
@@ -142,7 +158,7 @@ impl ToolExecutor for GitDiffTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let root = sandbox_root();
+        let root = self.policy.workspace_root.clone();
         let staged = call.arg_bool("staged").unwrap_or(false);
         let file = arg_str(call, "file");
         let max_lines = call.arg_u64("max_lines").unwrap_or(500) as usize;
@@ -180,10 +196,23 @@ impl ToolExecutor for GitDiffTool {
 
 /// Stages all changes and creates a commit in the workspace repository.
 /// Trusted at `LocalMutating`.
-pub struct GitCommitTool;
+pub struct GitCommitTool {
+    policy: Arc<crate::paths::PathPolicy>,
+}
 impl GitCommitTool {
     /// Creates a new [`GitCommitTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`GitCommitTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`GitCommitTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 #[async_trait]
@@ -213,7 +242,7 @@ impl ToolExecutor for GitCommitTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let root = sandbox_root();
+        let root = self.policy.workspace_root.clone();
         let message = match arg_str(call, "message") {
             Some(m) => m,
             None => return make_result(call, false, serde_json::json!({"error": "missing message"}), "Commit failed".to_string()),
@@ -255,10 +284,23 @@ impl ToolExecutor for GitCommitTool {
 
 /// Shows recent commit history of the workspace repository. Trusted at
 /// `Observational`.
-pub struct GitLogTool;
+pub struct GitLogTool {
+    policy: Arc<crate::paths::PathPolicy>,
+}
 impl GitLogTool {
     /// Creates a new [`GitLogTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`GitLogTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`GitLogTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 #[async_trait]
@@ -288,7 +330,7 @@ impl ToolExecutor for GitLogTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let root = sandbox_root();
+        let root = self.policy.workspace_root.clone();
         let count = call.arg_u64("count").unwrap_or(10) as usize;
         let count_str = count.to_string();
 
@@ -321,10 +363,23 @@ impl ToolExecutor for GitLogTool {
 
 /// Lists, creates, or switches git branches in the workspace repository.
 /// Trusted at `LocalMutating`.
-pub struct GitBranchTool;
+pub struct GitBranchTool {
+    policy: Arc<crate::paths::PathPolicy>,
+}
 impl GitBranchTool {
     /// Creates a new [`GitBranchTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`GitBranchTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`GitBranchTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 #[async_trait]
@@ -354,7 +409,7 @@ impl ToolExecutor for GitBranchTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let root = sandbox_root();
+        let root = self.policy.workspace_root.clone();
         let action = arg_str(call, "action").unwrap_or("list");
 
         match action {
@@ -396,10 +451,23 @@ impl ToolExecutor for GitBranchTool {
 
 /// Shows per-line authorship (git blame) for a file in the workspace
 /// repository. Trusted at `Observational`.
-pub struct GitBlameTool;
+pub struct GitBlameTool {
+    policy: Arc<crate::paths::PathPolicy>,
+}
 impl GitBlameTool {
     /// Creates a new [`GitBlameTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`GitBlameTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`GitBlameTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 #[async_trait]
@@ -429,7 +497,7 @@ impl ToolExecutor for GitBlameTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let root = sandbox_root();
+        let root = self.policy.workspace_root.clone();
         let file = match arg_str(call, "file") {
             Some(f) => f,
             None => return make_result(call, false, serde_json::json!({"error": "missing file"}), "Blame failed".to_string()),

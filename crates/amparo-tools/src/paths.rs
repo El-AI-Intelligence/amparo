@@ -64,17 +64,40 @@ impl Default for PathPolicy {
 
 impl PathPolicy {
     /// Create a policy from environment variables, falling back to defaults.
+    ///
+    /// Reads `AMPARO_WORKSPACE` for the workspace root and
+    /// `AMPARO_TOOL_TIMEOUT_SECS` for the maximum execution time.
     pub fn from_env() -> Self {
         let mut policy = Self::default();
         if let Ok(val) = std::env::var("AMPARO_WORKSPACE") {
             policy.workspace_root = PathBuf::from(val);
         }
+        policy.apply_timeout_env();
+        policy
+    }
+
+    /// Create a policy rooted at `workspace_root`, falling back to defaults.
+    ///
+    /// Identical to [`PathPolicy::from_env`] — including the
+    /// `AMPARO_TOOL_TIMEOUT_SECS` override — except that `AMPARO_WORKSPACE`
+    /// is ignored and the given root is used verbatim. This is the safe
+    /// constructor for per-user workspace roots in chat mode: it lets hosts
+    /// inject an explicit root per task instead of mutating the
+    /// process-global environment, which races across concurrent tasks.
+    pub fn from_root(workspace_root: PathBuf) -> Self {
+        let mut policy = Self::default();
+        policy.workspace_root = workspace_root;
+        policy.apply_timeout_env();
+        policy
+    }
+
+    /// Apply the `AMPARO_TOOL_TIMEOUT_SECS` environment override, when set.
+    fn apply_timeout_env(&mut self) {
         if let Ok(val) = std::env::var("AMPARO_TOOL_TIMEOUT_SECS") {
             if let Ok(secs) = val.parse::<u64>() {
-                policy.max_execution_seconds = secs;
+                self.max_execution_seconds = secs;
             }
         }
-        policy
     }
 
     /// Check whether a path is within the sandbox boundary.
@@ -330,5 +353,26 @@ mod tests {
         assert!(p.check_command_blocked("base64 -d").is_some());
         assert!(p.check_command_blocked("echo hello").is_none());
         assert!(p.check_command_blocked("git status").is_none());
+    }
+
+    #[test]
+    fn from_root_uses_the_given_root() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-from-root-{}", std::process::id()));
+        let p = PathPolicy::from_root(root.clone());
+        let resolved = p.resolve_workspace_path("notes/ideas.md").unwrap();
+        assert!(resolved.starts_with(&root));
+        assert_eq!(resolved, root.join("notes/ideas.md"));
+    }
+
+    #[test]
+    fn from_root_keeps_defaults() {
+        let root = std::env::temp_dir()
+            .join(format!("amparo-from-root-defaults-{}", std::process::id()));
+        let p = PathPolicy::from_root(root.clone());
+        assert_eq!(p.workspace_root, root);
+        assert_eq!(p.max_execution_seconds, 120);
+        assert!(p.read_only_paths.iter().any(|p| p == &PathBuf::from("/usr")));
+        assert!(!p.blocked_patterns.is_empty());
     }
 }

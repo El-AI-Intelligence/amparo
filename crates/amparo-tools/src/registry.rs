@@ -271,35 +271,45 @@ use crate::git::{
     GitBlameTool, GitBranchTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool,
 };
 use crate::memory::MemorySearchTool;
+use crate::paths::PathPolicy;
 use crate::shell::RunCommandTool;
 use crate::testing::RunTestsTool;
 use crate::web::{FetchUrlTool, WebSearchTool};
 
-/// Create the default registry with all built-in Amparo tools registered.
+/// Create the default registry with all 17 built-in tools, the 14
+/// workspace-bound ones rooted at `policy`.
 ///
 /// The deny-by-default posture lives in the *agent*, not here: a registry
 /// registers tools; only the policy gate in `amparo-agent` decides whether a
 /// call executes.
-pub fn default_registry() -> ToolRegistry {
+pub fn default_registry_with_policy(policy: Arc<PathPolicy>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(WebSearchTool::new()));
     registry.register(Arc::new(FetchUrlTool::new()));
-    registry.register(Arc::new(ReadFileTool::new()));
-    registry.register(Arc::new(WriteFileTool::new()));
-    registry.register(Arc::new(ListDirTool::new()));
-    registry.register(Arc::new(EditFileTool::new()));
-    registry.register(Arc::new(PatchFileTool::new()));
-    registry.register(Arc::new(RunCommandTool::new()));
+    registry.register(Arc::new(ReadFileTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(WriteFileTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(ListDirTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(EditFileTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(PatchFileTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(RunCommandTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(MemorySearchTool::new()));
-    registry.register(Arc::new(GitStatusTool::new()));
-    registry.register(Arc::new(GitDiffTool::new()));
-    registry.register(Arc::new(GitCommitTool::new()));
-    registry.register(Arc::new(GitLogTool::new()));
-    registry.register(Arc::new(GitBranchTool::new()));
-    registry.register(Arc::new(GitBlameTool::new()));
-    registry.register(Arc::new(RunTestsTool::new()));
-    registry.register(Arc::new(RunBuildTool::new()));
+    registry.register(Arc::new(GitStatusTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(GitDiffTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(GitCommitTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(GitLogTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(GitBranchTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(GitBlameTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(RunTestsTool::with_policy(Arc::clone(&policy))));
+    registry.register(Arc::new(RunBuildTool::with_policy(Arc::clone(&policy))));
     registry
+}
+
+/// Create the default registry with all built-in Amparo tools registered.
+///
+/// Equivalent to [`default_registry_with_policy`] with the policy loaded from
+/// the environment.
+pub fn default_registry() -> ToolRegistry {
+    default_registry_with_policy(Arc::new(PathPolicy::from_env()))
 }
 
 #[cfg(test)]
@@ -382,5 +392,40 @@ mod tests {
         for required in ["run_command", "read_file", "write_file", "git_commit", "web_search", "run_tests"] {
             assert!(names.contains(&required.to_string()), "{} must be in the registry", required);
         }
+    }
+
+    #[tokio::test]
+    async fn default_registry_with_policy_roots_workspace_tools() {
+        let root = std::env::temp_dir().join(format!("amparo-registry-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("seed.txt"), "injected content").unwrap();
+        let reg = default_registry_with_policy(Arc::new(PathPolicy::from_root(root.clone())));
+
+        let read = reg
+            .dispatch(&ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "seed.txt"}),
+            })
+            .await
+            .expect("read_file must be registered");
+        assert!(read.success, "output: {}", read.output);
+        assert_eq!(read.output["content"], "injected content");
+
+        let pwd = reg
+            .dispatch(&ToolCall {
+                id: "2".to_string(),
+                name: "run_command".to_string(),
+                arguments: serde_json::json!({"command": "pwd"}),
+            })
+            .await
+            .expect("run_command must be registered");
+        assert!(pwd.success, "output: {}", pwd.output);
+        let stdout = pwd.output["stdout"].as_str().unwrap_or("");
+        assert!(
+            stdout.contains(&root.to_string_lossy().to_string()),
+            "pwd must report the injected root, got: {}",
+            stdout
+        );
     }
 }

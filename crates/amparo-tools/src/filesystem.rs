@@ -61,9 +61,16 @@ impl ReadFileTool {
     /// Creates a new [`ReadFileTool`] with the path policy loaded from
     /// environment variables.
     pub fn new() -> Self {
-        Self {
-            policy: Arc::new(crate::paths::PathPolicy::from_env()),
-        }
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`ReadFileTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`ReadFileTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
     }
 }
 
@@ -135,9 +142,16 @@ impl WriteFileTool {
     /// Creates a new [`WriteFileTool`] with the path policy loaded from
     /// environment variables.
     pub fn new() -> Self {
-        Self {
-            policy: Arc::new(crate::paths::PathPolicy::from_env()),
-        }
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`WriteFileTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`WriteFileTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
     }
 }
 
@@ -228,9 +242,16 @@ impl ListDirTool {
     /// Creates a new [`ListDirTool`] with the path policy loaded from
     /// environment variables.
     pub fn new() -> Self {
-        Self {
-            policy: Arc::new(crate::paths::PathPolicy::from_env()),
-        }
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`ListDirTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`ListDirTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
     }
 }
 
@@ -300,9 +321,16 @@ impl EditFileTool {
     /// Creates a new [`EditFileTool`] with the path policy loaded from
     /// environment variables.
     pub fn new() -> Self {
-        Self {
-            policy: Arc::new(crate::paths::PathPolicy::from_env()),
-        }
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`EditFileTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`EditFileTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
     }
 }
 
@@ -407,9 +435,16 @@ impl PatchFileTool {
     /// Creates a new [`PatchFileTool`] with the path policy loaded from
     /// environment variables.
     pub fn new() -> Self {
-        Self {
-            policy: Arc::new(crate::paths::PathPolicy::from_env()),
-        }
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`PatchFileTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`PatchFileTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
     }
 }
 
@@ -605,5 +640,34 @@ mod tests {
         let source = vec!["a", "b", "c", "d", "e"];
         assert_eq!(find_subsequence(&source, &["b", "c", "d"], 0), Some(1));
         assert_eq!(find_subsequence(&source, &["x"], 0), None);
+    }
+
+    #[tokio::test]
+    async fn with_policy_roots_tool_at_the_given_root() {
+        let root = std::env::temp_dir().join(format!("amparo-with-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("seed.txt"), "injected content").unwrap();
+        let policy = Arc::new(crate::paths::PathPolicy::from_root(root.clone()));
+
+        let read = ReadFileTool::with_policy(Arc::clone(&policy));
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "seed.txt"}),
+        };
+        let result = read.execute(&call).await;
+        assert!(result.success, "output: {}", result.output);
+        assert_eq!(result.output["content"], "injected content");
+
+        let write = WriteFileTool::with_policy(Arc::clone(&policy));
+        let call = ToolCall {
+            id: "2".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path": "sub/out.txt", "content": "hello"}),
+        };
+        let result = write.execute(&call).await;
+        assert!(result.success, "output: {}", result.output);
+        let written = std::fs::read_to_string(root.join("sub/out.txt")).unwrap();
+        assert_eq!(written, "hello");
     }
 }

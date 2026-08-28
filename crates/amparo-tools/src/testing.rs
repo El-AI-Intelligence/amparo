@@ -9,18 +9,8 @@ use super::{ToolCall, ToolExecutor, ToolParam, ToolResult, ToolSchema, ToolTrust
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::process::Command;
-
-fn sandbox_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("AMPARO_WORKSPACE") {
-        PathBuf::from(dir)
-    } else {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join("amparo-workspace")
-    }
-}
 
 fn make_result(call: &ToolCall, success: bool, output: Value, summary: String) -> ToolResult {
     ToolResult {
@@ -41,10 +31,23 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
 /// Detects the test framework from the workspace and runs tests.
 /// Supports: cargo test, npm test, pytest, go test, jest, vitest.
 
-pub struct RunTestsTool;
+pub struct RunTestsTool {
+    policy: Arc<crate::paths::PathPolicy>,
+}
 impl RunTestsTool {
     /// Creates a new [`RunTestsTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`RunTestsTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`RunTestsTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 #[async_trait]
@@ -74,7 +77,7 @@ impl ToolExecutor for RunTestsTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let root = sandbox_root();
+        let root = self.policy.workspace_root.clone();
         let timeout = call.arg_u64("timeout_seconds")
             .unwrap_or(120);
 

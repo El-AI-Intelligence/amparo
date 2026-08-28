@@ -9,18 +9,8 @@ use super::{ToolCall, ToolExecutor, ToolParam, ToolResult, ToolSchema, ToolTrust
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::process::Command;
-
-fn sandbox_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("AMPARO_WORKSPACE") {
-        PathBuf::from(dir)
-    } else {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join("amparo-workspace")
-    }
-}
 
 fn make_result(call: &ToolCall, success: bool, output: Value, summary: String) -> ToolResult {
     ToolResult {
@@ -42,10 +32,23 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
 /// Build tool — runs a build in the Amparo workspace, auto-detecting the build
 /// system (Cargo, npm, go, make) or executing an explicit command, and returns
 /// parsed errors. Trusted at `SystemControl`.
-pub struct RunBuildTool;
+pub struct RunBuildTool {
+    policy: Arc<crate::paths::PathPolicy>,
+}
 impl RunBuildTool {
     /// Creates a new [`RunBuildTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self::with_policy(Arc::new(crate::paths::PathPolicy::from_env()))
+    }
+
+    /// Creates a new [`RunBuildTool`] with an explicitly supplied policy.
+    ///
+    /// Preferred for consistent configuration across tools (e.g. per-user
+    /// workspace roots in chat mode); [`RunBuildTool::new`] reads the
+    /// environment instead.
+    pub fn with_policy(policy: Arc<crate::paths::PathPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 #[async_trait]
@@ -75,7 +78,7 @@ impl ToolExecutor for RunBuildTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let root = sandbox_root();
+        let root = self.policy.workspace_root.clone();
         let timeout = call.arg_u64("timeout_seconds")
             .unwrap_or(300);
 
