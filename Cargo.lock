@@ -53,6 +53,7 @@ name = "amparo-cli"
 version = "0.1.0"
 dependencies = [
  "amparo-agent",
+ "amparo-chat",
  "amparo-inference",
  "amparo-mcp",
  "amparo-policy",

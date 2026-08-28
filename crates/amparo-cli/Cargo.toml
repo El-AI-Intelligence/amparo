@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 amparo-agent = { path = "../amparo-agent" }
+amparo-chat = { path = "../amparo-chat" }
 amparo-inference = { path = "../amparo-inference" }
 amparo-mcp = { path = "../amparo-mcp" }
 amparo-policy = { path = "../amparo-policy" }

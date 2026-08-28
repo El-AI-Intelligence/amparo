@@ -14,7 +14,10 @@
 //! exits instead of silently starving; every other failure is logged and
 //! retried after 5 seconds. [`serve`] checks the token, wires the shared
 //! driver assembly ([`crate::dispatch::build_driver`]), and runs the loop
-//! until Ctrl-C or a fatal error.
+//! until Ctrl-C or a fatal error. The transport is rooted at the Bot API
+//! base from `AMPARO_CHAT_TELEGRAM_BASE` (default
+//! `https://api.telegram.org`), so tests and self-hosted proxies can point
+//! [`serve`] at their own endpoint.
 
 use crate::dispatch::{build_driver, ChatFlags, ChatServeError};
 use crate::driver::ChatDriver;
@@ -390,9 +393,21 @@ fn truncate(text: &str) -> String {
     format!("{}…", &text[..end])
 }
 
+/// The default Bot API root, used when `AMPARO_CHAT_TELEGRAM_BASE` is unset.
+const DEFAULT_TELEGRAM_BASE: &str = "https://api.telegram.org";
+
+/// The Bot API base [`serve`] roots the transport at: the value of
+/// `AMPARO_CHAT_TELEGRAM_BASE`, or [`DEFAULT_TELEGRAM_BASE`] when unset.
+fn telegram_base() -> String {
+    std::env::var("AMPARO_CHAT_TELEGRAM_BASE")
+        .unwrap_or_else(|_| DEFAULT_TELEGRAM_BASE.to_string())
+}
+
 /// Serve the Telegram adapter: token fail-closed (exit 2), the shared
 /// driver assembly, then the long-poll loop until Ctrl-C or a fatal error
-/// (exit 1).
+/// (exit 1). The transport is rooted at the Bot API base from
+/// `AMPARO_CHAT_TELEGRAM_BASE` (default `https://api.telegram.org`) — an
+/// override for tests and self-hosted proxies.
 pub async fn serve(flags: &ChatFlags) -> Result<(), ChatServeError> {
     let token = std::env::var("AMPARO_CHAT_TELEGRAM_TOKEN").map_err(|_| {
         ChatServeError::new(
@@ -401,7 +416,7 @@ pub async fn serve(flags: &ChatFlags) -> Result<(), ChatServeError> {
         )
     })?;
     let transport: Arc<dyn ChatTransport> =
-        Arc::new(TelegramTransport::new("https://api.telegram.org", token));
+        Arc::new(TelegramTransport::new(telegram_base(), token));
     let driver = build_driver(flags, transport.clone()).await?;
     tokio::select! {
         result = transport.receive(driver) => {
@@ -445,5 +460,14 @@ mod tests {
         );
         assert_eq!(parse_button(&Some("nonsense".to_string())), None);
         assert_eq!(parse_button(&None), None);
+    }
+
+    #[test]
+    fn telegram_base_env_overrides_and_falls_back() {
+        std::env::remove_var("AMPARO_CHAT_TELEGRAM_BASE");
+        assert_eq!(telegram_base(), DEFAULT_TELEGRAM_BASE);
+        std::env::set_var("AMPARO_CHAT_TELEGRAM_BASE", "http://127.0.0.1:9999");
+        assert_eq!(telegram_base(), "http://127.0.0.1:9999");
+        std::env::remove_var("AMPARO_CHAT_TELEGRAM_BASE");
     }
 }

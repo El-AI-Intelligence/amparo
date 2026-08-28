@@ -7,6 +7,10 @@
 //! - `amparo mcp-serve` exposes the default tool registry over MCP — the same
 //!   implementation as the standalone `amparo-mcp-serve` binary, with the same
 //!   help text, error strings and exit codes.
+//! - `amparo chat telegram|discord|slack [FLAGS]` serves the agent over a
+//!   messaging platform — long-polled Telegram with inline-button approval,
+//!   Discord gateway and Slack Socket Mode, all behind the same deny-by-
+//!   default gate chain as `run`.
 //! - `amparo version` prints the version.
 //!
 //! stdout carries the final answer only (a scripting contract); progress,
@@ -24,14 +28,17 @@ amparo — the policy-governed AI agent
 USAGE:
   amparo run [FLAGS] \"task\"
   amparo mcp-serve [FLAGS]
+  amparo chat telegram|discord|slack [FLAGS]
   amparo version
 
 SUBCOMMANDS:
   run        drive the agent loop end-to-end (stdout: final answer only)
   mcp-serve  expose the default tool registry over MCP (stdio JSON-RPC 2.0)
+  chat       serve the agent over a messaging platform (inline-button approval)
   version    print the version
 
-Run `amparo run --help` or `amparo mcp-serve --help` for flags.";
+Run `amparo run --help`, `amparo mcp-serve --help` or `amparo chat --help`
+for flags.";
 
 #[tokio::main]
 async fn main() {
@@ -43,6 +50,7 @@ async fn main() {
     match cmd.as_str() {
         "run" => run::dispatch(args).await,
         "mcp-serve" => mcp_serve(args).await,
+        "chat" => chat(args).await,
         "version" | "-V" | "--version" => println!("amparo {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{USAGE}"),
         other => {
@@ -68,4 +76,11 @@ async fn mcp_serve(args: impl Iterator<Item = String>) {
             }
         }
     }
+}
+
+/// The `amparo chat` subcommand — parse the platform and flags, then serve
+/// the adapter until Ctrl-C or a fatal failure. Exit codes match the
+/// `amparo run` contract: 0 help, 2 flag/token problem, 1 serve failure.
+async fn chat(args: impl Iterator<Item = String>) {
+    amparo_chat::dispatch::dispatch(args).await;
 }

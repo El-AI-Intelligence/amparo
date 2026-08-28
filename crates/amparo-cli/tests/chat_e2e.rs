@@ -1,0 +1,717 @@
+//! Real-process e2e for the `amparo chat` subcommand.
+//!
+//! The round trip runs against the shipped binary: `AMPARO_CHAT_TELEGRAM_BASE`
+//! points the Telegram serve loop at a scripted mock Bot API, and
+//! `AMPARO_INFERENCE_URL` points the agent at a hand-rolled mock LLM (same
+//! scripted-SSE pattern as `cli_e2e.rs`). A message from an allowlisted user
+//! starts a task, the task escalates `run_command` to the gate, the gate
+//! sends an inline-keyboard approval, the button press is routed back, the
+//! tool executes for real in the temp workspace, and the final answer is
+//! delivered. All assertions poll the recorded request logs — request order
+//! is a transport detail, not a contract.
+//!
+//! The CLI-surface tests (parsing, fail-closed env checks in wiring order —
+//! bot token before inference env — and the exit-code contract: 0 help,
+//! 2 flag/token problem, 1 serve failure) live beside the round trip.
+//! Env-mutating tests hold [`LOCK`] and restore what they touched.
+
+use serde_json::{Value, json};
+use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+fn bin() -> String {
+    // Set at test runtime by cargo (this cargo version does not expose it
+    // at compile time via env!).
+    std::env::var("CARGO_BIN_EXE_amparo").expect("cargo sets CARGO_BIN_EXE_amparo for tests")
+}
+
+/// Serializes the tests that mutate environment variables around child
+/// spawns.
+static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One shared workspace for the spawned chat binary (created once per test
+/// process; `run_command` executes there).
+fn workspace() -> &'static PathBuf {
+    static WS: OnceLock<PathBuf> = OnceLock::new();
+    WS.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("amparo-cli-chat-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("workspace dir");
+        dir
+    })
+}
+
+/// Sets (and removes) env vars for the duration of a test; restores
+/// everything on drop. Callers hold `LOCK`.
+struct EnvGuard(Vec<(String, Option<String>)>);
+
+fn set_env(vars: &[(&str, &str)], removed: &[&str]) -> EnvGuard {
+    let mut saved = Vec::new();
+    for key in removed {
+        saved.push((key.to_string(), std::env::var(key).ok()));
+        std::env::remove_var(key);
+    }
+    for (key, value) in vars {
+        saved.push((key.to_string(), std::env::var(key).ok()));
+        std::env::set_var(key, value);
+    }
+    EnvGuard(saved)
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+/// Spawn `amparo chat` with a closed stdin and a hard timeout so a
+/// regression can never hang the suite.
+async fn run_with(args: &[&str]) -> Output {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::process::Command::new(bin())
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .expect("spawn amparo")
+    })
+    .await
+    .expect("amparo chat timed out")
+}
+
+/// Poll `cond` until it is true, or 30 seconds elapse.
+async fn wait_until(cond: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+// ── Mock LLM ─────────────────────────────────────────────────────────────────
+
+/// One scripted `stream: true` response: the frames emitted before
+/// `data: [DONE]`.
+type Script = Vec<Value>;
+
+/// A hand-rolled HTTP server: every connection gets one scripted SSE
+/// response (consumed in order; the last script repeats) or the fixed
+/// non-stream `VERIFIED` completion. Every request body is recorded so the
+/// test can prove what the agent sent (e.g. a `tool_call_id` reference).
+struct MockLlm {
+    addr: SocketAddr,
+    bodies: Arc<Mutex<Vec<String>>>,
+}
+
+impl MockLlm {
+    async fn start(scripts: Vec<Script>) -> MockLlm {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().unwrap();
+        let scripts = Arc::new(tokio::sync::Mutex::new(scripts));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let log_bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let scripts = Arc::clone(&scripts);
+                let bodies = Arc::clone(&log_bodies);
+                tokio::spawn(async move {
+                    // Read the request head, then the body by Content-Length.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if buf.len() > 1_000_000 {
+                            break;
+                        }
+                    }
+                    let split = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                        .unwrap_or(buf.len());
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.trim_start()
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let mut body = buf[split..].to_vec();
+                    while body.len() < content_length {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&body).to_string();
+                    bodies.lock().unwrap().push(body.clone());
+
+                    let streaming = body.contains("\"stream\":true");
+                    let response = if streaming {
+                        let script = {
+                            let mut remaining = scripts.lock().await;
+                            if remaining.len() > 1 {
+                                remaining.remove(0)
+                            } else {
+                                remaining.first().cloned().unwrap_or_default()
+                            }
+                        };
+                        let mut out = String::new();
+                        for frame in &script {
+                            out.push_str(&format!(
+                                "data: {}\n\n",
+                                serde_json::to_string(frame).unwrap()
+                            ));
+                        }
+                        out.push_str("data: [DONE]\n\n");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            out.len(),
+                            out
+                        )
+                    } else {
+                        let b = json!({
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "VERIFIED"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            b.len(),
+                            b
+                        )
+                    };
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        MockLlm { addr, bodies }
+    }
+
+    /// OpenAI-shaped base URL for `AMPARO_INFERENCE_URL`.
+    fn url(&self) -> String {
+        format!("http://{}/v1", self.addr)
+    }
+
+    /// Whether some recorded request referenced `call_1` as a
+    /// `tool_call_id` — the tool-result message only appears once the
+    /// approved tool actually executed.
+    fn saw_tool_result(&self) -> bool {
+        self.bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|body| body.contains("tool_call_id") && body.contains("call_1"))
+    }
+}
+
+/// One SSE frame carrying a content delta.
+fn content_frame(text: &str) -> Value {
+    json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]})
+}
+
+/// A scripted turn that requests `run_command <command>`: the tool-call
+/// frame plus the arguments fragment.
+fn tool_call_script(command: &str) -> Script {
+    vec![
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "run_command", "arguments": ""}
+                }]},
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": format!("{{\"command\":\"{command}\"}}")}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    ]
+}
+
+// ── Mock Telegram Bot API ─────────────────────────────────────────────────────
+
+/// One HTTP request the mock answered.
+#[derive(Debug, Clone)]
+struct Recorded {
+    method: String,
+    path: String,
+    body: String,
+}
+
+/// A scripted mock of the Telegram Bot API on 127.0.0.1:0. The
+/// per-connection loop REPEATS until the client closes it — reqwest pools
+/// connections, so a one-shot server would stall the second request on the
+/// same pool.
+struct MockTelegram {
+    addr: SocketAddr,
+    log: Arc<Mutex<Vec<Recorded>>>,
+    updates: Arc<Mutex<VecDeque<Value>>>,
+}
+
+impl MockTelegram {
+    async fn start() -> Arc<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let updates = Arc::new(Mutex::new(VecDeque::new()));
+        let next_message_id = Arc::new(AtomicI64::new(1000));
+        tokio::spawn(serve_mock(
+            listener,
+            Arc::clone(&log),
+            Arc::clone(&updates),
+            Arc::clone(&next_message_id),
+        ));
+        Arc::new(Self { addr, log, updates })
+    }
+
+    /// The base URL `AMPARO_CHAT_TELEGRAM_BASE` points at.
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Queue one update as the next `getUpdates` batch.
+    fn push_update(&self, update: Value) {
+        self.updates.lock().unwrap().push_back(update);
+    }
+
+    /// Every recorded request, in arrival order.
+    fn log(&self) -> Vec<Recorded> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+/// Accept connections and answer each on its own task.
+async fn serve_mock(
+    listener: tokio::net::TcpListener,
+    log: Arc<Mutex<Vec<Recorded>>>,
+    updates: Arc<Mutex<VecDeque<Value>>>,
+    next_message_id: Arc<AtomicI64>,
+) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else { return };
+        tokio::spawn(serve_connection(
+            stream,
+            Arc::clone(&log),
+            Arc::clone(&updates),
+            Arc::clone(&next_message_id),
+        ));
+    }
+}
+
+/// Answer requests on one connection until the client closes it.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    log: Arc<Mutex<Vec<Recorded>>>,
+    updates: Arc<Mutex<VecDeque<Value>>>,
+    next_message_id: Arc<AtomicI64>,
+) -> std::io::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    loop {
+        let Some((request_line, body)) = read_request(&mut reader).await? else {
+            return Ok(()); // clean close — reqwest ended the connection
+        };
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts.next().unwrap_or("").to_string();
+        log.lock().unwrap().push(Recorded { method, path: path.clone(), body: body.clone() });
+
+        let endpoint = path
+            .rsplit_once('/')
+            .map(|(_, rest)| rest.split('?').next().unwrap_or(""))
+            .unwrap_or("");
+        let answer = match endpoint {
+            "getUpdates" => {
+                let keyboard_sent = log.lock().unwrap().iter().any(|r| {
+                    r.path.contains("/sendMessage") && body_contains(&r.body, "inline_keyboard")
+                });
+                let mut updates = updates.lock().unwrap();
+                // The message batch is delivered immediately; the callback
+                // batch is held until the keyboard approval is on screen, so
+                // the press can never land before the gate is registered.
+                if keyboard_sent || updates.front().map_or(true, |u| u.get("message").is_some()) {
+                    match updates.pop_front() {
+                        Some(update) => json!({"ok": true, "result": [update]}),
+                        None => json!({"ok": true, "result": []}),
+                    }
+                } else {
+                    json!({"ok": true, "result": []})
+                }
+            }
+            "sendMessage" => json!({
+                "ok": true,
+                "result": {"message_id": next_message_id.fetch_add(1, Ordering::SeqCst)}
+            }),
+            "editMessageText" => json!({"ok": true, "result": true}),
+            "answerCallbackQuery" => json!({"ok": true, "result": true}),
+            other => json!({"ok": false, "error_code": 404, "description": format!("unknown method {other}")}),
+        };
+        write_response(&mut writer, &answer.to_string()).await?;
+    }
+}
+
+/// Read one request: head (up to `\r\n\r\n`) plus the `Content-Length`
+/// body. `Ok(None)` = clean close between requests.
+async fn read_request(
+    reader: &mut (impl AsyncRead + Unpin),
+) -> std::io::Result<Option<(String, String)>> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed mid-request-head",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&bytes[..head_end]).to_string();
+    let mut body = bytes[head_end..].to_vec();
+    let content_length = head
+        .to_ascii_lowercase()
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    while body.len() < content_length {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed mid-body",
+            ));
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length);
+    let request_line = head.lines().next().unwrap_or("").to_string();
+    Ok(Some((request_line, String::from_utf8_lossy(&body).to_string())))
+}
+
+/// Whether a form-url-encoded request body contains `needle` after
+/// decoding — request bodies arrive `%XX`-encoded, so a plain
+/// `contains("approve:call_1")` would never match.
+fn body_contains(body: &str, needle: &str) -> bool {
+    decode_form(body).contains(needle)
+}
+
+/// Decode a form-url-encoded body (`%XX` escapes and `+` spaces).
+fn decode_form(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                out.push(high * 16 + low);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// A single hex digit value, or `None` for anything else.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Write a minimal JSON 200 response.
+async fn write_response(
+    writer: &mut (impl AsyncWrite + Unpin),
+    body: &str,
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: keep-alive\r\n\r\n",
+        body.len()
+    );
+    writer.write_all(head.as_bytes()).await?;
+    writer.write_all(body.as_bytes()).await?;
+    writer.flush().await
+}
+
+/// An update carrying a text message from `user` in `chat`.
+fn message_update(update_id: i64, user_id: i64, chat_id: i64, text: &str) -> Value {
+    json!({
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id + 400,
+            "from": {"id": user_id, "is_bot": false, "first_name": "Test"},
+            "chat": {"id": chat_id, "type": "private"},
+            "text": text,
+        }
+    })
+}
+
+/// An update carrying a callback query with button payload `data`.
+fn callback_update(update_id: i64, user_id: i64, chat_id: i64, data: &str) -> Value {
+    json!({
+        "update_id": update_id,
+        "callback_query": {
+            "id": format!("cb_{update_id}"),
+            "from": {"id": user_id, "is_bot": false, "first_name": "Test"},
+            "message": {
+                "message_id": update_id + 500,
+                "chat": {"id": chat_id, "type": "private"},
+                "text": "Approval needed",
+            },
+            "data": data,
+        }
+    })
+}
+
+// ── CLI surface ──────────────────────────────────────────────────────────────
+
+#[test]
+fn chat_without_platform_exits_2() {
+    let out = std::process::Command::new(bin()).arg("chat").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("requires a platform"), "{}", stderr(&out));
+}
+
+#[test]
+fn chat_unknown_platform_exits_2() {
+    let out = std::process::Command::new(bin())
+        .args(["chat", "unknownplatform"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("unknown platform 'unknownplatform'"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn chat_unknown_flag_exits_2() {
+    let out = std::process::Command::new(bin())
+        .args(["chat", "telegram", "--nonsense"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("unknown flag --nonsense"), "{}", stderr(&out));
+}
+
+#[test]
+fn chat_conflicting_modes_exit_2() {
+    let out = std::process::Command::new(bin())
+        .args(["chat", "telegram", "--allow-all", "--policy-url", "http://p.test"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("mutually exclusive"), "{}", stderr(&out));
+}
+
+#[test]
+fn chat_help_exits_0() {
+    let out = std::process::Command::new(bin())
+        .args(["chat", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = stdout(&out);
+    assert!(stdout.contains("telegram"), "{}", stdout);
+    assert!(stdout.contains("AMPARO_CHAT_TELEGRAM_TOKEN"), "{}", stdout);
+}
+
+#[test]
+fn main_help_lists_chat() {
+    let out = std::process::Command::new(bin()).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        stdout(&out).contains("amparo chat telegram|discord|slack [FLAGS]"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+// ── Fail-closed env checks in wiring order ───────────────────────────────────
+
+#[tokio::test]
+async fn chat_missing_token_exits_2() {
+    let _guard = LOCK.lock().await;
+    let env = set_env(&[], &["AMPARO_CHAT_TELEGRAM_TOKEN"]);
+    let out = run_with(&["chat", "telegram"]).await;
+    drop(env);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("AMPARO_CHAT_TELEGRAM_TOKEN"),
+        "the fail-closed message names the missing token: {}",
+        stderr(&out)
+    );
+}
+
+#[tokio::test]
+async fn chat_serve_fails_closed_without_inference_env() {
+    let _guard = LOCK.lock().await;
+    // The token check runs before the inference wiring, so a token alone is
+    // not enough: serve() must still fail closed on the inference env, and
+    // that is a serve failure (exit 1), not a flag problem (exit 2).
+    let env = set_env(
+        &[("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token")],
+        &["AMPARO_INFERENCE_URL", "AMPARO_INFERENCE_MODEL"],
+    );
+    let out = run_with(&["chat", "telegram", "--allow-all"]).await;
+    drop(env);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("AMPARO_INFERENCE_URL"),
+        "fail-closed message names the missing env: {}",
+        stderr(&out)
+    );
+}
+
+// ── Full round trip ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn chat_telegram_roundtrip_message_approval_tool_answer() {
+    let _guard = LOCK.lock().await;
+
+    // The agent: one tool-calling turn (run_command "echo hi", id call_1)
+    // then a final answer. The tool only ever runs if the gate approves.
+    let llm = MockLlm::start(vec![
+        tool_call_script("echo hi"),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    // The bot API: a message from the allowlisted user, then the Approve
+    // press, then nothing.
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(101, 111, 111, "do it"));
+    telegram.push_update(callback_update(102, 111, 111, "approve:call_1"));
+
+    let ws = workspace().display().to_string();
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_ALLOWLIST", "111"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_WORKSPACE", ws.as_str()),
+        ],
+        &[],
+    );
+
+    // --allow-all skips the policy gate, but approval still fires: the
+    // external-effector run_command tier escalates to the inline buttons.
+    let mut child = tokio::process::Command::new(bin())
+        .args(["chat", "telegram", "--allow-all"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn amparo chat");
+
+    // The round trip is complete once the tool result reached the LLM AND a
+    // sendMessage carrying the final answer was recorded. Order is not
+    // asserted — the log is polled until both appear.
+    let done = wait_until(|| {
+        telegram.log().iter().any(|r| {
+            r.path.contains("/sendMessage") && body_contains(&r.body, "Done.")
+        }) && llm.saw_tool_result()
+    })
+    .await;
+
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        done,
+        "the round trip never completed within 30s; child stderr: {err}"
+    );
+
+    let log = telegram.log();
+    assert!(
+        log.iter().any(|r| r.method == "POST"
+            && r.path.contains("/sendMessage")
+            && body_contains(&r.body, "inline_keyboard")
+            && body_contains(&r.body, "approve:call_1")),
+        "the approval message carries the inline Approve button: {log:#?}"
+    );
+    assert!(
+        log.iter().any(|r| r.path.contains("/answerCallbackQuery")),
+        "the button press was answered so the client spinner stops: {log:#?}"
+    );
+    assert!(
+        log.iter().any(|r| r.path.contains("/editMessageText")),
+        "the gate edited the approval message with the outcome: {log:#?}"
+    );
+    assert!(
+        llm.saw_tool_result(),
+        "the LLM saw the tool_result for call_1 — the approved tool ran for real"
+    );
+}
