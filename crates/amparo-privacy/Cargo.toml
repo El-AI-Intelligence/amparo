@@ -1,0 +1,13 @@
+[package]
+name = "amparo-privacy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-request privacy policy engine and PII redaction for Amparo"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+regex = "1"

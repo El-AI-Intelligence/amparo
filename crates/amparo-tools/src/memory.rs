@@ -1,0 +1,277 @@
+//! Memory tools — the agent's long-term memory surface.
+//!
+//! Memory is an *interface* with a built-in default store:
+//!
+//! - [`Memory`] is the trait. [`InMemoryStore`] is the built-in default —
+//!   a naive, process-local keyword store that makes Amparo runnable with
+//!   zero configuration.
+//! - [Engram](https://github.com/El-AI-Intelligence/Engram) is the
+//!   *recommended* backend — durable, private, syncable across devices — but
+//!   it plugs in behind the trait and Amparo must never hard-depend on any
+//!   memory product.
+
+use super::{ToolCall, ToolExecutor, ToolParam, ToolResult, ToolSchema, ToolTrustTier};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+fn make_result(call: &ToolCall, success: bool, output: Value, summary: String) -> ToolResult {
+    ToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        success,
+        output,
+        display_summary: summary,
+        duration_ms: 0,
+    }
+}
+
+/// One stored memory entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEntry {
+    pub id: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// The memory seam. Implementations swap behind this trait.
+#[async_trait]
+pub trait Memory: Send + Sync {
+    /// Keyword/semantic search, best match first.
+    async fn search(&self, query: &str, limit: usize) -> Vec<MemoryEntry>;
+    /// Store content, returning its id.
+    async fn store(&self, content: String) -> Result<String, String>;
+}
+
+/// Built-in default: a process-local, naive keyword store. Deliberately simple
+/// — real deployments should plug in Engram (or another store) behind the
+/// [`Memory`] trait.
+#[derive(Default)]
+pub struct InMemoryStore {
+    entries: RwLock<Vec<MemoryEntry>>,
+}
+
+impl InMemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+fn keyword_score(entry: &str, query: &str) -> usize {
+    let q = query.to_lowercase();
+    let e = entry.to_lowercase();
+    let mut score = 0usize;
+    for word in q.split_whitespace() {
+        if e.contains(word) {
+            score += 1;
+        }
+    }
+    score
+}
+
+#[async_trait]
+impl Memory for InMemoryStore {
+    async fn search(&self, query: &str, limit: usize) -> Vec<MemoryEntry> {
+        let entries = self.entries.read().await;
+        let mut scored: Vec<(usize, MemoryEntry)> = entries
+            .iter()
+            .map(|e| (keyword_score(&e.content, query), e.clone()))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored
+            .into_iter()
+            .filter(|(score, _)| *score > 0)
+            .take(limit)
+            .map(|(_, e)| e)
+            .collect()
+    }
+
+    async fn store(&self, content: String) -> Result<String, String> {
+        let id = uuid_like_id();
+        let entry = MemoryEntry {
+            id: id.clone(),
+            content,
+            created_at: chrono_ts(),
+        };
+        self.entries.write().await.push(entry);
+        Ok(id)
+    }
+}
+
+fn uuid_like_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("mem-{}-{}", nanos, std::process::id())
+}
+
+fn chrono_ts() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+// ───────────────────────────────────────────────── SearchMemoryTool ──────────
+
+pub struct MemorySearchTool {
+    store: Arc<dyn Memory>,
+}
+
+impl MemorySearchTool {
+    pub fn new() -> Self {
+        Self { store: Arc::new(InMemoryStore::new()) }
+    }
+
+    /// Wire a specific store (e.g. an Engram adapter) behind the tool.
+    pub fn with_store(store: Arc<dyn Memory>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for MemorySearchTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "memory_search".to_string(),
+            description: "Search the agent's long-term memory for stored knowledge, past conversations, notes, and learned facts. Use to retrieve relevant context before answering.".to_string(),
+            parameters: vec![
+                ToolParam {
+                    name: "query".to_string(),
+                    description: "Search query — matched against stored memory content".to_string(),
+                    param_type: "string".to_string(),
+                    enum_values: None,
+                    required: true,
+                },
+                ToolParam {
+                    name: "max_results".to_string(),
+                    description: "Maximum number of entries to return (default 5, max 20)".to_string(),
+                    param_type: "integer".to_string(),
+                    enum_values: None,
+                    required: false,
+                },
+            ],
+            trust_tier: ToolTrustTier::Observational,
+        }
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        let query = match call.arg_str("query") {
+            Some(q) => q.to_string(),
+            None => return make_result(call, false, serde_json::json!({"error": "missing query"}), "Search failed".to_string()),
+        };
+        let limit = call.arg_u64("max_results").unwrap_or(5).min(20) as usize;
+
+        let hits = self.store.search(&query, limit).await;
+        make_result(
+            call,
+            true,
+            serde_json::json!({
+                "query": query,
+                "results": hits.iter().map(|e| serde_json::json!({
+                    "id": e.id,
+                    "content": e.content,
+                    "created_at": e.created_at,
+                })).collect::<Vec<_>>(),
+                "count": hits.len(),
+            }),
+            format!("{} memory hit(s) for '{}'", hits.len(), query),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────── StoreMemoryTool ────────────
+
+pub struct MemoryWriteTool {
+    store: Arc<dyn Memory>,
+}
+
+impl MemoryWriteTool {
+    pub fn new() -> Self {
+        Self { store: Arc::new(InMemoryStore::new()) }
+    }
+
+    pub fn with_store(store: Arc<dyn Memory>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for MemoryWriteTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "memory_store".to_string(),
+            description: "Store a fact, note, or piece of learned knowledge into long-term memory for later retrieval with memory_search.".to_string(),
+            parameters: vec![ToolParam {
+                name: "content".to_string(),
+                description: "The text to remember".to_string(),
+                param_type: "string".to_string(),
+                enum_values: None,
+                required: true,
+            }],
+            trust_tier: ToolTrustTier::LocalMutating,
+        }
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        let content = match call.arg_str("content") {
+            Some(c) => c.to_string(),
+            None => return make_result(call, false, serde_json::json!({"error": "missing content"}), "Store failed".to_string()),
+        };
+        match self.store.store(content.clone()).await {
+            Ok(id) => make_result(
+                call,
+                true,
+                serde_json::json!({"id": id, "stored": content}),
+                "Stored in memory".to_string(),
+            ),
+            Err(e) => make_result(call, false, serde_json::json!({"error": e}), "Store failed".to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn in_memory_store_round_trips() {
+        let store = InMemoryStore::new();
+        store.store("The user prefers dark mode".to_string()).await.unwrap();
+        let hits = store.search("dark mode", 5).await;
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("dark mode"));
+    }
+
+    #[tokio::test]
+    async fn search_requires_keyword_overlap() {
+        let store = InMemoryStore::new();
+        store.store("cargo is the rust build tool".to_string()).await.unwrap();
+        assert!(store.search("python", 5).await.is_empty());
+        assert_eq!(store.search("rust build", 5).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_tool_wired_to_shared_store() {
+        let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let write = MemoryWriteTool::with_store(Arc::clone(&store));
+        let search = MemorySearchTool::with_store(Arc::clone(&store));
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "memory_store".to_string(),
+            arguments: serde_json::json!({"content": "project deploys to hetzner"}),
+        };
+        assert!(write.execute(&call).await.success);
+
+        let call = ToolCall {
+            id: "2".to_string(),
+            name: "memory_search".to_string(),
+            arguments: serde_json::json!({"query": "hetzner"}),
+        };
+        let res = search.execute(&call).await;
+        assert!(res.success);
+        assert_eq!(res.output["count"], 1);
+    }
+}

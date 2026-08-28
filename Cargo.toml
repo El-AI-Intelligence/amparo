@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/amparo-inference"]
+members = ["crates/amparo-inference", "crates/amparo-memory", "crates/amparo-privacy", "crates/amparo-policy", "crates/amparo-tools"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,3 +8,14 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["EL AI Intelligence <Elai-intelligence@pm.me>"]
 repository = "https://github.com/El-AI-Intelligence/amparo"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+tokio = { version = "1.40", features = ["rt-multi-thread", "time", "sync", "macros", "io-util", "process", "fs"] }
+reqwest = { version = "0.12", features = ["json", "stream"], default-features = false }
+futures-util = "0.3"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }

@@ -1,0 +1,16 @@
+[package]
+name = "amparo-policy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The policy seam between a tool call and its execution — deny-by-default, wire-protocol client"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }

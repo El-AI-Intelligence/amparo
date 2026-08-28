@@ -1,0 +1,20 @@
+[package]
+name = "amparo-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Amparo's tool registry: web, filesystem, shell, git, tests, build, memory"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
+regex-lite = "0.1"
+urlencoding = "2"

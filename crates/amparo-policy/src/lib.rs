@@ -1,0 +1,152 @@
+//! Amparo Policy — the seam between "the model decided to do this" and "this ran".
+//!
+//! Every tool call passes a policy check before it executes. Amparo itself ships
+//! no judgment engine — it ships the *contract* and a deny-by-default posture:
+//!
+//! - [`PolicyEngine`] is the trait. Implementations swap behind one seam.
+//! - [`DenyAllPolicyEngine`] is the default: an agent with no configured policy
+//!   refuses to act. Deny-all is the only safe default — an agent whose policy
+//!   waves everything through is worse than one with no policy engine, because
+//!   it looks safe.
+//! - [`wire::WirePolicyEngine`] speaks the open policy-check wire protocol
+//!   (`POST /check {tool_name, target} → {verdict, reason, enforced}`), so a
+//!   remote engine — [Guardrail](https://elai-intelligence.com) is the
+//!   commercial implementation — plugs in over HTTP. Anyone can write another.
+//!
+//! **Caller contract** (from the wire spec, implemented here):
+//!
+//! | Verdict | Behavior |
+//! |---|---|
+//! | Allow | Execute. |
+//! | Deny (enforced) | Hard-block, with reasons surfaced. |
+//! | Deny / Escalate (audit-only, `enforced: false`) | Do **not** block — the verdict is a prediction. Proceed, log the engine's real verdict. |
+//! | Escalate (enforced) | Ask a human. Never execute silently. |
+//! | Engine failure / timeout | Fail-safe **Escalate** — an engine error is never an allow. |
+//! | `limit_reached: true` | Hard-block. This bypasses audit mode by design. |
+//!
+//! Ported from the axiom-daemon `policy_engine.rs` seam (Axiom-OS, MIT,
+//! Copyright (c) Pixel Phantom AI); see the repository NOTICE. The ELLM bridge
+//! stays behind — Amparo's seam speaks the open protocol instead.
+
+pub mod wire;
+
+use async_trait::async_trait;
+
+/// A policy verdict for a single tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyVerdict {
+    /// Execute.
+    Allow,
+    /// Hard-block.
+    Deny,
+    /// Needs a human decision — never execute silently.
+    Escalate,
+}
+
+impl PolicyVerdict {
+    /// Wire/display form: `allowed` / `denied` / `escalated`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyVerdict::Allow => "allowed",
+            PolicyVerdict::Deny => "denied",
+            PolicyVerdict::Escalate => "escalated",
+        }
+    }
+}
+
+/// The outcome of a policy check.
+#[derive(Debug, Clone)]
+pub struct PolicyDecision {
+    pub verdict: PolicyVerdict,
+    /// Human-readable rule firings explaining the verdict — denials must never
+    /// be silent.
+    pub fired: Vec<String>,
+}
+
+impl PolicyDecision {
+    pub fn allow() -> Self {
+        Self { verdict: PolicyVerdict::Allow, fired: Vec::new() }
+    }
+
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self { verdict: PolicyVerdict::Deny, fired: vec![reason.into()] }
+    }
+
+    pub fn escalate(reason: impl Into<String>) -> Self {
+        Self { verdict: PolicyVerdict::Escalate, fired: vec![reason.into()] }
+    }
+}
+
+/// The policy seam. Every tool call is judged through this before execution.
+///
+/// `tool_name` is the registry tool name (`run_command`, `write_file`, …),
+/// `target` the primary argument (the shell command for `run_command`, the path
+/// for file tools), `params` supplementary key/value pairs.
+#[async_trait]
+pub trait PolicyEngine: Send + Sync {
+    async fn judge_tool(
+        &self,
+        tool_name: &str,
+        target: &str,
+        params: &[(&str, &str)],
+    ) -> PolicyDecision;
+}
+
+/// Fail-safe default engine: refuses everything, with the reason surfaced in
+/// every decision so denials are legible.
+#[derive(Debug, Clone)]
+pub struct DenyAllPolicyEngine {
+    reason: &'static str,
+}
+
+impl DenyAllPolicyEngine {
+    pub fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
+#[async_trait]
+impl PolicyEngine for DenyAllPolicyEngine {
+    async fn judge_tool(
+        &self,
+        tool_name: &str,
+        _target: &str,
+        _params: &[(&str, &str)],
+    ) -> PolicyDecision {
+        PolicyDecision::deny(format!("{}: {}", self.reason, tool_name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deny_all_default_denies_everything_including_reads() {
+        let engine = DenyAllPolicyEngine::new("test");
+        let d = engine.judge_tool("read_file", "/tmp/x", &[]).await;
+        assert_eq!(d.verdict, PolicyVerdict::Deny);
+        assert!(!d.fired.is_empty(), "denials must carry a reason");
+
+        let d = engine.judge_tool("run_command", "rm -rf /", &[]).await;
+        assert_eq!(d.verdict, PolicyVerdict::Deny);
+    }
+
+    #[tokio::test]
+    async fn deny_all_never_allows_or_escalates() {
+        // The default posture is deny-all — even unclassified tools must not
+        // slip through as Escalate-then-execute.
+        let engine = DenyAllPolicyEngine::new("test");
+        for tool in ["read_file", "run_command", "some_future_tool"] {
+            let d = engine.judge_tool(tool, "anything", &[]).await;
+            assert_eq!(d.verdict, PolicyVerdict::Deny, "{} must be denied", tool);
+        }
+    }
+
+    #[test]
+    fn verdict_strings_are_stable_wire_values() {
+        assert_eq!(PolicyVerdict::Allow.as_str(), "allowed");
+        assert_eq!(PolicyVerdict::Deny.as_str(), "denied");
+        assert_eq!(PolicyVerdict::Escalate.as_str(), "escalated");
+    }
+}

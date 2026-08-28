@@ -1,0 +1,14 @@
+[package]
+name = "amparo-memory"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Context-window assembly for Amparo agent inference calls"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
