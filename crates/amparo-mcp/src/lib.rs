@@ -24,4 +24,4 @@ pub mod types;
 
 pub use client::{McpClient, McpError, RemoteMcpTool};
 pub use server::McpServer;
-pub use types::{McpTool, PROTOCOL_VERSION};
+pub use types::{CallToolResult, McpTool, PROTOCOL_VERSION};
