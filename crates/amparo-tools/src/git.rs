@@ -54,8 +54,13 @@ async fn run_git(args: &[&str], cwd: &PathBuf) -> std::result::Result<String, St
 
 // ─────────────────────────────────────────────────── GitStatusTool ───────────
 
+/// Shows the working-tree status of the git repository in the Amparo
+/// workspace. Trusted at `Observational`.
 pub struct GitStatusTool;
-impl GitStatusTool { pub fn new() -> Self { Self } }
+impl GitStatusTool {
+    /// Creates a new [`GitStatusTool`].
+    pub fn new() -> Self { Self }
+}
 
 #[async_trait]
 impl ToolExecutor for GitStatusTool {
@@ -95,8 +100,13 @@ impl ToolExecutor for GitStatusTool {
 
 // ─────────────────────────────────────────────────── GitDiffTool ─────────────
 
+/// Shows the diff of working-tree changes (staged, unstaged, or between
+/// commits) in the workspace repository. Trusted at `Observational`.
 pub struct GitDiffTool;
-impl GitDiffTool { pub fn new() -> Self { Self } }
+impl GitDiffTool {
+    /// Creates a new [`GitDiffTool`].
+    pub fn new() -> Self { Self }
+}
 
 #[async_trait]
 impl ToolExecutor for GitDiffTool {
@@ -168,8 +178,13 @@ impl ToolExecutor for GitDiffTool {
 
 // ─────────────────────────────────────────────────── GitCommitTool ───────────
 
+/// Stages all changes and creates a commit in the workspace repository.
+/// Trusted at `LocalMutating`.
 pub struct GitCommitTool;
-impl GitCommitTool { pub fn new() -> Self { Self } }
+impl GitCommitTool {
+    /// Creates a new [`GitCommitTool`].
+    pub fn new() -> Self { Self }
+}
 
 #[async_trait]
 impl ToolExecutor for GitCommitTool {
@@ -238,8 +253,13 @@ impl ToolExecutor for GitCommitTool {
 
 // ─────────────────────────────────────────────────── GitLogTool ──────────────
 
+/// Shows recent commit history of the workspace repository. Trusted at
+/// `Observational`.
 pub struct GitLogTool;
-impl GitLogTool { pub fn new() -> Self { Self } }
+impl GitLogTool {
+    /// Creates a new [`GitLogTool`].
+    pub fn new() -> Self { Self }
+}
 
 #[async_trait]
 impl ToolExecutor for GitLogTool {
@@ -299,8 +319,13 @@ impl ToolExecutor for GitLogTool {
 
 // ─────────────────────────────────────────────────── GitBranchTool ───────────
 
+/// Lists, creates, or switches git branches in the workspace repository.
+/// Trusted at `LocalMutating`.
 pub struct GitBranchTool;
-impl GitBranchTool { pub fn new() -> Self { Self } }
+impl GitBranchTool {
+    /// Creates a new [`GitBranchTool`].
+    pub fn new() -> Self { Self }
+}
 
 #[async_trait]
 impl ToolExecutor for GitBranchTool {
@@ -369,8 +394,13 @@ impl ToolExecutor for GitBranchTool {
 
 // ─────────────────────────────────────────────────── GitBlameTool ────────────
 
+/// Shows per-line authorship (git blame) for a file in the workspace
+/// repository. Trusted at `Observational`.
 pub struct GitBlameTool;
-impl GitBlameTool { pub fn new() -> Self { Self } }
+impl GitBlameTool {
+    /// Creates a new [`GitBlameTool`].
+    pub fn new() -> Self { Self }
+}
 
 #[async_trait]
 impl ToolExecutor for GitBlameTool {

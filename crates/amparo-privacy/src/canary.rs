@@ -61,8 +61,11 @@ impl CanaryToken {
 /// Recorded when a canary fires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanaryTrigger {
+    /// The id of the canary token that fired.
     pub token_id: String,
+    /// Context label of the triggered token (for audit logs).
     pub context: String,
+    /// ISO8601 timestamp of when the trigger was recorded.
     pub triggered_at: String,
     /// First 200 chars of the output where the token was found.
     pub output_excerpt: String,
@@ -83,6 +86,7 @@ pub struct CanaryTokenManager {
 }
 
 impl CanaryTokenManager {
+    /// Creates a manager with the default settings: a 5-minute token TTL and a trigger history capped at 1000 records.
     pub fn new() -> Self {
         Self {
             active: Mutex::new(HashMap::new()),
@@ -92,6 +96,7 @@ impl CanaryTokenManager {
         }
     }
 
+    /// Creates a manager with the given token TTL in seconds; other settings keep their defaults.
     pub fn with_ttl(ttl_secs: u64) -> Self {
         let mut m = Self::new();
         m.ttl = Duration::from_secs(ttl_secs);

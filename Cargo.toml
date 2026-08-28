@@ -5,6 +5,7 @@ members = ["crates/amparo-inference", "crates/amparo-memory", "crates/amparo-pri
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["EL AI Intelligence <Elai-intelligence@pm.me>"]
 repository = "https://github.com/El-AI-Intelligence/amparo"

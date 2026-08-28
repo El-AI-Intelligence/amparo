@@ -3,6 +3,8 @@
 //! Originally part of Axiom-OS (MIT, Copyright (c) Pixel Phantom AI);
 //! ported to Amparo and relicensed Apache-2.0. See NOTICE at the repo root.
 
+#![warn(missing_docs)]
+
 mod anthropic;
 
 pub use anthropic::AnthropicProvider;
@@ -44,25 +46,36 @@ where
     ))
 }
 
+/// Error type for Amparo's BYO-LLM inference layer, surfacing provider
+/// failures, invalid requests, configuration errors, and timeouts under one type.
 #[derive(Error, Debug)]
 pub enum InferenceError {
+    /// The upstream provider returned an error or failed the request.
     #[error("Provider error: {0}")]
     Provider(String),
+    /// The request is invalid for the configured provider.
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+    /// Configuration is missing or invalid (e.g. a required environment variable).
     #[error("Configuration error: {0}")]
     Config(String),
+    /// The request timed out; stream idle timeouts emit this as the final item.
     #[error("Timeout")]
     Timeout,
 }
 
+/// Result alias for fallible inference operations, carrying [`InferenceError`].
 pub type Result<T> = std::result::Result<T, InferenceError>;
 
 /// Inference request
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InferenceRequest {
+    /// The user prompt to send to the model.
     pub prompt: String,
+    /// Maximum tokens to generate; filled with `DEFAULT_MAX_TOKENS` and clamped
+    /// to the provider limit when set.
     pub max_tokens: Option<usize>,
+    /// Sampling temperature; defaults to 0.7 when unset.
     pub temperature: Option<f32>,
     /// Override the provider's default model for this single request.
     pub model: Option<String>,
@@ -102,7 +115,7 @@ impl Default for ProviderKind {
 /// Cloud fallback configuration for when local inference is unavailable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
-    /// Cloud API endpoint (e.g. https://api.anthropic.com/v1)
+    /// Cloud API endpoint (e.g. `https://api.anthropic.com/v1`)
     pub url: String,
     /// Cloud API key
     pub api_key: String,
@@ -124,6 +137,8 @@ impl Default for CloudConfig {
 }
 
 impl CloudConfig {
+    /// Build a cloud config from the `AMPARO_CLOUD_*` environment variables;
+    /// enabled when a key is present or `AMPARO_USE_CLOUD_FALLBACK` is true.
     pub fn from_env() -> Self {
         let api_key = std::env::var("AMPARO_CLOUD_API_KEY").unwrap_or_default();
         Self {
@@ -185,9 +200,13 @@ pub fn clamp_max_tokens(requested: Option<usize>, limit: Option<usize>) -> usize
 /// `from_env()` (fail-closed) or be constructed explicitly by the embedder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceConfig {
+    /// Provider base URL, e.g. `http://localhost:11434/v1`.
     pub base_url: String,
+    /// API key for the provider (empty for keyless local providers).
     pub api_key:  String,
+    /// Default model ID used when a request does not specify one.
     pub model:    String,
+    /// Provider kind, selecting the wire protocol (OpenAI-compatible or Anthropic).
     #[serde(default)]
     pub provider: ProviderKind,
     /// HTTP timeout for a single inference request, in seconds.
@@ -365,6 +384,8 @@ pub struct InferenceHandle {
 }
 
 impl InferenceHandle {
+    /// Create a handle from a config, building the inner provider via `build()`
+    /// and failing closed on invalid configuration.
     pub fn new(config: InferenceConfig) -> Result<Arc<Self>> {
         let provider = config.build()?;
         Ok(Arc::new(Self {
@@ -444,6 +465,7 @@ pub struct FallbackProvider {
 }
 
 impl FallbackProvider {
+    /// Create a provider that tries `primary` first and `fallback` on failure.
     pub fn new(
         primary: Arc<dyn InferenceProvider>,
         fallback: Arc<dyn InferenceProvider>,
@@ -509,14 +531,18 @@ pub async fn probe_local_models(base_url: &str) -> Vec<String> {
 /// Inference response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceResponse {
+    /// The generated response text.
     pub text: String,
+    /// Total tokens reported by the provider for this request.
     pub tokens: usize,
+    /// Why generation stopped (`stop`, `length`, `tool_calls`, ...).
     pub finish_reason: String,
 }
 
 /// A function call made by the assistant (OpenAI tool-call shape).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FunctionCall {
+    /// The name of the function the model wants to call.
     pub name: String,
     /// Arguments as a JSON string (OpenAI convention; parsed into an object
     /// when translated to the Anthropic Messages API).
@@ -526,9 +552,12 @@ pub struct FunctionCall {
 /// One entry in an assistant message's `tool_calls` array.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AssistantToolCall {
+    /// Unique ID for this tool call, echoed back in the answering tool result.
     pub id: String,
+    /// Tool call type; always `"function"`.
     #[serde(rename = "type")]
     pub call_type: String, // always "function"
+    /// The function being called, with JSON-encoded arguments.
     pub function: FunctionCall,
 }
 
@@ -541,7 +570,9 @@ pub struct AssistantToolCall {
 /// way serialize exactly as before.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Message role: `"system"`, `"user"`, `"assistant"`, or `"tool"`.
     pub role: String,       // "system" | "user" | "assistant" | "tool"
+    /// Message body text; empty for tool-call-only assistant messages.
     pub content: String,
     /// Native tool calls made by the assistant (assistant messages only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -552,12 +583,15 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Build a `"user"` role message.
     pub fn user(content: impl Into<String>) -> Self {
         Self { role: "user".into(), content: content.into(), tool_calls: None, tool_call_id: None }
     }
+    /// Build an `"assistant"` role message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self { role: "assistant".into(), content: content.into(), tool_calls: None, tool_call_id: None }
     }
+    /// Build a `"system"` role message.
     pub fn system(content: impl Into<String>) -> Self {
         Self { role: "system".into(), content: content.into(), tool_calls: None, tool_call_id: None }
     }
@@ -574,19 +608,27 @@ impl ChatMessage {
 /// OpenAI-compatible tool definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
+    /// Tool type; always `"function"`.
     #[serde(rename = "type")]
     pub tool_type: String,  // always "function"
+    /// Function definition: `{ name, description, parameters }`.
     pub function: serde_json::Value,  // { name, description, parameters }
 }
 
 /// Chat inference request (messages + optional tools)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
+    /// The conversation history, oldest first.
     pub messages: Vec<ChatMessage>,
+    /// Optional tool definitions made available to the model.
     pub tools: Option<Vec<Tool>>,
+    /// Maximum tokens for the response, clamped to the provider limit when set.
     pub max_tokens: Option<usize>,
+    /// Sampling temperature; defaults to 0.7 when unset.
     pub temperature: Option<f32>,
+    /// Whether the response is requested as a stream.
     pub stream: Option<bool>,
+    /// Override the provider's default model for this request.
     pub model: Option<String>,
     /// Privacy level — determines routing.
     #[serde(default)]
@@ -608,9 +650,14 @@ pub struct ChatRequest {
 /// Inference provider trait
 #[async_trait]
 pub trait InferenceProvider: Send + Sync {
+    /// Run a non-streaming completion and return the full response.
     async fn complete(&self, request: InferenceRequest) -> Result<InferenceResponse>;
+    /// Embed text into a vector; providers without an embeddings API fail with
+    /// `InvalidRequest`.
     async fn embed(&self, text: &str) -> Result<Vec<f64>>;
+    /// List the model IDs the provider can serve, sorted and deduplicated.
     async fn list_models(&self) -> Result<Vec<String>>;
+    /// The provider's default model ID.
     fn default_model(&self) -> String;
     /// Chat completions with optional tool definitions. Returns a byte stream of SSE events.
     async fn complete_chat_stream(
@@ -635,6 +682,8 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    /// Create an OpenAI-compatible provider. The embedding model is read from
+    /// `AMPARO_INFERENCE_EMBEDDING_MODEL` (default `nomic-embed-text`).
     pub fn new(
         base_url: String,
         api_key: String,
@@ -1223,9 +1272,13 @@ pub fn planning_prompt(task: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRoute {
+    /// The selected model ID.
     pub model: String,
+    /// Whether the route runs inference on a remote (cloud) provider.
     pub is_cloud: bool,
+    /// Human-readable explanation of why this route was chosen.
     pub reasoning: String,
+    /// Task complexity score (0.0–1.0) that drove the routing decision.
     pub complexity_score: f64,
 }
 
@@ -1398,6 +1451,8 @@ pub fn route_request_with_coherence(
 
 use std::collections::HashMap as StdHashMap;
 
+/// Content-addressable cache for system prompts and repeated context, keyed by
+/// content hash to reduce token usage.
 pub struct PromptCache {
     entries: StdHashMap<String, CachedPrompt>,
     max_entries: usize,
@@ -1412,6 +1467,8 @@ struct CachedPrompt {
 }
 
 impl PromptCache {
+    /// Create an empty cache that evicts the least-hit entry once `max_entries`
+    /// is reached.
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: StdHashMap::new(),

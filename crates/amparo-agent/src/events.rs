@@ -14,33 +14,85 @@ use tokio::sync::broadcast;
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// The task began.
-    TaskStarted { prompt: String },
+    TaskStarted {
+        /// The original prompt.
+        prompt: String,
+    },
     /// One LLM turn arrived (content plus how many tool calls it made).
-    AssistantTurn { step: usize, content: String, tool_calls: usize },
+    AssistantTurn {
+        /// The loop step number.
+        step: usize,
+        /// The assistant's text for this turn.
+        content: String,
+        /// How many tool calls the turn requested.
+        tool_calls: usize,
+    },
     /// The model requested a tool call.
-    ToolCallRequested { call: ToolCall },
+    ToolCallRequested {
+        /// The requested call.
+        call: ToolCall,
+    },
     /// A gate decided on a tool call.
     /// `decision` is one of `allowed`, `trust_blocked`, `policy_denied`,
     /// `approval_denied`, `unknown_tool`.
-    ToolGate { call_id: String, tool_name: String, decision: String, reasons: Vec<String> },
+    ToolGate {
+        /// The call's id.
+        call_id: String,
+        /// The tool's name.
+        tool_name: String,
+        /// The gate's decision: `allowed` or a block reason.
+        decision: String,
+        /// The reasons behind it — policy rules that fired, or the block reason.
+        reasons: Vec<String>,
+    },
     /// The loop asked a human whether a call may run.
-    ApprovalRequested { call_id: String, tool_name: String, reasons: Vec<String> },
+    ApprovalRequested {
+        /// The call's id.
+        call_id: String,
+        /// The tool's name.
+        tool_name: String,
+        /// Why approval is required — policy escalation, tier, or both.
+        reasons: Vec<String>,
+    },
     /// The human (or gate) answered.
-    ApprovalResolved { call_id: String, approved: bool },
+    ApprovalResolved {
+        /// The call's id.
+        call_id: String,
+        /// Whether the call may execute.
+        approved: bool,
+    },
     /// A tool call finished executing.
-    ToolExecuted { result: ToolResult },
+    ToolExecuted {
+        /// The tool's result.
+        result: ToolResult,
+    },
     /// The model produced a candidate final answer.
-    FinalAnswer { content: String },
+    FinalAnswer {
+        /// The candidate answer text.
+        content: String,
+    },
     /// The self-verification turn decided.
-    Verification { decision: String, feedback: Option<String> },
+    Verification {
+        /// `complete` | `incomplete`
+        decision: String,
+        /// The model's feedback, when incomplete.
+        feedback: Option<String>,
+    },
     /// The task completed with this final answer.
-    TaskComplete { final_answer: String },
+    TaskComplete {
+        /// The final answer text.
+        final_answer: String,
+    },
     /// The task failed.
-    TaskFailed { message: String },
+    TaskFailed {
+        /// Why the task failed.
+        message: String,
+    },
 }
 
 /// Observability seam — everything the loop emits goes through here.
 pub trait EventSink: Send + Sync {
+    /// Record one event — the loop calls this for every decision.
     fn emit(&self, event: &AgentEvent);
 }
 
@@ -51,6 +103,7 @@ pub struct InMemoryEventSink {
 }
 
 impl InMemoryEventSink {
+    /// An empty log with a fresh broadcast channel.
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(64);
         Self { events: std::sync::Mutex::new(Vec::new()), tx }

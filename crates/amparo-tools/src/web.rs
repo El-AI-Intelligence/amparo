@@ -35,9 +35,13 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
 
 // ─────────────────────────────────────────────── WebSearchTool ────────────
 
+/// Searches the web, trying backends in order (SearXNG, Brave Search,
+/// DuckDuckGo Instant Answers) with automatic fallback when one fails.
+/// Trusted at `Observational`.
 pub struct WebSearchTool;
 
 impl WebSearchTool {
+    /// Creates a new [`WebSearchTool`].
     pub fn new() -> Self { Self }
 
     /// Which backend should we use? Returns (backend, display_name).
@@ -212,10 +216,15 @@ enum Backend {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+/// One search result returned by a web-search backend.
 pub struct SearchResult {
+    /// Result title.
     pub title: String,
+    /// Result URL.
     pub url: String,
+    /// Short excerpt of the result.
     pub snippet: String,
+    /// Name of the backend that produced the result.
     pub source: String,
 }
 
@@ -335,9 +344,12 @@ impl ToolExecutor for WebSearchTool {
 
 // ─────────────────────────────────────────────────── FetchUrlTool ─────────────
 
+/// Fetches a URL and returns its content as readable text, stripping HTML and
+/// requiring an `http://` or `https://` scheme. Trusted at `Observational`.
 pub struct FetchUrlTool;
 
 impl FetchUrlTool {
+    /// Creates a new [`FetchUrlTool`].
     pub fn new() -> Self { Self }
 
     /// Strip HTML tags and decode entities to readable text.

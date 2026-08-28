@@ -26,18 +26,30 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, Mutex};
 
+/// Errors in the MCP client session, from transport through protocol.
 #[derive(Debug, Error)]
 pub enum McpError {
+    /// An I/O error on the underlying stream.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A JSON-RPC error response returned by the remote server.
     #[error("JSON-RPC error {code}: {message}")]
-    JsonRpc { code: i64, message: String },
+    JsonRpc {
+        /// The JSON-RPC error code.
+        code: i64,
+        /// The JSON-RPC error message.
+        message: String,
+    },
+    /// A protocol violation or unparseable payload from the server.
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// The MCP server process exited before the session completed.
     #[error("MCP server exited before the session completed")]
     ProcessExit,
+    /// A call timed out after the configured duration.
     #[error("call timed out after {0:?}")]
     Timeout(Duration),
+    /// The session closed while calls were pending; a dead server never hangs the caller.
     #[error("session closed")]
     Closed,
 }

@@ -4,6 +4,8 @@
 //! approval gate), and a sandboxed execution path. The registry itself holds
 //! no policy — the deny-by-default policy gate lives in `amparo-agent`.
 
+#![warn(missing_docs)]
+
 pub mod build;
 pub mod filesystem;
 pub mod git;

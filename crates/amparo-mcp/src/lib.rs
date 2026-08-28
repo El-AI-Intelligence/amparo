@@ -17,6 +17,8 @@
 //! protocol lines only, and a dead server fails every pending call rather
 //! than hanging the agent.
 
+#![warn(missing_docs)]
+
 pub mod client;
 pub mod jsonrpc;
 pub mod serve;

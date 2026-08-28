@@ -9,6 +9,14 @@
 // path confinement + blocklist here, and the deny-by-default policy gate in
 // `amparo-policy` in front of every call.
 
+//! Path policy — the sandbox boundary for Amparo's file and shell tools.
+//!
+//! [`PathPolicy`] is the single source of truth for what those tools can
+//! touch: a workspace root (default `~/amparo-workspace`), read-only system
+//! paths, a command blocklist, and per-execution time limits. Confinement is
+//! layered here; the deny-by-default approval gate itself lives in
+//! `amparo-agent`.
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

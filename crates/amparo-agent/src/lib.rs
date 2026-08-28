@@ -57,6 +57,8 @@
 //! the response (Secure Minions), with per-message placeholder namespaces so
 //! tokens from different messages cannot collide.
 
+#![warn(missing_docs)]
+
 pub mod agent;
 pub mod approval;
 pub mod events;

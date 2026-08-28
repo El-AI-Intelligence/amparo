@@ -51,11 +51,15 @@ fn resolve_path(
 
 // ─────────────────────────────────────────────────── ReadFileTool ────────────
 
+/// Reads a file inside the workspace, enforcing the path-confinement checks in
+/// [`crate::paths::PathPolicy`]. Trusted at `Observational`.
 pub struct ReadFileTool {
     policy: Arc<crate::paths::PathPolicy>,
 }
 
 impl ReadFileTool {
+    /// Creates a new [`ReadFileTool`] with the path policy loaded from
+    /// environment variables.
     pub fn new() -> Self {
         Self {
             policy: Arc::new(crate::paths::PathPolicy::from_env()),
@@ -120,11 +124,16 @@ impl ToolExecutor for ReadFileTool {
 
 // ──────────────────────────────────────────────────── WriteFileTool ───────────
 
+/// Writes or appends a file inside the workspace, creating parent directories
+/// as needed; paths outside the writable workspace are denied. Trusted at
+/// `LocalMutating`.
 pub struct WriteFileTool {
     policy: Arc<crate::paths::PathPolicy>,
 }
 
 impl WriteFileTool {
+    /// Creates a new [`WriteFileTool`] with the path policy loaded from
+    /// environment variables.
     pub fn new() -> Self {
         Self {
             policy: Arc::new(crate::paths::PathPolicy::from_env()),
@@ -209,11 +218,15 @@ impl ToolExecutor for WriteFileTool {
 
 // ─────────────────────────────────────────────────── ListDirTool ────────────
 
+/// Lists the contents of a directory inside the workspace sandbox. Trusted at
+/// `Observational`.
 pub struct ListDirTool {
     policy: Arc<crate::paths::PathPolicy>,
 }
 
 impl ListDirTool {
+    /// Creates a new [`ListDirTool`] with the path policy loaded from
+    /// environment variables.
     pub fn new() -> Self {
         Self {
             policy: Arc::new(crate::paths::PathPolicy::from_env()),
@@ -276,11 +289,16 @@ impl ToolExecutor for ListDirTool {
 
 // ─────────────────────────────────────────────────── EditFileTool ────────────
 
+/// Applies SEARCH/REPLACE edits to a file in the workspace, writing back with
+/// a backup; fails closed when the search text is not found. Trusted at
+/// `LocalMutating`.
 pub struct EditFileTool {
     policy: Arc<crate::paths::PathPolicy>,
 }
 
 impl EditFileTool {
+    /// Creates a new [`EditFileTool`] with the path policy loaded from
+    /// environment variables.
     pub fn new() -> Self {
         Self {
             policy: Arc::new(crate::paths::PathPolicy::from_env()),
@@ -379,11 +397,15 @@ impl ToolExecutor for EditFileTool {
 
 // ─────────────────────────────────────────────────── PatchFileTool ───────────
 
+/// Applies a unified diff to a file in the workspace, writing back with a
+/// backup. Trusted at `LocalMutating`.
 pub struct PatchFileTool {
     policy: Arc<crate::paths::PathPolicy>,
 }
 
 impl PatchFileTool {
+    /// Creates a new [`PatchFileTool`] with the path policy loaded from
+    /// environment variables.
     pub fn new() -> Self {
         Self {
             policy: Arc::new(crate::paths::PathPolicy::from_env()),

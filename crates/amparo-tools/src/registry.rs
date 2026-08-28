@@ -7,6 +7,15 @@
 // leaves (email, wallet, inbox). What remains is the portable, deployable
 // set: web, filesystem, shell, git, tests, build, memory.
 
+//! Tool registry — the contracts and the central registry of Amparo's
+//! portable tool set.
+//!
+//! Defines the JSON-schema parameters exposed to the LLM, the trust tiers
+//! that drive the approval gate, the call/result types, the [`ToolExecutor`]
+//! trait, and the [`ToolRegistry`] that holds every registered tool. The
+//! registry holds no policy — the deny-by-default approval gate lives in
+//! `amparo-agent`.
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,12 +43,18 @@ pub enum ToolTrustTier {
 /// JSON-schema parameter definition exposed to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolParam {
+    /// Parameter name as exposed to the LLM.
     pub name: String,
+    /// Human-readable description of the parameter.
     pub description: String,
+    /// JSON-schema type for the parameter (e.g. "string", "integer",
+    /// "boolean").
     #[serde(rename = "type")]
     pub param_type: String,
+    /// Allowed values, when the parameter is a closed enum.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enum_values: Option<Vec<String>>,
+    /// Whether the LLM must supply this parameter on every call.
     #[serde(default)]
     pub required: bool,
 }
@@ -47,9 +62,14 @@ pub struct ToolParam {
 /// Full tool schema exposed to the LLM via the inference request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSchema {
+    /// Tool name as exposed to the LLM.
     pub name: String,
+    /// Human-readable description of what the tool does.
     pub description: String,
+    /// JSON-schema parameter definitions exposed to the LLM.
     pub parameters: Vec<ToolParam>,
+    /// Trust tier for this tool, which drives the approval gate in
+    /// `amparo-agent`.
     pub trust_tier: ToolTrustTier,
 }
 
@@ -105,8 +125,11 @@ impl ToolSchema {
 /// A tool call emitted by the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Unique id for this call, echoed back in the matching [`ToolResult`].
     pub id: String,
+    /// Name of the tool being called.
     pub name: String,
+    /// JSON arguments to the tool.
     pub arguments: Value,
 }
 
@@ -140,12 +163,17 @@ impl ToolCall {
 /// Result returned after executing a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
+    /// Id of the originating [`ToolCall`].
     pub tool_call_id: String,
+    /// Name of the tool that produced this result.
     pub tool_name: String,
+    /// Whether the tool reported success.
     pub success: bool,
+    /// JSON payload with the tool's output data.
     pub output: Value,
     /// Human-readable summary for display in chat
     pub display_summary: String,
+    /// Wall-clock execution time, in milliseconds.
     pub duration_ms: u64,
 }
 
@@ -154,7 +182,10 @@ pub struct ToolResult {
 /// Every tool implements this trait.
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
+    /// Returns the tool's schema, including its name, parameters, and trust
+    /// tier.
     fn schema(&self) -> ToolSchema;
+    /// Executes a tool call and returns its result.
     async fn execute(&self, call: &ToolCall) -> ToolResult;
 }
 
@@ -172,10 +203,13 @@ impl Default for ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Creates an empty registry.
     pub fn new() -> Self {
         Self { tools: HashMap::new() }
     }
 
+    /// Registers a tool executor under its schema name, replacing any tool
+    /// with the same name.
     pub fn register(&mut self, executor: Arc<dyn ToolExecutor>) {
         let name = executor.schema().name.clone();
         self.tools.insert(name, executor);
@@ -195,6 +229,8 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Dispatches a call to the named tool and returns its result, or `None`
+    /// when no such tool is registered.
     pub async fn dispatch(&self, call: &ToolCall) -> Option<ToolResult> {
         if let Some(executor) = self.tools.get(&call.name) {
             let start = std::time::Instant::now();
@@ -206,6 +242,7 @@ impl ToolRegistry {
         }
     }
 
+    /// Returns the schemas of all registered tools.
     pub fn list_schemas(&self) -> Vec<ToolSchema> {
         self.tools.values().map(|t| t.schema()).collect()
     }

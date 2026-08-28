@@ -18,8 +18,11 @@ use serde_json::Value;
 /// A request for human approval before a tool executes.
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
+    /// The tool call's id — echoed back in the tool-role answer.
     pub call_id: String,
+    /// The tool the model wants to run.
     pub tool_name: String,
+    /// The arguments it wants to run it with.
     pub arguments: Value,
     /// Why approval is required — policy escalation reasons, the trust
     /// tier, or both.

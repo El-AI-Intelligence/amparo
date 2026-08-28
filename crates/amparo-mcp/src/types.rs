@@ -9,12 +9,15 @@ use amparo_tools::{ToolParam, ToolSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The MCP protocol version this crate implements.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
+/// Client capabilities advertised in the `initialize` handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientCapabilities {
+    /// The client's `tools` capability; `Some` when MCP tools are supported.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
 }
@@ -22,38 +25,54 @@ pub struct ClientCapabilities {
 // The camelCase field names below are the MCP wire protocol's literal JSON
 // keys (protocolVersion, clientInfo, listChanged, inputSchema, isError) —
 // kept verbatim so serialization needs no mapping layer.
+/// The client's `initialize` handshake request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct InitializeRequest {
+    /// The protocol version the client proposes.
     pub protocolVersion: String,
+    /// The capabilities the client advertises.
     pub capabilities: ClientCapabilities,
+    /// The client application's identity.
     pub clientInfo: ClientInfo,
 }
 
+/// Identity of an MCP endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientInfo {
+    /// The endpoint's name.
     pub name: String,
+    /// The endpoint's version.
     pub version: String,
 }
 
+/// Server capabilities advertised in `initialize` responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCapabilities {
+    /// The server's `tools` capability.
     pub tools: ServerToolsCapabilities,
 }
 
+/// The server's `tools` capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct ServerToolsCapabilities {
+    /// Whether the server notifies clients when its tool list changes.
     #[serde(default)]
     pub listChanged: bool,
 }
 
+/// The server's `initialize` handshake response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct InitializeResult {
+    /// The protocol version the server speaks.
     pub protocolVersion: String,
+    /// The capabilities the server advertises.
     pub capabilities: ServerCapabilities,
+    /// The server application's identity.
     pub serverInfo: ClientInfo,
+    /// Optional instructions for the client; omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 }
@@ -64,9 +83,12 @@ pub struct InitializeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct McpTool {
+    /// The tool's name, as passed to `tools/call`.
     pub name: String,
+    /// A human-readable description of what the tool does.
     #[serde(default)]
     pub description: String,
+    /// The schema describing the tool's arguments.
     pub inputSchema: McpToolSchema,
 }
 
@@ -74,32 +96,42 @@ pub struct McpTool {
 /// properties and a required list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolSchema {
+    /// The schema's top-level JSON Schema type.
     #[serde(rename = "type")]
     pub schema_type: String,
+    /// Property definitions keyed by parameter name.
     #[serde(default)]
     pub properties: serde_json::Map<String, Value>,
+    /// Parameter names that must be supplied.
     #[serde(default)]
     pub required: Vec<String>,
 }
 
+/// The body of a `tools/list` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListToolsResult {
+    /// The server's exposed tools.
     pub tools: Vec<McpTool>,
 }
 
 /// One content block in a `tools/call` result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentBlock {
+    /// The block's kind, e.g. `text`.
     #[serde(rename = "type")]
     pub block_type: String,
+    /// The block's text content.
     #[serde(default)]
     pub text: String,
 }
 
+/// The body of a `tools/call` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct CallToolResult {
+    /// The result's content blocks.
     pub content: Vec<ContentBlock>,
+    /// Whether the tool call failed (`isError` on the wire).
     #[serde(default)]
     pub isError: bool,
 }

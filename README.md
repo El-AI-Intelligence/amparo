@@ -7,16 +7,15 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M2 landed — the loop and the MCP surface are in
+## Status: pre-alpha, M3 in — the `amparo` CLI is installable
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
-BYO-LLM provider layer) and **Milestone 2 is in**: the agent loop runs on
-native `tool_calls` behind the policy gate, and MCP is first-class — the
-server exposes the registry over Model Context Protocol and the client mounts
-external MCP tools as ordinary registry tools, both behind the same gate
-chain. Next is an install path, a release, and API stability.
-
-If you are reading this expecting to run something, come back after Milestone 3.
+BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
+`tool_calls` behind the policy gate, MCP first-class in both directions),
+and **Milestone 3 is in**: the `amparo` binary installs with
+`cargo install --path crates/amparo-cli`, drives the loop end-to-end from
+the command line, and the workspace carries a versioned release (v0.1.0)
+with a documented API-stability policy.
 
 ### What exists today: the crate set
 
@@ -61,10 +60,52 @@ If you are reading this expecting to run something, come back after Milestone 3.
 - **`amparo-privacy`** (M2a) — privacy policy evaluation, blocked/allowed
   domain routing, and the Secure Minions PII strip/restore primitives the
   loop uses.
+- **`amparo-cli`** (M3) — the one binary: `amparo run "task"` drives the
+  loop end-to-end (fail-closed BYO-LLM env, interactive terminal approval,
+  `--auto-approve`/`--auto-deny` overrides), `amparo mcp-serve` reuses the
+  same implementation as the standalone `amparo-mcp-serve` binary (same
+  help, errors, exit codes), `amparo version` prints the version.
 
 ```sh
-cargo test --workspace   # the gate
+cargo test --workspace            # the behavior gate
+cargo doc --workspace --no-deps   # the API-stability gate (missing_docs on every crate)
 ```
+
+Both gates must pass with zero warnings — see [VERSIONING.md](VERSIONING.md).
+
+### Quickstart
+
+```sh
+cargo install --path crates/amparo-cli   # or: cargo build --release
+```
+
+Environment surface (everything is optional except the two marked
+**required**):
+
+| Variable | Meaning |
+|---|---|
+| `AMPARO_INFERENCE_URL` | **Required.** Provider base URL, e.g. `http://localhost:11434/v1` or `https://api.anthropic.com` |
+| `AMPARO_INFERENCE_MODEL` | **Required.** Model ID, e.g. `qwen2.5:14b` |
+| `AMPARO_INFERENCE_KEY` | API key (empty for keyless local providers) |
+| `AMPARO_INFERENCE_PROVIDER` | `openai` (default) or `anthropic` |
+| `AMPARO_INFERENCE_TIMEOUT_SECS` | Request timeout (default 120, clamped 1–3600) |
+| `AMPARO_INFERENCE_MAX_TOKENS` | Optional per-request `max_tokens` cap |
+| `AMPARO_INFERENCE_MODEL_ALLOWLIST` | Optional comma-separated model allowlist |
+| `AMPARO_WORKSPACE` | Directory the tools are confined to |
+| `AMPARO_POLICY_KEY` | API key for a remote policy engine (with `--policy-url`) |
+
+```sh
+export AMPARO_INFERENCE_URL=http://localhost:11434/v1
+export AMPARO_INFERENCE_MODEL=qwen2.5:14b
+amparo run "list the files and tell me what's there" --allow-all
+```
+
+Deny-by-default: without `--policy-url` or `--allow-all`, every tool call is
+refused — `--allow-all` is an explicit opt-in for local experiments. Calls
+that need approval ask **y/N at the terminal** (60s timeout; closed or
+non-terminal stdin auto-denies), with `--auto-approve`/`--auto-deny`
+overrides. stdout carries the final answer only — progress, gate decisions
+and the report go to stderr — so `amparo run` scripts cleanly.
 
 ## What Amparo is meant to be
 
@@ -99,8 +140,8 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | # | Milestone | State |
 |---|---|---|
 | 1 | Provider abstraction — Anthropic + OpenAI-compatible | ✅ done |
-| 2 | Native tool calling (replacing text-parsed ReAct) | ✅ landed — loop + MCP client/server, 164 tests green |
-| 3 | Headless operation — screen/desktop tools become optional | not started |
+| 2 | Native tool calling (replacing text-parsed ReAct) | ✅ landed — loop + MCP client/server, 207 tests green |
+| 3 | Install path + release — the `amparo` CLI drives the loop end-to-end (headless: no screen/desktop tools in the registry) | ✅ done |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | not started |
 | 5 | Multi-tenant identity and per-user policy | not started |
 

@@ -42,6 +42,8 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// Create an Anthropic Messages provider, accepting a base URL with or
+    /// without a trailing `/v1`.
     pub fn new(
         base_url: String,
         api_key: String,

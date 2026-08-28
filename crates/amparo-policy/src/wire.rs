@@ -19,14 +19,20 @@ pub const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 60;
 /// The request body per the wire spec.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckRequest {
+    /// The registry tool name (`run_command`, `write_file`, …).
     pub tool_name: String,
+    /// The primary argument — the shell command for `run_command`, the path for file tools.
     pub target: String,
+    /// Supplementary key/value pairs for the check.
     #[serde(default)]
     pub params: BTreeMap<String, String>,
+    /// Caller identifier sent with the check; defaults to `"amparo"`.
     #[serde(default = "default_source")]
     pub source: String,
+    /// Marks the check as blocking; this client always sends `false` so audit mode never blocks.
     #[serde(default)]
     pub blocking: bool,
+    /// Optional session id attached to every check to correlate engine-side audit rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 }
@@ -38,15 +44,20 @@ fn default_source() -> String {
 /// The response body per the wire spec (the fields the caller contract acts on).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CheckResponse {
+    /// Wire verdict string: `allow`, `deny`, or `escalate`.
     pub verdict: Option<String>,
+    /// Human-readable explanation for the verdict.
     pub reason: Option<String>,
     /// Console surface only. Absent (engine-direct) means `enforced: true`.
     #[serde(default)]
     pub enforced: Option<bool>,
+    /// The engine's real verdict when the response is audit-only (`enforced: false`).
     #[serde(default)]
     pub engine_verdict: Option<String>,
+    /// Hard-block flag; when `true` it bypasses audit mode by design.
     #[serde(default)]
     pub limit_reached: Option<bool>,
+    /// Engine-side error text, used as the reason when `reason` is absent.
     #[serde(default)]
     pub error: Option<String>,
 }

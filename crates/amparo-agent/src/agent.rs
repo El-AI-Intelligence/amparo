@@ -5,7 +5,7 @@
 //!
 //! The Axiom loop parsed text-format ReAct turns (`parse_react_turn` over
 //! `Thought:`/`Action:` text) and collapsed a six-deep gate chain. Amparo
-//! drives the model's **native function-calling protocol** (see [`crate::sse`])
+//! drives the model's **native function-calling protocol** (see `crate::sse`)
 //! and keeps the gate chain it owns:
 //!
 //! ```text
@@ -44,7 +44,9 @@ const DEFAULT_MAX_STEPS: usize = 12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    /// The task finished with a final answer.
     Complete,
+    /// The task ended without one — a gate block, an error, or max steps.
     Failed,
 }
 
@@ -52,10 +54,20 @@ pub enum TaskStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentStep {
+    /// The model requested a tool call.
     ToolCall(ToolCall),
+    /// A tool finished executing — or a gate blocked it.
     ToolResult(ToolResult),
-    FinalAnswer { content: String },
-    Error { message: String },
+    /// The model produced a final answer.
+    FinalAnswer {
+        /// The answer text.
+        content: String,
+    },
+    /// The task failed with this message.
+    Error {
+        /// Why the task failed.
+        message: String,
+    },
 }
 
 /// The outcome of the self-verification pass.
@@ -63,17 +75,22 @@ pub enum AgentStep {
 pub struct Verification {
     /// `complete` | `incomplete`
     pub decision: String,
+    /// The model's feedback on what is missing, when incomplete.
     pub feedback: Option<String>,
 }
 
 /// What the agent reports when a task ends.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentReport {
+    /// How the task ended.
     pub status: TaskStatus,
+    /// The final answer text, if the task produced one.
     pub final_answer: Option<String>,
+    /// Every recorded step, in order.
     pub steps: Vec<AgentStep>,
     /// Loop iterations consumed (1 = one LLM turn).
     pub steps_used: usize,
+    /// The self-verification outcome, when one ran.
     pub verification: Option<Verification>,
 }
 
@@ -86,7 +103,9 @@ pub struct AgentConfig {
     pub trust_ceiling: ToolTrustTier,
     /// Override the provider's default model for every request.
     pub model: Option<String>,
+    /// Override the provider's default completion token limit.
     pub max_tokens: Option<usize>,
+    /// Override the provider's default sampling temperature.
     pub temperature: Option<f32>,
 }
 
@@ -168,15 +187,18 @@ impl Agent {
         self
     }
 
+    /// Replace the whole loop configuration (see [`AgentConfig`]).
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         self.config = config;
         self
     }
 
+    /// The tool registry this agent executes against.
     pub fn registry(&self) -> &ToolRegistry {
         &self.registry
     }
 
+    /// The agent's loop configuration.
     pub fn config(&self) -> &AgentConfig {
         &self.config
     }

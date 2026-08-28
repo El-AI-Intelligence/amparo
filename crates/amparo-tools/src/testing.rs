@@ -42,7 +42,10 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
 /// Supports: cargo test, npm test, pytest, go test, jest, vitest.
 
 pub struct RunTestsTool;
-impl RunTestsTool { pub fn new() -> Self { Self } }
+impl RunTestsTool {
+    /// Creates a new [`RunTestsTool`].
+    pub fn new() -> Self { Self }
+}
 
 #[async_trait]
 impl ToolExecutor for RunTestsTool {

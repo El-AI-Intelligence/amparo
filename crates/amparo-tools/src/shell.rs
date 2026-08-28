@@ -15,6 +15,14 @@
 // Blocked: rm -rf, sudo, su, passwd, chown, chmod, mkfs, dd, fork bombs,
 // pipe-to-shell, base64-encoded evasion.
 
+//! Shell tool — execute commands inside the path policy's boundaries.
+//!
+//! `run_command` runs commands via `bash` with layered defense: the
+//! deny-by-default policy gate in `amparo-agent` judges every call first, the
+//! [`PathPolicy`] blocklist rejects destructive patterns before anything
+//! spawns, and a wall-clock timeout bounds every command. OS-level confinement
+//! (bwrap/unshare namespaces) is scheduled for the hardening milestone.
+
 use super::{ToolCall, ToolExecutor, ToolParam, ToolResult, ToolSchema, ToolTrustTier};
 use crate::paths::PathPolicy;
 use async_trait::async_trait;
@@ -40,6 +48,8 @@ pub struct RunCommandTool {
 }
 
 impl RunCommandTool {
+    /// Creates a shell tool with the path policy loaded from environment
+    /// variables.
     pub fn new() -> Self {
         Self { policy: Arc::new(PathPolicy::from_env()) }
     }

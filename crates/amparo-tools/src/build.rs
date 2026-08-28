@@ -39,8 +39,14 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
 
 // ─────────────────────────────────────────────────── RunBuildTool ────────────
 
+/// Build tool — runs a build in the Amparo workspace, auto-detecting the build
+/// system (Cargo, npm, go, make) or executing an explicit command, and returns
+/// parsed errors. Trusted at `SystemControl`.
 pub struct RunBuildTool;
-impl RunBuildTool { pub fn new() -> Self { Self } }
+impl RunBuildTool {
+    /// Creates a new [`RunBuildTool`].
+    pub fn new() -> Self { Self }
+}
 
 #[async_trait]
 impl ToolExecutor for RunBuildTool {

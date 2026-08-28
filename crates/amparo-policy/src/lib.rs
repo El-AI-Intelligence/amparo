@@ -30,6 +30,8 @@
 //! Copyright (c) Pixel Phantom AI); see the repository NOTICE. The ELLM bridge
 //! stays behind — Amparo's seam speaks the open protocol instead.
 
+#![warn(missing_docs)]
+
 pub mod wire;
 
 use async_trait::async_trait;
@@ -59,6 +61,7 @@ impl PolicyVerdict {
 /// The outcome of a policy check.
 #[derive(Debug, Clone)]
 pub struct PolicyDecision {
+    /// The verdict for this tool call.
     pub verdict: PolicyVerdict,
     /// Human-readable rule firings explaining the verdict — denials must never
     /// be silent.
@@ -66,14 +69,17 @@ pub struct PolicyDecision {
 }
 
 impl PolicyDecision {
+    /// Builds an allow decision with no fired rules.
     pub fn allow() -> Self {
         Self { verdict: PolicyVerdict::Allow, fired: Vec::new() }
     }
 
+    /// Builds a deny decision carrying the given reason.
     pub fn deny(reason: impl Into<String>) -> Self {
         Self { verdict: PolicyVerdict::Deny, fired: vec![reason.into()] }
     }
 
+    /// Builds an escalate decision carrying the given reason.
     pub fn escalate(reason: impl Into<String>) -> Self {
         Self { verdict: PolicyVerdict::Escalate, fired: vec![reason.into()] }
     }
@@ -86,6 +92,7 @@ impl PolicyDecision {
 /// for file tools), `params` supplementary key/value pairs.
 #[async_trait]
 pub trait PolicyEngine: Send + Sync {
+    /// Judges a single tool call and returns the decision the caller must enforce.
     async fn judge_tool(
         &self,
         tool_name: &str,
@@ -102,6 +109,7 @@ pub struct DenyAllPolicyEngine {
 }
 
 impl DenyAllPolicyEngine {
+    /// Builds a deny-all engine whose decisions surface the given reason.
     pub fn new(reason: &'static str) -> Self {
         Self { reason }
     }

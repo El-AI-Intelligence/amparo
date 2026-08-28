@@ -44,22 +44,32 @@
 //! **No external dependencies** — this crate is deliberately zero-dep for maximum
 //! portability across every Amparo build target.
 
+#![warn(missing_docs)]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // ─────────────────────────────────────── errors ──────────────────────────────
 
+/// Errors produced by the context-window assembly pipeline.
 #[derive(Error, Debug)]
 pub enum MemoryError {
+    /// A context slot could not be serialized to JSON.
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// The required slots alone exceed the configured token budget.
     #[error("Token budget exhausted: required slots exceed budget of {budget}")]
-    BudgetExhausted { budget: usize },
+    BudgetExhausted {
+        /// The token budget that was exceeded.
+        budget: usize,
+    },
+    /// A context slot was rejected as invalid.
     #[error("Invalid slot: {0}")]
     InvalidSlot(String),
 }
 
+/// Result type used by the context-window assembly pipeline.
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
 // ─────────────────────────────────────── priority ────────────────────────────
@@ -82,13 +92,18 @@ pub enum ContextPriority {
 /// Role of a message as seen by the LLM
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ContextRole {
+    /// System instructions shown to the model.
     System,
+    /// A message from the user.
     User,
+    /// A message from the assistant.
     Assistant,
+    /// A tool-call result message.
     Tool,
 }
 
 impl ContextRole {
+    /// Returns the OpenAI-compatible role name ("system", "user", "assistant", or "tool").
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::System    => "system",
@@ -102,19 +117,30 @@ impl ContextRole {
 /// Which subsystem produced this context slot
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ContextSource {
+    /// The static system prompt defining the agent's behavior.
     SystemPrompt,
+    /// Character bias strengths injected into the system context.
     CharacterBias,
+    /// The agent's current purpose or goal vector.
     PurposeVector,
+    /// The current user message being responded to.
     CurrentTurn,
+    /// Recent conversation turns.
     RecentHistory,
+    /// Older conversation turns, compacted into summaries.
     CompactedHistory,
+    /// Long-term memory hits retrieved from Engram.
     EngramRetrieval,
+    /// World or environment context.
     WorldContext,
+    /// Policy instructions from the council.
     CouncilInstruction,
+    /// A red-line warning that must stay in context.
     RedLineWarning,
 }
 
 impl ContextSource {
+    /// Default [`ContextPriority`] for slots produced by this source.
     pub fn default_priority(&self) -> ContextPriority {
         match self {
             Self::SystemPrompt      => ContextPriority::Required,
@@ -136,17 +162,24 @@ impl ContextSource {
 /// A single unit of context — maps to one OpenAI `messages` entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextSlot {
+    /// The message role as seen by the LLM.
     pub role: ContextRole,
+    /// The raw text content of the slot.
     pub content: String,
+    /// Approximate token count, computed with `estimate_tokens`.
     pub token_estimate: usize,
+    /// Retention priority; `Required` slots are never dropped.
     pub priority: ContextPriority,
+    /// Which subsystem produced this slot.
     pub source: ContextSource,
     /// Optional metadata for attribution and debugging
     pub metadata: serde_json::Value,
+    /// When the slot was created, used for stable ordering.
     pub created_at: DateTime<Utc>,
 }
 
 impl ContextSlot {
+    /// Creates a slot, estimating its tokens and applying the source's default priority.
     pub fn new(
         role: ContextRole,
         content: impl Into<String>,
@@ -166,11 +199,13 @@ impl ContextSlot {
         }
     }
 
+    /// Overrides the slot's retention priority.
     pub fn with_priority(mut self, p: ContextPriority) -> Self {
         self.priority = p;
         self
     }
 
+    /// Attaches optional metadata to the slot.
     pub fn with_metadata(mut self, meta: serde_json::Value) -> Self {
         self.metadata = meta;
         self
@@ -217,7 +252,7 @@ pub struct AssemblerConfig {
     pub high_priority_reserve: f64,
     /// Maximum number of Recent History turns to include before compacting
     pub max_recent_turns: usize,
-    /// If true, compacted slots are included with a "[SUMMARY]" prefix
+    /// If true, compacted slots are included with a `"[SUMMARY]"` prefix
     /// rather than being discarded; preserves temporal context at lower cost
     pub include_compacted: bool,
 }
@@ -234,6 +269,7 @@ impl Default for AssemblerConfig {
 }
 
 impl AssemblerConfig {
+    /// Returns a default config using the given token budget.
     pub fn with_budget(budget: usize) -> Self {
         Self { token_budget: budget, ..Self::default() }
     }
@@ -254,14 +290,17 @@ impl AssemblerConfig {
 /// 4. Slots are **re-ordered** for optimal LLM comprehension:
 ///    `System → HiContext → RecentHistory → CurrentTurn`
 pub struct ContextAssembler {
+    /// Configuration controlling the budget, reserve, and compaction behavior.
     pub config: AssemblerConfig,
 }
 
 impl ContextAssembler {
+    /// Creates an assembler with a default config using the given token budget.
     pub fn new(token_budget: usize) -> Self {
         Self { config: AssemblerConfig::with_budget(token_budget) }
     }
 
+    /// Creates an assembler with a fully custom configuration.
     pub fn with_config(config: AssemblerConfig) -> Self {
         Self { config }
     }
@@ -370,10 +409,15 @@ impl ContextAssembler {
 /// Output of `ContextAssembler::assemble()`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssembledContext {
+    /// The ordered, budget-constrained context slots.
     pub slots: Vec<ContextSlot>,
+    /// Sum of token estimates across the included slots.
     pub total_tokens: usize,
+    /// The token budget the assembly was constrained to.
     pub budget: usize,
+    /// Tokens dropped because they did not fit the budget.
     pub dropped_tokens: usize,
+    /// Number of slots dropped to fit the budget.
     pub dropped_slots: usize,
 }
 
@@ -438,6 +482,7 @@ pub struct ContextBuilder {
 }
 
 impl ContextBuilder {
+    /// Starts a new context build with the given token budget.
     pub fn new(token_budget: usize) -> Self {
         Self {
             assembler: ContextAssembler::new(token_budget),
@@ -445,31 +490,38 @@ impl ContextBuilder {
         }
     }
 
+    /// Starts a new context build with a fully custom configuration.
     pub fn with_config(config: AssemblerConfig) -> Self {
         Self { assembler: ContextAssembler::with_config(config), slots: Vec::new() }
     }
 
+    /// Adds a pre-built slot to the context.
     pub fn add_slot(mut self, slot: ContextSlot) -> Self {
         self.slots.push(slot);
         self
     }
 
+    /// Adds the system prompt as a `Required` slot.
     pub fn system(self, content: impl Into<String>) -> Self {
         self.add_slot(ContextSlot::new(ContextRole::System, content, ContextSource::SystemPrompt))
     }
 
+    /// Adds character bias as a `Required` system slot.
     pub fn character_bias(self, content: impl Into<String>) -> Self {
         self.add_slot(ContextSlot::new(ContextRole::System, content, ContextSource::CharacterBias))
     }
 
+    /// Adds the purpose vector as a `High` system slot.
     pub fn purpose_vector(self, content: impl Into<String>) -> Self {
         self.add_slot(ContextSlot::new(ContextRole::System, content, ContextSource::PurposeVector))
     }
 
+    /// Adds the current user message as a `Required` slot.
     pub fn user(self, content: impl Into<String>) -> Self {
         self.add_slot(ContextSlot::new(ContextRole::User, content, ContextSource::CurrentTurn))
     }
 
+    /// Adds an assistant response as a `Normal` recent-history slot.
     pub fn assistant(self, content: impl Into<String>) -> Self {
         self.add_slot(
             ContextSlot::new(ContextRole::Assistant, content, ContextSource::RecentHistory)
@@ -477,18 +529,22 @@ impl ContextBuilder {
         )
     }
 
+    /// Adds an Engram retrieval as a `High` system slot.
     pub fn engram(self, content: impl Into<String>) -> Self {
         self.add_slot(ContextSlot::new(ContextRole::System, content, ContextSource::EngramRetrieval))
     }
 
+    /// Adds world context as a `High` system slot.
     pub fn world_context(self, content: impl Into<String>) -> Self {
         self.add_slot(ContextSlot::new(ContextRole::System, content, ContextSource::WorldContext))
     }
 
+    /// Adds a council instruction as a `Required` system slot.
     pub fn council_instruction(self, content: impl Into<String>) -> Self {
         self.add_slot(ContextSlot::new(ContextRole::System, content, ContextSource::CouncilInstruction))
     }
 
+    /// Adds a user/assistant turn pair as `Normal` recent-history slots.
     pub fn previous_turn(self, user: impl Into<String>, assistant: impl Into<String>) -> Self {
         let user_slot = ContextSlot::new(ContextRole::User, user, ContextSource::RecentHistory)
             .with_priority(ContextPriority::Normal);
@@ -525,10 +581,12 @@ impl Default for ConversationSummarizer {
 }
 
 impl ConversationSummarizer {
+    /// Creates a summarizer with default settings.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the maximum token count for a summary slot.
     pub fn with_max_tokens(mut self, tokens: usize) -> Self {
         self.max_summary_tokens = tokens;
         self

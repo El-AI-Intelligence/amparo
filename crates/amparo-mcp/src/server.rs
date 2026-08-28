@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+/// An MCP server exposing a [`ToolRegistry`] over stdio JSON-RPC 2.0, keeping
+/// every `tools/call` behind the same deny-by-default gate chain as the agent loop.
 pub struct McpServer {
     registry: ToolRegistry,
     policy: Arc<dyn PolicyEngine>,

@@ -8,6 +8,8 @@
 //! the level against the active `PrivacyPolicy` and either allows, redacts, or
 //! blocks the operation.
 
+#![warn(missing_docs)]
+
 pub mod canary;
 pub use canary::{CanaryToken, CanaryTokenManager, CanaryTrigger};
 
@@ -121,9 +123,12 @@ impl Default for PrivacyPolicy {
     }
 }
 
+/// A per-category override of the default privacy level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryOverride {
+    /// The data category this override applies to.
     pub category: DataCategory,
+    /// The privacy level to enforce for that category.
     pub level: PrivacyLevel,
 }
 
@@ -132,9 +137,13 @@ pub struct CategoryOverride {
 /// The result of a privacy evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrivacyDecision {
+    /// Whether the request is permitted under the active policy.
     pub allowed: bool,
+    /// The privacy level that was effectively applied to the request.
     pub effective_level: PrivacyLevel,
+    /// Whether PII should be redacted from the request before it leaves the device.
     pub redact_pii: bool,
+    /// Human-readable explanation of the decision.
     pub reason: String,
 }
 
@@ -207,14 +216,18 @@ pub fn evaluate(
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
+/// Errors produced by the privacy engine.
 #[derive(Error, Debug)]
 pub enum PrivacyError {
+    /// An unrecognised privacy level string was parsed.
     #[error("Invalid privacy level: {0}")]
     InvalidLevel(String),
+    /// The operation was blocked by the active privacy policy.
     #[error("Policy violation: {0}")]
     PolicyViolation(String),
 }
 
+/// Result type for privacy engine operations.
 pub type Result<T> = std::result::Result<T, PrivacyError>;
 
 // ─── Secure Minions Protocol ─────────────────────────────────────────────────
@@ -233,7 +246,7 @@ pub type Result<T> = std::result::Result<T, PrivacyError>;
 /// A PII placeholder used during redaction / restoration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiiPlaceholder {
-    /// The placeholder token inserted into the text (e.g. "[NAME_1]").
+    /// The placeholder token inserted into the text (e.g. `[NAME_1]`).
     pub token: String,
     /// The original value that was redacted.
     pub original: String,
