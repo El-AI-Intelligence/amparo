@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/amparo-inference"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["EL AI Intelligence <Elai-intelligence@pm.me>"]
+repository = "https://github.com/El-AI-Intelligence/amparo"

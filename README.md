@@ -7,14 +7,35 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, nothing to run yet
+## Status: pre-alpha, M1 landed
 
-This repository was created on 2026-08-27 and does not yet contain a working
-agent. The sections below describe what is being built and where the code is
-coming from, not what exists here today. There is no install path, no release,
-and no API stability.
+This repository was created on 2026-08-27. **Milestone 1 is in**: the
+`amparo-inference` crate (BYO-LLM provider abstraction) builds and passes its
+test suite. There is still no agent loop, no install path, no release, and no
+API stability.
 
 If you are reading this expecting to run something, come back after Milestone 2.
+
+### What exists today: `crates/amparo-inference`
+
+One trait (`InferenceProvider`), two providers:
+
+- **`OpenAIProvider`** — any OpenAI-compatible endpoint (Ollama, vLLM,
+  OpenRouter, Together, Groq), including an Ollama-native `/api/chat` branch.
+- **`AnthropicProvider`** — the native Anthropic Messages API, translated to
+  the same OpenAI-shaped contract (including `tool_use`/`tool_result`
+  translation and SSE streaming).
+
+Fail-closed by construction: no silent localhost default (config requires
+`AMPARO_INFERENCE_URL` + `AMPARO_INFERENCE_MODEL`), per-request timeouts plus a
+stream idle timeout, a `max_tokens` clamp, and an optional model allowlist
+enforced at provider build time. `ChatMessage` carries native tool calls
+(`tool_calls` / `tool_call_id`) — the substrate Milestone 2's agent loop will
+consume.
+
+```sh
+cargo test   # the gate
+```
 
 ## What Amparo is meant to be
 
@@ -48,7 +69,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 
 | # | Milestone | State |
 |---|---|---|
-| 1 | Provider abstraction — Anthropic + OpenAI-compatible | not started |
+| 1 | Provider abstraction — Anthropic + OpenAI-compatible | ✅ done |
 | 2 | Native tool calling (replacing text-parsed ReAct) | not started |
 | 3 | Headless operation — screen/desktop tools become optional | not started |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | not started |
