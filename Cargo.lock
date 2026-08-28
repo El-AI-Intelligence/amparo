@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amparo-inference",
  "amparo-policy",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-chat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amparo-agent",
  "amparo-inference",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amparo-agent",
  "amparo-chat",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-inference"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amparo-agent",
  "amparo-policy",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-privacy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",

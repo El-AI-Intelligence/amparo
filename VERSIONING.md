@@ -13,6 +13,9 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
 
 - **0.1.0 (2026-08-28)** — first release: the `amparo` CLI, the agent loop,
   the MCP surface, deny-by-default policy gate, interactive approval.
+- **0.2.0 (2026-08-28)** — chat adapters: Telegram, Discord and Slack behind
+  one transport seam, with inline-button approval and a fail-closed
+  operator allowlist.
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 

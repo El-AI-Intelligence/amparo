@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
+## [0.2.0] — 2026-08-28
+
+Chat adapters: the agent now runs from Telegram, Discord, and Slack — the
+same loop, gate chain and approval seam behind one transport trait, with
+inline-button approval.
+
+### Added
+
+- **The chat layer** (`amparo-chat`): one `ChatTransport` seam (text out,
+  approval messages with inline buttons, outcome edits, a receive loop), a
+  `ChatDriver` that turns a normalized message into a per-task agent run
+  (allowlist, one task per chat, panic-proof task boundary), an
+  `ApprovalRouter` for routing button presses back to the waiting gate (an
+  atomic take — a second press is already decided), a `ChatApprovalGate`
+  with inline Approve/Deny buttons and a 60 s auto-deny timeout, and a
+  `ChatEventSink` forwarding the agent's `[tag]` progress lines into the
+  chat (the final answer bypasses the sink, so it can never be lost).
+- **Three hand-rolled adapters** — no platform SDKs, rustls-only websockets:
+  **Telegram** via getUpdates long polling (inline keyboards,
+  `answerCallbackQuery` acks, 409/401 → exit), **Discord** via the gateway
+  websocket (message intents, heartbeat discipline, resume-first
+  reconnects, message components, interaction callbacks), and **Slack**
+  via Socket Mode (envelope acks before processing, block-kit buttons,
+  bot-echo suppression). Every approval flows through the same inline
+  Approve/Deny buttons.
+- **`amparo chat telegram|discord|slack`** — the `amparo` CLI's fourth
+  subcommand. Tokens come from `AMPARO_CHAT_*` environment variables
+  (never argv); `AMPARO_CHAT_ALLOWLIST` is a fail-closed single-operator
+  allowlist (empty = every message refused); `AMPARO_CHAT_TELEGRAM_BASE`
+  points the Telegram adapter at a self-hosted Bot API server.
+- **Canonical event formatting** — `format_event` moved into
+  `amparo-agent`, so the CLI and every chat platform render identical
+  `[tag]` lines.
+- **Full end-to-end coverage** — a binary-level e2e test drives the real
+  `amparo chat telegram` process against in-test mock LLM and Telegram
+  servers: message → approval keyboard → button press → outcome edit →
+  final answer, with the tool executed against a real workspace.
+
 ## [0.1.0] — 2026-08-28
 
 First release: the `amparo` CLI, the agent loop, and the MCP surface — an open

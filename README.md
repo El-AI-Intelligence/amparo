@@ -7,15 +7,17 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M3 in — the `amparo` CLI is installable
+## Status: pre-alpha, M4 in — the agent has a chat face
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
 `tool_calls` behind the policy gate, MCP first-class in both directions),
-and **Milestone 3 is in**: the `amparo` binary installs with
+**Milestone 3 is in** (the `amparo` binary installs with
 `cargo install --path crates/amparo-cli`, drives the loop end-to-end from
-the command line, and the workspace carries a versioned release (v0.1.0)
-with a documented API-stability policy.
+the command line, and the workspace carries a versioned release with a
+documented API-stability policy), and **Milestone 4 is in**: Telegram,
+Discord and Slack chat adapters behind one transport seam, with
+inline-button approval and a fail-closed operator allowlist.
 
 ### What exists today: the crate set
 
@@ -60,11 +62,19 @@ with a documented API-stability policy.
 - **`amparo-privacy`** (M2a) — privacy policy evaluation, blocked/allowed
   domain routing, and the Secure Minions PII strip/restore primitives the
   loop uses.
-- **`amparo-cli`** (M3) — the one binary: `amparo run "task"` drives the
-  loop end-to-end (fail-closed BYO-LLM env, interactive terminal approval,
-  `--auto-approve`/`--auto-deny` overrides), `amparo mcp-serve` reuses the
-  same implementation as the standalone `amparo-mcp-serve` binary (same
-  help, errors, exit codes), `amparo version` prints the version.
+- **`amparo-chat`** (M4) — the chat adapter layer: one `ChatTransport`
+  seam, a per-task `ChatDriver` (allowlist, one task per chat, panic-proof
+  task boundary), an `ApprovalRouter` for inline-button presses, a
+  `ChatApprovalGate` (inline Approve/Deny buttons, 60 s auto-deny), and
+  hand-rolled transports for **Telegram** (long polling), **Discord**
+  (gateway websocket) and **Slack** (Socket Mode).
+- **`amparo-cli`** (M3, M4) — the one binary: `amparo run "task"` drives
+  the loop end-to-end (fail-closed BYO-LLM env, interactive terminal
+  approval, `--auto-approve`/`--auto-deny` overrides), `amparo mcp-serve`
+  reuses the same implementation as the standalone `amparo-mcp-serve`
+  binary (same help, errors, exit codes), `amparo chat
+  telegram|discord|slack` serves the agent over a messaging platform,
+  `amparo version` prints the version.
 
 ```sh
 cargo test --workspace            # the behavior gate
@@ -93,12 +103,32 @@ Environment surface (everything is optional except the two marked
 | `AMPARO_INFERENCE_MODEL_ALLOWLIST` | Optional comma-separated model allowlist |
 | `AMPARO_WORKSPACE` | Directory the tools are confined to |
 | `AMPARO_POLICY_KEY` | API key for a remote policy engine (with `--policy-url`) |
+| `AMPARO_CHAT_TELEGRAM_TOKEN` | Bot token for `amparo chat telegram` |
+| `AMPARO_CHAT_DISCORD_TOKEN` | Bot token for `amparo chat discord` |
+| `AMPARO_CHAT_SLACK_APP_TOKEN` | Socket Mode app token for `amparo chat slack` (with `AMPARO_CHAT_SLACK_BOT_TOKEN`) |
+| `AMPARO_CHAT_SLACK_BOT_TOKEN` | Bot token for the Slack Web API |
+| `AMPARO_CHAT_ALLOWLIST` | Comma-separated user ids who may talk to the chat bot — absent or empty refuses everyone |
+| `AMPARO_CHAT_TELEGRAM_BASE` | Telegram Bot API base URL (self-hosted Bot API servers) |
 
 ```sh
 export AMPARO_INFERENCE_URL=http://localhost:11434/v1
 export AMPARO_INFERENCE_MODEL=qwen2.5:14b
 amparo run "list the files and tell me what's there" --allow-all
 ```
+
+Same agent, over Telegram (tokens come from the environment, never argv):
+
+```sh
+export AMPARO_CHAT_TELEGRAM_TOKEN=123456:ABC-DEF
+export AMPARO_CHAT_ALLOWLIST=111222333      # your Telegram user id
+amparo chat telegram --allow-all
+```
+
+In chat mode, approvals arrive as inline **Approve/Deny** buttons on the
+approval message; unanswered approvals auto-deny after 60 s. Progress
+lines mirror the terminal's `[tag]` format. `amparo chat discord` and
+`amparo chat slack` work the same way with their `AMPARO_CHAT_*_TOKEN`
+variables; without `AMPARO_CHAT_ALLOWLIST` the bot refuses every message.
 
 Deny-by-default: without `--policy-url` or `--allow-all`, every tool call is
 refused — `--allow-all` is an explicit opt-in for local experiments. Calls
@@ -140,15 +170,16 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | # | Milestone | State |
 |---|---|---|
 | 1 | Provider abstraction — Anthropic + OpenAI-compatible | ✅ done |
-| 2 | Native tool calling (replacing text-parsed ReAct) | ✅ landed — loop + MCP client/server, 207 tests green |
+| 2 | Native tool calling (replacing text-parsed ReAct) | ✅ landed — loop + MCP client/server, 260 tests green |
 | 3 | Install path + release — the `amparo` CLI drives the loop end-to-end (headless: no screen/desktop tools in the registry) | ✅ done |
-| 4 | Chat adapters — Telegram first, then Discord and Slack | not started |
+| 4 | Chat adapters — Telegram first, then Discord and Slack | ✅ done — all three behind one transport seam, inline-button approval |
 | 5 | Multi-tenant identity and per-user policy | not started |
 
-Milestones 1–3 are the product. 4 is small once 1–3 exist. **5 gates giving
-this to anyone but yourself** — a shell-executing agent behind a chat bot is a
-security boundary, and until per-user identity and sandboxing land, the only
-safe operator is the person who owns the machine.
+**5 gates giving this to anyone but yourself** — a shell-executing agent
+behind a chat bot is a security boundary, and until per-user identity and
+sandboxing land, the only safe operator is the person who owns the
+machine. The fail-closed `AMPARO_CHAT_ALLOWLIST` is the interim line:
+one operator, named explicitly.
 
 ## Provenance
 
