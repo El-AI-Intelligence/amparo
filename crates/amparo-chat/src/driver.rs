@@ -9,11 +9,11 @@ use crate::gate::ChatApprovalGate;
 use crate::router::ApprovalRouter;
 use crate::sink::ChatEventSink;
 use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport};
-use amparo_agent::Agent;
+use amparo_agent::{Agent, AgentConfig};
 use amparo_inference::InferenceProvider;
 use amparo_policy::PolicyEngine;
 use amparo_privacy::PrivacyPolicy;
-use amparo_tools::ToolRegistry;
+use amparo_tools::{ToolRegistry, ToolTrustTier};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -75,6 +75,10 @@ pub struct ChatDriver {
     /// `true` = approvals succeed without asking (deliberate unattended
     /// mode — the equivalent of `--auto-approve`).
     auto_approve: bool,
+    /// The trust ceiling applied to every task's agent — tools at tiers
+    /// above it are blocked outright (the `--trust-ceiling` knob of
+    /// `amparo run`). Defaults to [`ToolTrustTier::SystemControl`].
+    trust_ceiling: ToolTrustTier,
     /// Chat ids with a task in flight. std Mutex, and never held across an
     /// await — claim and release are synchronous.
     busy: Arc<Mutex<HashSet<String>>>,
@@ -107,6 +111,7 @@ impl ChatDriver {
             transport,
             router,
             auto_approve,
+            trust_ceiling: ToolTrustTier::SystemControl,
             busy: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -114,6 +119,16 @@ impl ChatDriver {
     /// Attach a privacy policy to every task this driver runs.
     pub fn with_privacy(mut self, policy: Arc<PrivacyPolicy>) -> Self {
         self.privacy = Some(policy);
+        self
+    }
+
+    /// Set the trust ceiling applied to every task's agent.
+    ///
+    /// [`ToolTrustTier::SystemControl`] (the default) blocks nothing; a
+    /// lower ceiling blocks tools above it outright, exactly like
+    /// `--trust-ceiling` on `amparo run`.
+    pub fn with_trust_ceiling(mut self, ceiling: ToolTrustTier) -> Self {
+        self.trust_ceiling = ceiling;
         self
     }
 
@@ -148,17 +163,24 @@ impl ChatDriver {
             return;
         }
 
-        {
+        // The claim-or-busy decision is made inside a block so the
+        // MutexGuard is dropped before any await — the future must stay
+        // Send for the transports' receive loops.
+        let busy_reply = {
             let mut busy = self.busy.lock().unwrap();
             if busy.contains(&chat.chat_id) {
-                drop(busy);
-                let _ = self
-                    .transport
-                    .send_text(&chat, "Another task is still running — wait for it to finish.")
-                    .await;
-                return;
+                true
+            } else {
+                busy.insert(chat.chat_id.clone());
+                false
             }
-            busy.insert(chat.chat_id.clone());
+        };
+        if busy_reply {
+            let _ = self
+                .transport
+                .send_text(&chat, "Another task is still running — wait for it to finish.")
+                .await;
+            return;
         }
 
         let provider = Arc::clone(&self.provider);
@@ -169,6 +191,7 @@ impl ChatDriver {
         let router = Arc::clone(&self.router);
         let busy = Arc::clone(&self.busy);
         let auto_approve = self.auto_approve;
+        let trust_ceiling = self.trust_ceiling;
 
         tokio::spawn(async move {
             // The claim is the busy-map entry; dropping it (however this
@@ -198,6 +221,9 @@ impl ChatDriver {
             if let Some(privacy) = privacy {
                 agent = agent.with_privacy(privacy);
             }
+            // The flags' trust ceiling reaches the per-task agent through
+            // the shared agent config (the `amparo run` equivalent).
+            agent = agent.with_config(AgentConfig { trust_ceiling, ..AgentConfig::default() });
 
             // Run inside its own spawn so a panic becomes a JoinError
             // instead of taking down this task — and the receive loop.
