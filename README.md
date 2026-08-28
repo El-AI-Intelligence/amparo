@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M4 in — the agent has a chat face
+## Status: pre-alpha, M5 in — multi-tenant identity
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -15,9 +15,12 @@ BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
 **Milestone 3 is in** (the `amparo` binary installs with
 `cargo install --path crates/amparo-cli`, drives the loop end-to-end from
 the command line, and the workspace carries a versioned release with a
-documented API-stability policy), and **Milestone 4 is in**: Telegram,
+documented API-stability policy), **Milestone 4 is in**: Telegram,
 Discord and Slack chat adapters behind one transport seam, with
-inline-button approval and a fail-closed operator allowlist.
+inline-button approval and a fail-closed operator allowlist, and
+**Milestone 5 is in**: a TOML tenant directory with per-user policy
+checks, per-user trust ceilings, per-user workspace directories, and
+requester-only approval presses.
 
 ### What exists today: the crate set
 
@@ -107,7 +110,8 @@ Environment surface (everything is optional except the two marked
 | `AMPARO_CHAT_DISCORD_TOKEN` | Bot token for `amparo chat discord` |
 | `AMPARO_CHAT_SLACK_APP_TOKEN` | Socket Mode app token for `amparo chat slack` (with `AMPARO_CHAT_SLACK_BOT_TOKEN`) |
 | `AMPARO_CHAT_SLACK_BOT_TOKEN` | Bot token for the Slack Web API |
-| `AMPARO_CHAT_ALLOWLIST` | Comma-separated user ids who may talk to the chat bot — absent or empty refuses everyone |
+| `AMPARO_CHAT_ALLOWLIST` | Comma-separated user ids who may talk to the chat bot — absent or empty refuses everyone; ignored when a chat config is set |
+| `AMPARO_CHAT_CONFIG` | Path to a TOML chat config (the tenant directory); the `--chat-config` flag wins |
 | `AMPARO_CHAT_TELEGRAM_BASE` | Telegram Bot API base URL (self-hosted Bot API servers) |
 
 ```sh
@@ -129,6 +133,32 @@ approval message; unanswered approvals auto-deny after 60 s. Progress
 lines mirror the terminal's `[tag]` format. `amparo chat discord` and
 `amparo chat slack` work the same way with their `AMPARO_CHAT_*_TOKEN`
 variables; without `AMPARO_CHAT_ALLOWLIST` the bot refuses every message.
+
+Multiple users, each with their own policy scope — a TOML chat config
+(`--chat-config`, or `AMPARO_CHAT_CONFIG`; the flag wins):
+
+```toml
+# tenants.toml — the tenant directory: only these users may start tasks
+[users."telegram:111222333"]                # one operator, all defaults
+[users."telegram:444555666"]
+trust_ceiling = "observational"             # per-user ceiling (falls back
+workspace = "team-b"                        #   to --trust-ceiling if absent)
+```
+
+```sh
+amparo chat telegram --chat-config tenants.toml --allow-all
+```
+
+Each user's workspace is a directory under the workspace root
+(`users/<platform>-<user_id>` by default; a profile `workspace` is a
+relative subpath — absolute and `..` paths are rejected). Each task's
+policy checks carry `session_id = "platform:user_id"`, so a wire policy
+engine sees who asked — the raw platform id goes to the policy server
+with every check, so the operator should choose an engine they trust.
+The config file is read once at startup. While a config is set,
+`AMPARO_CHAT_ALLOWLIST` is ignored. Approval presses are attributed:
+only the user who started a task can decide it; anyone else pressing the
+buttons gets a polite toast and the approval stays pending.
 
 Deny-by-default: without `--policy-url` or `--allow-all`, every tool call is
 refused — `--allow-all` is an explicit opt-in for local experiments. Calls
@@ -173,13 +203,15 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 2 | Native tool calling (replacing text-parsed ReAct) | ✅ landed — loop + MCP client/server, 260 tests green |
 | 3 | Install path + release — the `amparo` CLI drives the loop end-to-end (headless: no screen/desktop tools in the registry) | ✅ done |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | ✅ done — all three behind one transport seam, inline-button approval |
-| 5 | Multi-tenant identity and per-user policy | not started |
+| 5 | Multi-tenant identity and per-user policy | ✅ done — TOML tenant directory, per-user ceilings/workspaces, attributed approvals |
 
-**5 gates giving this to anyone but yourself** — a shell-executing agent
-behind a chat bot is a security boundary, and until per-user identity and
-sandboxing land, the only safe operator is the person who owns the
-machine. The fail-closed `AMPARO_CHAT_ALLOWLIST` is the interim line:
-one operator, named explicitly.
+**Giving this to other people** — a shell-executing agent behind a chat
+bot is a security boundary, and the operator owns it: the TOML tenant
+directory names exactly who may start tasks, scopes each user's tools to
+their own workspace directory, caps each user's trust ceiling, tags each
+user's policy checks with their `platform:user_id` session, and makes
+approvals requester-only. The flat `AMPARO_CHAT_ALLOWLIST` remains for
+single-operator setups, fail-closed: absent or empty means nobody.
 
 ## Provenance
 

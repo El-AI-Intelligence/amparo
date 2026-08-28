@@ -16,6 +16,10 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
 - **0.2.0 (2026-08-28)** — chat adapters: Telegram, Discord and Slack behind
   one transport seam, with inline-button approval and a fail-closed
   operator allowlist.
+- **0.3.0 (2026-08-28)** — multi-tenant identity: the TOML chat config
+  (`--chat-config` / `AMPARO_CHAT_CONFIG`), per-user policy session tags,
+  per-user trust ceilings and workspace directories, and requester-only
+  approval presses.
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 

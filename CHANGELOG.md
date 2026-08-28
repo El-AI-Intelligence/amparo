@@ -6,6 +6,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
+## [0.3.0] — 2026-08-28
+
+Multi-tenant identity: the chat face moves from a single-operator
+allowlist to a TOML tenant directory, with per-user policy, trust
+ceilings, workspaces and attributed approvals.
+
+### Added
+
+- **The TOML chat profile** (`--chat-config <path>` /
+  `AMPARO_CHAT_CONFIG`, the flag wins): `[users."platform:user_id"]`
+  sections are the tenant directory — a user without an entry is refused
+  exactly as an unlisted user is today. Per-user `trust_ceiling` (falling
+  back to the `--trust-ceiling` flag) and per-user `workspace` (a
+  relative subpath under the workspace root, defaulting to
+  `users/<platform>-<user_id>/`; absolute and `..` paths are rejected at
+  load). The file is read once at startup; an empty directory and the
+  legacy `AMPARO_CHAT_ALLOWLIST` interplay are both warned about at
+  startup.
+- **Per-user policy checks** — with `--policy-url`, every task gets a
+  fresh engine session-tagged `platform:user_id`, so engine-side audit
+  rows carry the chat user (legacy allowlist mode included).
+- **Per-user workspaces** — directory-mode tasks run in their own
+  workspace directory, enforced by explicit `PathPolicy` injection
+  (`PathPolicy::from_root`, `with_policy` on the 14 workspace-bound
+  tools, `default_registry_with_policy`) — never process-global
+  environment mutation. The default `users/` path is re-checked per task
+  so a hostile user id cannot escape the root.
+- **Strict press attribution** — `ApprovalButtonPress` carries the
+  pressing user's id; presses from anyone but the requester are rejected
+  with a polite toast and never consume the pending approval.
+- **Binary-level M5 e2e** — the shipped `amparo chat telegram` process
+  against mock Telegram and LLM servers: config flag/env precedence and
+  exit codes, the per-user workspace proven with `pwd`, the wrong-user
+  toast followed by the requester's own deciding press, refusal of
+  unknown users, and a per-user ceiling blocking the tool without ever
+  asking.
+
+### Changed
+
+- `ChatDriver::new` takes `Tenants` (directory or legacy allowlist) and
+  `PolicySource` (shared engine or per-task wire engine); `allowlisted()`
+  becomes `allows()`, and per-task parts are resolved before the busy
+  claim so a refused user never holds a chat busy.
+- Wrong-user Slack presses now reply ephemerally (the requester's
+  buttons stay up — previously the outcome edit replaced them) and
+  Discord sends a toast message (previously silent).
+
 ## [0.2.0] — 2026-08-28
 
 Chat adapters: the agent now runs from Telegram, Discord, and Slack — the
