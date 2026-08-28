@@ -715,3 +715,368 @@ async fn chat_telegram_roundtrip_message_approval_tool_answer() {
         "the LLM saw the tool_result for call_1 — the approved tool ran for real"
     );
 }
+
+// ── Chat config (M5 tenant directory) ───────────────────────────────────────
+
+/// Spawn `amparo chat telegram` as a serve process (closed stdin, piped
+/// stdio) — the round-trip spawn pattern, shared by the config tests.
+fn spawn_serve(args: &[&str]) -> tokio::process::Child {
+    tokio::process::Command::new(bin())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn amparo chat")
+}
+
+/// Write a tenant-directory config to a uniquely named file under the
+/// system temp dir (never the repo tree). The caller removes the file.
+fn write_chat_config(name: &str, body: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("amparo-cli-chat-config-{name}.toml"));
+    std::fs::write(&path, body).expect("write chat config");
+    path
+}
+
+/// A uniquely named workspace root for one test's per-user directories
+/// (fresh: any stale dir from a crashed run is cleared first).
+fn fresh_workspace(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("amparo-cli-chat-cfg-ws-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create workspace root");
+    dir
+}
+
+#[tokio::test]
+async fn chat_config_flag_without_value_exits_2() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["chat", "telegram", "--chat-config"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("requires a path"), "{}", stderr(&out));
+}
+
+#[tokio::test]
+async fn chat_config_missing_file_exits_2() {
+    let _guard = LOCK.lock().await;
+    // Token and inference env are valid, so the config load is the only
+    // possible failure — and it must be a configuration problem (exit 2),
+    // not a serve failure (exit 1).
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_INFERENCE_URL", "http://127.0.0.1:9/v1"),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+        ],
+        &["AMPARO_CHAT_CONFIG", "AMPARO_CHAT_ALLOWLIST"],
+    );
+    let out = run_with(&[
+        "chat", "telegram", "--chat-config", "/nonexistent/amparo-tenants.toml",
+    ])
+    .await;
+    drop(env);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("chat config"), "{}", stderr(&out));
+}
+
+#[tokio::test]
+async fn chat_config_flag_wins_over_env() {
+    let _guard = LOCK.lock().await;
+    // The env config allows telegram:111; the flag config is empty. If the
+    // env path were used, 111 would get a task — the refusal proves the
+    // flag won, and the empty-config warning on stderr says so explicitly.
+    let env_cfg = write_chat_config("flag-wins-env", "[users.\"telegram:111\"]\n");
+    let flag_cfg = write_chat_config("flag-wins", "[users]\n");
+    let llm = MockLlm::start(vec![]).await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(201, 111, 111, "do it"));
+
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let env_cfg_str = env_cfg.to_str().unwrap();
+    let flag_cfg_str = flag_cfg.to_str().unwrap();
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_ALLOWLIST", "111"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_CHAT_CONFIG", env_cfg_str),
+        ],
+        &["AMPARO_WORKSPACE"],
+    );
+
+    let mut child =
+        spawn_serve(&["chat", "telegram", "--chat-config", flag_cfg_str]);
+
+    let refused = wait_until(|| {
+        telegram.log().iter().any(|r| {
+            r.path.contains("/sendMessage") && body_contains(&r.body, "not authorized")
+        })
+    })
+    .await;
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+    std::fs::remove_file(&env_cfg).ok();
+    std::fs::remove_file(&flag_cfg).ok();
+
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        refused,
+        "111 must be refused by the empty flag config; child stderr: {err}"
+    );
+    assert!(
+        llm.bodies.lock().unwrap().is_empty(),
+        "a refused user never reaches the LLM"
+    );
+    assert!(
+        err.contains("no users in chat config"),
+        "the empty-config warning proves the flag path loaded: {err}"
+    );
+}
+
+#[tokio::test]
+async fn chat_config_directory_roundtrip_per_user_workspace() {
+    let _guard = LOCK.lock().await;
+    let cfg = write_chat_config("per-user-ws", "[users.\"telegram:111\"]\n");
+    let ws = fresh_workspace("per-user-ws");
+    let llm = MockLlm::start(vec![tool_call_script("pwd"), vec![content_frame("Done.")]]).await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(301, 111, 111, "do it"));
+    telegram.push_update(callback_update(302, 111, 111, "approve:call_1"));
+
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let ws_str = ws.to_str().unwrap();
+    let cfg_str = cfg.to_str().unwrap();
+    // AMPARO_CHAT_ALLOWLIST is set on purpose: it must be ignored while a
+    // chat config is set, and the warning on stderr proves that.
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_ALLOWLIST", "111"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_WORKSPACE", ws_str),
+        ],
+        &["AMPARO_CHAT_CONFIG"],
+    );
+
+    let mut child = spawn_serve(&["chat", "telegram", "--allow-all", "--chat-config", cfg_str]);
+
+    let done = wait_until(|| {
+        telegram.log().iter().any(|r| {
+            r.path.contains("/sendMessage") && body_contains(&r.body, "Done.")
+        }) && llm.saw_tool_result()
+    })
+    .await;
+
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+
+    let per_user = ws.join("users/telegram-111");
+    assert!(
+        done,
+        "the per-user workspace round trip never completed; child stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        per_user.is_dir(),
+        "the per-user workspace exists on disk: {per_user:?}"
+    );
+    let bodies = llm.bodies.lock().unwrap();
+    assert!(
+        bodies.iter().any(|b| b.contains(&per_user.to_string_lossy().to_string())),
+        "the run_command result echoed the per-user cwd: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|b| b.contains("\\\"exit_code\\\":0")),
+        "the tool truly ran (success result present): {bodies:?}"
+    );
+    drop(bodies);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("AMPARO_CHAT_ALLOWLIST is ignored"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[tokio::test]
+async fn chat_config_wrong_user_press_is_toasted_and_requester_still_decides() {
+    let _guard = LOCK.lock().await;
+    let cfg = write_chat_config("wrong-user", "[users.\"telegram:111\"]\n");
+    let ws = fresh_workspace("wrong-user");
+    let llm = MockLlm::start(vec![tool_call_script("echo hi"), vec![content_frame("Done.")]]).await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(401, 111, 111, "do it"));
+    // FIFO: 222's press is answered before 111's own approve — the toast
+    // must land, and the approval must stay pending for the requester.
+    telegram.push_update(callback_update(402, 222, 111, "approve:call_1"));
+    telegram.push_update(callback_update(403, 111, 111, "approve:call_1"));
+
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let ws_str = ws.to_str().unwrap();
+    let cfg_str = cfg.to_str().unwrap();
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_WORKSPACE", ws_str),
+        ],
+        &["AMPARO_CHAT_CONFIG", "AMPARO_CHAT_ALLOWLIST"],
+    );
+
+    let mut child = spawn_serve(&["chat", "telegram", "--allow-all", "--chat-config", cfg_str]);
+
+    let done = wait_until(|| {
+        telegram.log().iter().any(|r| {
+            r.path.contains("/sendMessage") && body_contains(&r.body, "Done.")
+        }) && llm.saw_tool_result()
+            && telegram.log().iter().any(|r| {
+                r.path.contains("/answerCallbackQuery")
+                    && body_contains(&r.body, "Only the user who started")
+            })
+    })
+    .await;
+
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&ws).ok();
+
+    assert!(
+        done,
+        "the wrong-user press was toasted, then the requester's own press completed the task; \
+         child stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        llm.saw_tool_result(),
+        "the approved tool ran for real after the requester's press"
+    );
+}
+
+#[tokio::test]
+async fn chat_config_unknown_user_refused() {
+    let _guard = LOCK.lock().await;
+    let cfg = write_chat_config("unknown-user", "[users.\"telegram:111\"]\n");
+    let ws = fresh_workspace("unknown-user");
+    let llm = MockLlm::start(vec![]).await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(501, 222, 222, "do it"));
+
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let ws_str = ws.to_str().unwrap();
+    let cfg_str = cfg.to_str().unwrap();
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_WORKSPACE", ws_str),
+        ],
+        &["AMPARO_CHAT_CONFIG", "AMPARO_CHAT_ALLOWLIST"],
+    );
+
+    let mut child = spawn_serve(&["chat", "telegram", "--chat-config", cfg_str]);
+
+    let refused = wait_until(|| {
+        telegram.log().iter().any(|r| {
+            r.path.contains("/sendMessage") && body_contains(&r.body, "not authorized")
+        })
+    })
+    .await;
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&ws).ok();
+
+    assert!(
+        refused,
+        "222 must be refused; child stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        llm.bodies.lock().unwrap().is_empty(),
+        "a refused user never reaches the LLM"
+    );
+}
+
+#[tokio::test]
+async fn chat_config_per_user_trust_ceiling() {
+    let _guard = LOCK.lock().await;
+    let cfg = write_chat_config(
+        "trust-ceiling",
+        "[users.\"telegram:111\"]\ntrust_ceiling = \"observational\"\n",
+    );
+    let ws = fresh_workspace("trust-ceiling");
+    let llm = MockLlm::start(vec![tool_call_script("echo hi"), vec![content_frame("Done.")]]).await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(601, 111, 111, "do it"));
+
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let ws_str = ws.to_str().unwrap();
+    let cfg_str = cfg.to_str().unwrap();
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_WORKSPACE", ws_str),
+        ],
+        &["AMPARO_CHAT_CONFIG", "AMPARO_CHAT_ALLOWLIST"],
+    );
+
+    let mut child = spawn_serve(&["chat", "telegram", "--allow-all", "--chat-config", cfg_str]);
+
+    // The ceiling blocks run_command before the policy gate, so no approval
+    // is ever asked and the task still completes with the scripted answer.
+    let done = wait_until(|| {
+        telegram.log().iter().any(|r| {
+            r.path.contains("/sendMessage") && body_contains(&r.body, "Done.")
+        })
+    })
+    .await;
+
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&ws).ok();
+
+    assert!(
+        done,
+        "the task completed despite the blocked call; child stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = telegram.log();
+    assert!(
+        !log.iter().any(|r| r.path.contains("/sendMessage")
+            && body_contains(&r.body, "inline_keyboard")),
+        "no approval keyboard for a trust-ceiling-blocked call: {log:#?}"
+    );
+    let bodies = llm.bodies.lock().unwrap();
+    assert!(
+        bodies.iter().any(|b| b.contains("tool blocked by trust ceiling")),
+        "the blocked call was answered to the LLM: {bodies:?}"
+    );
+    assert!(
+        !bodies.iter().any(|b| b.contains("\\\"exit_code\\\":0")),
+        "the tool never executed (no success result reached the LLM): {bodies:?}"
+    );
+}
