@@ -7,34 +7,52 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M1 landed
+## Status: pre-alpha, M2 in progress — the loop is in
 
-This repository was created on 2026-08-27. **Milestone 1 is in**: the
-`amparo-inference` crate (BYO-LLM provider abstraction) builds and passes its
-test suite. There is still no agent loop, no install path, no release, and no
-API stability.
+This repository was created on 2026-08-27. **Milestone 1 is in** (the
+BYO-LLM provider layer) and **Milestone 2 is nearly in**: the agent loop now
+runs on native `tool_calls` behind the policy gate. What remains in M2 is the
+MCP client/server surface, then an install path, a release, and API stability.
 
-If you are reading this expecting to run something, come back after Milestone 2.
+If you are reading this expecting to run something, come back after Milestone 3.
 
-### What exists today: `crates/amparo-inference`
+### What exists today: the crate set
 
-One trait (`InferenceProvider`), two providers:
-
-- **`OpenAIProvider`** — any OpenAI-compatible endpoint (Ollama, vLLM,
-  OpenRouter, Together, Groq), including an Ollama-native `/api/chat` branch.
-- **`AnthropicProvider`** — the native Anthropic Messages API, translated to
-  the same OpenAI-shaped contract (including `tool_use`/`tool_result`
-  translation and SSE streaming).
-
-Fail-closed by construction: no silent localhost default (config requires
-`AMPARO_INFERENCE_URL` + `AMPARO_INFERENCE_MODEL`), per-request timeouts plus a
-stream idle timeout, a `max_tokens` clamp, and an optional model allowlist
-enforced at provider build time. `ChatMessage` carries native tool calls
-(`tool_calls` / `tool_call_id`) — the substrate Milestone 2's agent loop will
-consume.
+- **`amparo-inference`** (M1) — one trait (`InferenceProvider`), two providers:
+  **`OpenAIProvider`** (any OpenAI-compatible endpoint — Ollama, vLLM,
+  OpenRouter, Together, Groq — including an Ollama-native `/api/chat` branch)
+  and **`AnthropicProvider`** (the native Anthropic Messages API, translated to
+  the same OpenAI-shaped contract, including `tool_use`/`tool_result`
+  translation and SSE streaming). Fail-closed by construction: no silent
+  localhost default, per-request timeouts plus a stream idle timeout, a
+  `max_tokens` clamp, and an optional model allowlist enforced at build time.
+- **`amparo-agent`** (M2d) — the loop, ported from Axiom's `run_agent_task`
+  and switched from text-parsed ReAct to native `tool_calls`. The gate chain
+  Amparo owns is the deny-by-default seam: **trust ceiling → policy gate →
+  human approval**, and every tool call — executed or blocked — gets a
+  tool-role answer carrying its `tool_call_id`. Loop mechanics preserved from
+  Axiom: max steps + conversation trimming, parallel tool batches with retry
+  ×2, the one-shot shortcut, the same-tool loop guard, empty-turn recovery,
+  and VERIFIED/INCOMPLETE self-verification. Events flow through an
+  `EventSink` seam; approval gates default to auto-deny; privacy is enforced
+  per turn with Secure Minions PII strip/restore (per-message placeholder
+  namespaces), and nudge/verification messages are stripped too.
+- **`amparo-policy`** (M2b) — the policy seam (`PolicyEngine`) with a
+  deny-all default and `WirePolicyEngine`, a client for the open policy-check
+  wire protocol (`POST /check {tool_name, target} → {verdict, reason,
+  enforced}`). Guardrail is a commercial implementation of that protocol;
+  anyone can write another.
+- **`amparo-tools`** (M2c) — the registry and the portable tool set (web,
+  filesystem, shell, git, tests, build, memory), each with a trust tier that
+  drives the approval gate.
+- **`amparo-memory`** (M2a) — the memory interface with a built-in default
+  store. Engram is the recommended backend; it is never a dependency.
+- **`amparo-privacy`** (M2a) — privacy policy evaluation, blocked/allowed
+  domain routing, and the Secure Minions PII strip/restore primitives the
+  loop uses.
 
 ```sh
-cargo test   # the gate
+cargo test --workspace   # the gate
 ```
 
 ## What Amparo is meant to be
@@ -70,7 +88,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | # | Milestone | State |
 |---|---|---|
 | 1 | Provider abstraction — Anthropic + OpenAI-compatible | ✅ done |
-| 2 | Native tool calling (replacing text-parsed ReAct) | not started |
+| 2 | Native tool calling (replacing text-parsed ReAct) | 🚧 in progress — loop landed; MCP surface next |
 | 3 | Headless operation — screen/desktop tools become optional | not started |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | not started |
 | 5 | Multi-tenant identity and per-user policy | not started |
@@ -82,11 +100,11 @@ safe operator is the person who owns the machine.
 
 ## Provenance
 
-The agent loop is being extracted from
+The agent loop was extracted from
 [Axiom-OS](https://github.com/PixelPhantomAI/Axiom-OS) (MIT), which contains a
 working ReAct loop with tool retry, self-verification, and conversation
-trimming. What is *not* coming across: the desktop compositor, screen ingestion,
-the companion loop, and the ELLM proxy coupling.
+trimming. What did *not* come across: the desktop compositor, screen ingestion,
+the companion loop, and the ELLM proxy coupling — see [NOTICE](NOTICE).
 
 Amparo is Apache-2.0 rather than MIT for the explicit patent grant, which
 matters more than usual for software that executes arbitrary code.
