@@ -62,6 +62,8 @@ pub mod approval;
 pub mod events;
 mod sse;
 
-pub use agent::{Agent, AgentConfig, AgentReport, AgentStep, TaskStatus, Verification};
+pub use agent::{
+    extract_target, Agent, AgentConfig, AgentReport, AgentStep, TaskStatus, Verification,
+};
 pub use approval::{ApprovalGate, ApprovalRequest, AutoApprove, AutoDeny};
 pub use events::{AgentEvent, EventSink, InMemoryEventSink};

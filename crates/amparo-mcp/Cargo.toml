@@ -1,0 +1,24 @@
+[package]
+name = "amparo-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Amparo's MCP surface: serve amparo tools over Model Context Protocol, mount external MCP tools into the registry — both behind the policy gate"
+
+[[bin]]
+name = "amparo-mcp-serve"
+path = "src/main.rs"
+
+[dependencies]
+amparo-agent = { path = "../amparo-agent" }
+amparo-policy = { path = "../amparo-policy" }
+amparo-tools = { path = "../amparo-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+tracing = "0.1"

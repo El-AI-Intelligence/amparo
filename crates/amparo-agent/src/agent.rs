@@ -870,7 +870,11 @@ impl Agent {
 /// Other arguments become supplementary key/value pairs. Calls with no
 /// recognizable primary string argument use the compact JSON of the
 /// arguments as the target.
-fn extract_target(call: &ToolCall) -> (String, Vec<(String, String)>) {
+///
+/// Public because the same contract is shared by every surface that routes
+/// calls to a [`amparo_policy::PolicyEngine`] — the agent loop and the MCP
+/// server both use it.
+pub fn extract_target(call: &ToolCall) -> (String, Vec<(String, String)>) {
     let primary = ["command", "path", "url", "query"].iter().find_map(|key| {
         call.arguments
             .get(*key)
