@@ -1,0 +1,21 @@
+[package]
+name = "amparo-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Amparo's agent loop: native tool_calls, policy-gated execution, approval gates, self-verification"
+
+[dependencies]
+amparo-inference = { path = "../amparo-inference" }
+amparo-privacy = { path = "../amparo-privacy" }
+amparo-policy = { path = "../amparo-policy" }
+amparo-tools = { path = "../amparo-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+tracing = "0.1"

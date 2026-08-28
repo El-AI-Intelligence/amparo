@@ -12,6 +12,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "amparo-agent"
+version = "0.1.0"
+dependencies = [
+ "amparo-inference",
+ "amparo-policy",
+ "amparo-privacy",
+ "amparo-tools",
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "amparo-inference"
 version = "0.1.0"
 dependencies = [
