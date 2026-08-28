@@ -7,12 +7,14 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M2 in progress — the loop is in
+## Status: pre-alpha, M2 landed — the loop and the MCP surface are in
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
-BYO-LLM provider layer) and **Milestone 2 is nearly in**: the agent loop now
-runs on native `tool_calls` behind the policy gate. What remains in M2 is the
-MCP client/server surface, then an install path, a release, and API stability.
+BYO-LLM provider layer) and **Milestone 2 is in**: the agent loop runs on
+native `tool_calls` behind the policy gate, and MCP is first-class — the
+server exposes the registry over Model Context Protocol and the client mounts
+external MCP tools as ordinary registry tools, both behind the same gate
+chain. Next is an install path, a release, and API stability.
 
 If you are reading this expecting to run something, come back after Milestone 3.
 
@@ -37,6 +39,15 @@ If you are reading this expecting to run something, come back after Milestone 3.
   `EventSink` seam; approval gates default to auto-deny; privacy is enforced
   per turn with Secure Minions PII strip/restore (per-message placeholder
   namespaces), and nudge/verification messages are stripped too.
+- **`amparo-mcp`** (M2e) — MCP first-class on both sides. `McpServer`
+  speaks JSON-RPC 2.0 over stdio (`initialize`, `tools/list`, `tools/call`,
+  `ping`); the policy engine is a required constructor argument and every
+  call runs the same gate chain as the loop, with auto-deny approval by
+  default. `McpClient` spawns a server process, handshakes, and
+  `mount_into`s its tools as registry executors at `ExternalEffector` by
+  default, so remote tools cannot skip the approval gate. Ships the
+  `amparo-mcp-serve` binary (`--policy-url`, `--allow-all`,
+  `--auto-approve`, `--trust-ceiling`).
 - **`amparo-policy`** (M2b) — the policy seam (`PolicyEngine`) with a
   deny-all default and `WirePolicyEngine`, a client for the open policy-check
   wire protocol (`POST /check {tool_name, target} → {verdict, reason,
@@ -88,7 +99,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | # | Milestone | State |
 |---|---|---|
 | 1 | Provider abstraction — Anthropic + OpenAI-compatible | ✅ done |
-| 2 | Native tool calling (replacing text-parsed ReAct) | 🚧 in progress — loop landed; MCP surface next |
+| 2 | Native tool calling (replacing text-parsed ReAct) | ✅ landed — loop + MCP client/server, 164 tests green |
 | 3 | Headless operation — screen/desktop tools become optional | not started |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | not started |
 | 5 | Multi-tenant identity and per-user policy | not started |
