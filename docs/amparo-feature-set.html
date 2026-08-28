@@ -1,0 +1,546 @@
+<title>Amparo Feature Set</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #faf7f2;
+    --bg-soft: #f1ece3;
+    --ink: #1d2a26;
+    --ink-soft: #51615b;
+    --accent: #0e6e5c;
+    --accent-ink: #0a5245;
+    --line: #ddd5c8;
+    --chip-bg: #e8e2d6;
+    --warn: #8a5a12;
+    --good: #0e6e5c;
+    --code-bg: #efe9de;
+  }
+  :root[data-theme="dark"] {
+    --bg: #141a18;
+    --bg-soft: #1c2421;
+    --ink: #e8e4db;
+    --ink-soft: #a5b2ab;
+    --accent: #4fc3a1;
+    --accent-ink: #7ad6ba;
+    --line: #2e3a35;
+    --chip-bg: #232d29;
+    --warn: #e0a75a;
+    --good: #4fc3a1;
+    --code-bg: #1e2723;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141a18; --bg-soft: #1c2421; --ink: #e8e4db; --ink-soft: #a5b2ab;
+      --accent: #4fc3a1; --accent-ink: #7ad6ba; --line: #2e3a35;
+      --chip-bg: #232d29; --warn: #e0a75a; --good: #4fc3a1; --code-bg: #1e2723;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding-bottom: 5rem;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 1.4rem; }
+  header.hero { padding: 4rem 0 2.2rem; border-bottom: 1px solid var(--line); }
+  .glyph { font-size: 2.4rem; }
+  h1 { font-size: 2.4rem; line-height: 1.15; margin: .6rem 0 .4rem; letter-spacing: -.02em; }
+  .lede { font-size: 1.15rem; color: var(--ink-soft); max-width: 40rem; margin: .3rem 0 1.2rem; }
+  .chips { display: flex; flex-wrap: wrap; gap: .5rem; }
+  .chip {
+    font-size: .78rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    padding: .3rem .7rem; border-radius: 999px; background: var(--chip-bg); color: var(--ink-soft);
+  }
+  .chip.accent { background: var(--accent); color: #fff; }
+  :root[data-theme="dark"] .chip.accent { color: #10211b; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .chip.accent { color: #10211b; }
+  }
+  section { padding: 2.6rem 0 0; }
+  h2 {
+    font-size: 1.35rem; margin: 0 0 .3rem; letter-spacing: -.01em;
+    border-left: 4px solid var(--accent); padding-left: .8rem;
+  }
+  h3 { font-size: 1.05rem; margin: 1.6rem 0 .5rem; color: var(--accent-ink); }
+  p { margin: .5rem 0; }
+  ul { margin: .4rem 0; padding-left: 1.2rem; }
+  li { margin: .25rem 0; }
+  strong { color: var(--ink); }
+  .subtle { color: var(--ink-soft); }
+  .muted { color: var(--ink-soft); font-size: .92rem; }
+
+  /* gate chain */
+  .chain {
+    display: flex; flex-wrap: wrap; gap: .5rem; align-items: stretch;
+    margin: 1.2rem 0; counter-reset: step;
+  }
+  .step {
+    flex: 1 1 8.5rem; background: var(--bg-soft); border: 1px solid var(--line);
+    border-radius: 10px; padding: .7rem .8rem; font-size: .85rem; position: relative;
+  }
+  .step::before {
+    counter-increment: step; content: counter(step);
+    display: inline-block; width: 1.35rem; height: 1.35rem; line-height: 1.35rem;
+    text-align: center; border-radius: 50%; background: var(--accent); color: #fff;
+    font-size: .72rem; font-weight: 700; margin-right: .45rem;
+  }
+  :root[data-theme="dark"] .step::before { color: #10211b; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .step::before { color: #10211b; }
+  }
+  .step b { display: block; margin-top: .25rem; }
+  .step span { color: var(--ink-soft); font-size: .8rem; }
+  .verdict { margin: .8rem 0 1.4rem; font-size: .95rem; }
+  .verdict b.good { color: var(--good); }
+  .verdict b.bad { color: var(--warn); }
+
+  /* feature groups */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1.1rem; margin-top: 1.1rem; }
+  .card {
+    background: var(--bg-soft); border: 1px solid var(--line); border-radius: 12px;
+    padding: 1.1rem 1.2rem;
+  }
+  .card h4 { margin: 0 0 .4rem; font-size: .95rem; letter-spacing: .02em; }
+  .card h4 .tag {
+    float: right; font-size: .68rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--accent-ink); border: 1px solid var(--line);
+    border-radius: 999px; padding: .05rem .5rem; background: var(--bg);
+  }
+  .card ul { font-size: .88rem; }
+  .card li { margin: .3rem 0; }
+
+  /* comparison table */
+  .tablebox { overflow-x: auto; margin: 1.1rem 0; border: 1px solid var(--line); border-radius: 12px; }
+  table { border-collapse: collapse; width: 100%; min-width: 780px; font-size: .85rem; }
+  th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  thead th { background: var(--bg-soft); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-soft); }
+  th.dim { width: 9rem; }
+  td.dim { font-weight: 600; color: var(--ink); background: var(--bg-soft); }
+  td.me { background: color-mix(in srgb, var(--accent) 7%, var(--bg)); font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+
+  blockquote {
+    margin: 1.2rem 0; padding: .9rem 1.1rem; border-left: 3px solid var(--accent);
+    background: var(--bg-soft); border-radius: 0 10px 10px 0; font-size: .95rem;
+  }
+  code { background: var(--code-bg); padding: .1rem .35rem; border-radius: 5px; font-size: .86em; }
+  .note { font-size: .85rem; color: var(--ink-soft); }
+  footer { margin-top: 3.5rem; padding-top: 1.4rem; border-top: 1px solid var(--line); color: var(--ink-soft); font-size: .85rem; }
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1.1rem; }
+</style>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="glyph">&#x1F6E1;&#xFE0F;</div>
+    <h1>Amparo Feature Set</h1>
+    <p class="lede">The open agent that acts under policy — what it ships today, and how that differs from every other kind of agent software.</p>
+    <div class="chips">
+      <span class="chip accent">v0.3.0</span>
+      <span class="chip">pre-alpha</span>
+      <span class="chip">Apache-2.0</span>
+      <span class="chip">Rust</span>
+      <span class="chip">9 crates</span>
+      <span class="chip">298 tests</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<section>
+  <h2>What Amparo is</h2>
+  <p>Amparo is an assembled agent, not a framework: a single Rust binary that runs a real
+  tool-use loop — files, shell, git, web, tests, build — where <strong>every tool call passes
+  a policy check before it executes</strong>, and the model driving the loop is yours to choose.
+  It runs headless as a CLI, an MCP server, or a chat bot for Telegram, Discord and Slack,
+  serving many users at once with per-user policy, per-user trust ceilings, per-user
+  workspace directories, and requester-only approvals.</p>
+  <p>Three commitments shape every design decision:</p>
+  <ul>
+    <li><strong>Bring your own LLM.</strong> Anthropic, OpenAI, or any OpenAI-compatible endpoint
+      (Ollama, vLLM, OpenRouter, Together, Groq). No bundled model, no required sidecar.</li>
+    <li><strong>Policy is an interface, not a product.</strong> The gate between &ldquo;the model decided
+      to do this&rdquo; and &ldquo;this ran&rdquo; is an open wire protocol. The default is <strong>deny</strong>.</li>
+    <li><strong>Deployable anywhere.</strong> A standalone server, a container, a systemd unit, a chat bot —
+      not welded to a desktop session.</li>
+  </ul>
+
+  <h3>The gate chain — the spine</h3>
+  <p>Every tool call the model makes passes through four gates in order. If any gate says no, the call
+  does not run — and the model still gets an answer for it:</p>
+  <div class="chain">
+    <div class="step"><b>Registry lookup</b><span>unknown tools get an honest error, not a hallucinated result</span></div>
+    <div class="step"><b>Trust ceiling</b><span>tiers: Observational &middot; LocalMutating &middot; ExternalEffector &middot; SystemControl</span></div>
+    <div class="step"><b>Policy engine</b><span>local allow/deny engines, or a remote engine over the open wire spec</span></div>
+    <div class="step"><b>Human approval</b><span>inline Approve/Deny buttons, 60&nbsp;s auto-deny, requester-only presses</span></div>
+  </div>
+  <p class="verdict">Executed &#8594; the result goes back to the model as a <code>tool_result</code>.
+  Blocked &#8594; <b class="bad">a blocked-call answer still goes back, carrying the same
+  <code>tool_call_id</code></b> — the loop never stalls, and the model never fills a gap with invention.</p>
+</section>
+
+<section>
+  <h2>The full feature set</h2>
+  <p class="subtle">Grouped by the layer that owns it. Everything below is in the tree and behind the gate today.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h4>Inference <span class="tag">M1</span></h4>
+      <ul>
+        <li>One <code>InferenceProvider</code> trait; two providers: <strong>OpenAI-compatible</strong>
+          (any endpoint, incl. an Ollama-native branch) and <strong>Anthropic-native</strong>
+          (Messages API, <code>tool_use</code>/<code>tool_result</code> translated to the same contract)</li>
+        <li>Fail-closed: no silent localhost default — URL and model are required</li>
+        <li>Per-request and stream-idle timeouts, <code>max_tokens</code> clamp, optional model allowlist</li>
+        <li>Configurable base URL — works with local sidecars and hosted APIs alike</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>The agent loop <span class="tag">M2</span></h4>
+      <ul>
+        <li>Native <code>tool_calls</code> — no text-parsed ReAct, no format guessing</li>
+        <li>Max steps + conversation trimming, parallel tool batches with retry &times;2,
+          the one-shot shortcut, a same-tool loop guard, empty-turn recovery</li>
+        <li><strong>Self-verification</strong>: every final answer is graded
+          VERIFIED/INCOMPLETE before it ships</li>
+        <li>Events flow through an <code>EventSink</code> seam — the same <code>[tag]</code>
+          progress lines on every surface</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Policy <span class="tag">M2b</span></h4>
+      <ul>
+        <li><code>PolicyEngine</code> trait; deny-all default; <code>AllowAllPolicyEngine</code>
+          is an explicit named opt-in, never the default</li>
+        <li><code>WirePolicyEngine</code>: the open <code>POST /check {tool_name, target}</code>
+          protocol, with the caller contract — never block on <code>enforced:false</code>,
+          engine errors escalate, escalate means ask a human</li>
+        <li>Per-task session tags: checks carry <code>session_id = "platform:user_id"</code></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Tools <span class="tag">M2c</span></h4>
+      <ul>
+        <li><strong>17 tools</strong>: 5 filesystem, shell (<code>run_command</code>), 6 git,
+          run-tests, run-build, web search, fetch URL, memory search</li>
+        <li>Each carries a <strong>trust tier</strong> that drives the approval gate</li>
+        <li><strong>14 are workspace-bound</strong>: every path resolves under the workspace
+          root, per user, via explicit <code>PathPolicy</code> injection</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>MCP, both directions <span class="tag">M2e</span></h4>
+      <ul>
+        <li><code>McpServer</code>: JSON-RPC 2.0 over stdio; a policy engine is a required
+          constructor argument; every <code>tools/call</code> runs the same gate chain</li>
+        <li><code>McpClient</code>: spawns external servers, handshakes, mounts their tools
+          at <code>ExternalEffector</code> — remote tools cannot skip approval</li>
+        <li>Race-free pending map, 60&nbsp;s call timeout, clean EOF draining</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Memory &amp; privacy <span class="tag">M2a</span></h4>
+      <ul>
+        <li>Memory is an <strong>interface</strong> with a built-in default store;
+          <strong>Engram is the recommended backend, never a dependency</strong></li>
+        <li>Per-turn PII strip/restore (Secure Minions, per-message placeholder
+          namespaces) — nudges and verification prompts are stripped too, so PII
+          never reaches the self-verification context</li>
+        <li>Blocked/allowed domain routing for web tools</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>The chat face <span class="tag">M4</span></h4>
+      <ul>
+        <li><strong>Telegram</strong> (long polling), <strong>Discord</strong> (gateway
+          websocket, resume-first reconnects), <strong>Slack</strong> (Socket Mode,
+          echo-suppression) — hand-rolled, no platform SDKs</li>
+        <li>One task per chat (busy claim), panic containment (&ldquo;The task crashed&rdquo;
+          instead of a dead loop), final answer delivered directly, never lost in a sink</li>
+        <li>Atomic approval router — a second press can never double-decide</li>
+        <li>Inline Approve/Deny buttons, 60&nbsp;s auto-deny, single-message outcome edits</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Multi-tenant identity <span class="tag">M5</span></h4>
+      <ul>
+        <li>A TOML <strong>tenant directory</strong>: <code>[users."platform:user_id"]</code>
+          sections; no entry = refused, fail-closed</li>
+        <li><strong>Per-user trust ceiling</strong> (falls back to <code>--trust-ceiling</code>)</li>
+        <li><strong>Per-user workspace</strong> under the root
+          (<code>users/&lt;platform&gt;-&lt;user&gt;/</code> by default); absolute and
+          <code>..</code> paths rejected at load and re-checked per task</li>
+        <li><strong>Requester-only approvals</strong>: anyone else pressing the buttons gets
+          a polite toast; the pending approval is never consumed</li>
+        <li>Legacy flat <code>AMPARO_CHAT_ALLOWLIST</code> path preserved</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Operations &amp; quality</h4>
+      <ul>
+        <li>One binary: <code>amparo run</code> / <code>mcp-serve</code> /
+          <code>chat telegram|discord|slack</code> / <code>version</code></li>
+        <li>stdout carries the final answer only — progress, gate decisions and reports go
+          to stderr, so <code>amparo run</code> scripts cleanly</li>
+        <li><strong>rustls-only</strong> — <code>openssl-sys</code> is out of the graph,
+          <code>cargo install</code> needs no system OpenSSL</li>
+        <li>MSRV declared at Rust 1.85, verified on 1.98</li>
+        <li>Two gates, zero warnings: <code>cargo test --workspace</code> (298 tests incl.
+          binary-level e2e) and <code>cargo doc --workspace --no-deps</code> with
+          <code>missing_docs</code> on every crate</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>How it compares to the agent landscape</h2>
+  <p class="subtle">Agents split into a few architectural families. Amparo sits in the space between
+  them — assembled like a product, seam-rich like a framework, and multi-tenant like neither.</p>
+
+  <div class="tablebox">
+  <table>
+    <thead>
+      <tr>
+        <th class="dim">Dimension</th>
+        <th>Amparo</th>
+        <th>Frameworks (LangChain/LangGraph, Agents SDK)</th>
+        <th>Coding harnesses (Claude Code, OpenHands)</th>
+        <th>Autonomous agents (AutoGPT lineage)</th>
+        <th>Multi-agent frameworks (CrewAI, AutoGen)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="dim">What you get</td>
+        <td class="me">An assembled agent behind one binary</td>
+        <td>Parts you assemble; your code is the product</td>
+        <td>A developer tool for one operator</td>
+        <td>A demo that showed the shape</td>
+        <td>Orchestration for many agents</td>
+      </tr>
+      <tr>
+        <td class="dim">Safety model</td>
+        <td class="me">Runtime gate chain on every tool call, deny by default</td>
+        <td>Callbacks and validation you write yourself</td>
+        <td>Interactive permission prompts per session</td>
+        <td>Prompt-level instructions</td>
+        <td>None built in</td>
+      </tr>
+      <tr>
+        <td class="dim">Policy engine</td>
+        <td class="me">Open wire protocol — any engine, any language; Guardrail is the commercial implementation</td>
+        <td>N/A — the framework is policy-neutral</td>
+        <td>N/A</td>
+        <td>N/A</td>
+        <td>N/A</td>
+      </tr>
+      <tr>
+        <td class="dim">Human approval</td>
+        <td class="me">First-class channel: inline buttons, auto-deny, attributed to the requester</td>
+        <td>Do it yourself</td>
+        <td>Terminal prompts to the single user</td>
+        <td>&ldquo;Continue?&rdquo; loops</td>
+        <td>Do it yourself</td>
+      </tr>
+      <tr>
+        <td class="dim">Multi-tenant</td>
+        <td class="me">Yes — tenant directory, per-user policy/ceiling/workspace, requester-only approvals</td>
+        <td>No</td>
+        <td>No (single user, local)</td>
+        <td>No</td>
+        <td>No</td>
+      </tr>
+      <tr>
+        <td class="dim">Model support</td>
+        <td class="me">Any OpenAI-compatible endpoint + native Anthropic, no vendor lock</td>
+        <td>Depends on the SDK; often vendor-shaped</td>
+        <td>Vendor-tied by design</td>
+        <td>Mostly OpenAI-era wiring</td>
+        <td>Inherits from the base framework</td>
+      </tr>
+      <tr>
+        <td class="dim">MCP stance</td>
+        <td class="me">Both directions, under the same gate — server exposes gated tools, client mounts remote tools at a tier that needs approval</td>
+        <td>Client-side adoption, your wiring</td>
+        <td>Tool consumers</td>
+        <td>No</td>
+        <td>Via framework plugins</td>
+      </tr>
+      <tr>
+        <td class="dim">Memory</td>
+        <td class="me">An interface + default store; Engram recommended, never required</td>
+        <td>Anything in the ecosystem</td>
+        <td>Session-local</td>
+        <td>Filesystem scrapes</td>
+        <td>App-level</td>
+      </tr>
+      <tr>
+        <td class="dim">In-loop privacy</td>
+        <td class="me">Per-turn PII strip/restore, including nudges and self-verification</td>
+        <td>App-level, your code</td>
+        <td>Local machine, moot</td>
+        <td>None</td>
+        <td>None</td>
+      </tr>
+      <tr>
+        <td class="dim">Deployment</td>
+        <td class="me">One rustls-only binary, no system deps, headless</td>
+        <td>Python/JS toolchain, heavy dep trees</td>
+        <td>CLI/IDE apps</td>
+        <td>Python, unmaintained</td>
+        <td>Python</td>
+      </tr>
+      <tr>
+        <td class="dim">Extensibility seams</td>
+        <td class="me">Traits: provider, policy engine, transport, memory, event sink</td>
+        <td>Everything is a hook</td>
+        <td>Plugin systems</td>
+        <td>&mdash;</td>
+        <td>Agent classes</td>
+      </tr>
+      <tr>
+        <td class="dim">License</td>
+        <td class="me">Apache-2.0 with the patent grant — deliberate for software that executes code</td>
+        <td>Mixed MIT/Apache</td>
+        <td>Mixed; some source-available</td>
+        <td>MIT</td>
+        <td>Mixed</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Against frameworks</h3>
+  <p>LangChain, LangGraph and the OpenAI Agents SDK are scaffolding: the loop, the tools and the
+  safety are your code. That is their superpower — and their gap. Amparo ships the boundary as
+  the product: the gate chain is not a callback you register, it is the spine the loop is built
+  around, and the policy engine behind it speaks an open protocol, so the operator can swap in
+  any engine (including Guardrail, the commercial implementation) without touching the agent.</p>
+
+  <h3>Against coding harnesses</h3>
+  <p>Claude Code and OpenHands are outstanding at one human in front of one machine, with
+  permissions as interactive session prompts. Amparo is built for the other job: one agent
+  serving <em>many humans</em> over chat platforms, with identity, isolation and approval
+  that hold up unattended. A harness&rsquo;s permission model is a conversation with its user;
+  Amparo&rsquo;s is a policy decision with a session tag, a trust ceiling and a workspace
+  directory attached.</p>
+
+  <h3>Against autonomous agents</h3>
+  <p>The AutoGPT generation proved demand and mostly proved the failure mode: a text-parsed loop
+  with prompt-level guardrails, running until it ran out of tokens. Amparo keeps the useful
+  loop mechanics (retries, trimming, self-verification) but replaces the text parsing with
+  native tool calls, and replaces the prompt guardrails with a runtime gate that answers the
+  model even when it blocks — so a blocked call can never turn into a hallucinated result.</p>
+
+  <h3>Against guardrail tooling</h3>
+  <p>NeMo Guardrails and Guardrails AI validate what goes in and out of a model — content and
+  structure rails. Amparo gates what the model <em>does</em>: the tool call, before execution,
+  per user. The layers are complementary; only one of them has an open wire spec an operator
+  can implement in any language, which is the part Amparo owns.</p>
+
+  <h3>Against memory products</h3>
+  <p>mem0 and Letta are memory-first. Amparo treats memory as an interface with a default store
+  and recommends <strong>Engram</strong> as the durable, syncable backend — the same pattern as
+  policy: the product is the seam, not the store.</p>
+
+  <h3>Against its own source</h3>
+  <p>Amparo&rsquo;s loop descends from <strong>Axiom-OS</strong> (MIT, provenance in NOTICE). What
+  came across: the loop mechanics. What did not: the desktop compositor, screen ingestion, the
+  companion loop, and the proxy coupling — and critically, the gap Axiom left between &ldquo;the
+  model asked&rdquo; and &ldquo;it ran.&rdquo; Amparo&rsquo;s reason to exist is that gap, closed
+  with a gate chain and shipped as a headless, installable, versioned binary.</p>
+
+  <h3>Against Hermes Agent</h3>
+  <p><strong>Hermes Agent</strong> (Nous Research, MIT, 2026) is the closest open-source peer in
+  ambition: a self-hosted general agent with a messaging gateway, BYO models, persistent memory,
+  and a self-improving skill system. The bets differ. Hermes wins on <strong>breadth and
+  self-evolution</strong> — more platforms, sub-agents, cron, voice, and a Curator that distills
+  successful runs into reusable skills. Amparo deliberately does not self-modify: its loop is
+  deterministic and gated, because a shell-executing agent that rewrites its own playbook is
+  harder to audit. The architectural fork: Hermes authorizes with static per-user permission
+  levels; Amparo gates <em>every call</em> through a policy engine behind an open wire protocol,
+  with a human-approval channel, attributed presses, per-user workspace confinement and
+  session-tagged audit records. Authorization says who may; policy says what may, per action,
+  with a record. Memory: Hermes ships rich built-in episodic and procedural stores; Amparo
+  treats memory as an interface (Engram recommended). Deployment: Hermes is a Python stack;
+  Amparo is one rustls-only binary. The honest summary: Hermes is the agent that grows with
+  you; Amparo is the agent you can prove was acting under policy.</p>
+</section>
+
+<section>
+  <h2>What is genuinely unique</h2>
+  <ul>
+    <li><strong>Deny-by-default as the spine, not a setting.</strong> The trust-ceiling &#8594;
+      policy &#8594; approval chain runs on every call, on every surface — CLI, MCP, chat — because
+      all three surfaces share one gate contract.</li>
+    <li><strong>The blocked-answer guarantee.</strong> An agent whose gate waves everything through
+      is worse than one with no gate, because it looks safe. Every call — executed or blocked —
+      gets a tool-role answer with its <code>tool_call_id</code>. The model can never stall or
+      invent past a denied call.</li>
+    <li><strong>Policy as an open wire spec.</strong> <code>POST /check</code> is documented,
+      engine-agnostic, implementable in any language. The OpenTelemetry play: the protocol is
+      free, the commercial engine (Guardrail) is optional, the agent works with either.</li>
+    <li><strong>Multi-tenant by design.</strong> Open-source agents are almost uniformly
+      single-operator. Amparo ships a tenant directory, per-user policy session tags, per-user
+      trust ceilings, per-user workspace directories and requester-only approvals — the set of
+      properties that makes a shell-executing agent safe to give to other people.</li>
+    <li><strong>Approval as an attributed, first-class channel.</strong> Inline buttons on three
+      platforms, an atomic router, a 60-second auto-deny, and strict press attribution: only the
+      user who started the task can decide it.</li>
+    <li><strong>Privacy inside the loop.</strong> PII is stripped before the verification step and
+      restored after — the loop&rsquo;s own introspection never sees personal data it has no
+      business seeing.</li>
+    <li><strong>One rustls-only binary, zero system deps.</strong> No Python venv, no Node, no
+      OpenSSL headers. Install from source with one cargo command; run it anywhere.</li>
+    <li><strong>Apache-2.0 with a provenance trail.</strong> The patent grant matters for software
+      that executes arbitrary code, and NOTICE says exactly what came from Axiom-OS.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Honest trade-offs</h2>
+  <div class="two">
+    <ul>
+      <li><strong>Not kernel-level sandboxing.</strong> The boundary is workspace confinement +
+        policy + approval. Running the chat face inside a container or VM is the operator&rsquo;s
+        job — and recommended for strangers.</li>
+      <li><strong>One agent, not a swarm.</strong> No built-in multi-agent orchestration;
+        multi-agent setups are an MCP composition problem, not a flag.</li>
+      <li><strong>No bundled model.</strong> Bring-your-own is the commitment — it means
+        configuration up front.</li>
+      <li><strong>Pre-alpha.</strong> 0.x semver: APIs can break between minors. The repository
+        is not yet public.</li>
+    </ul>
+    <ul>
+      <li><strong>Config is read once.</strong> Tenant changes need a restart; no hot reload.</li>
+      <li><strong>The policy engine must be reachable.</strong> In wire mode, checks are HTTP;
+        the caller contract escalates to a human if the engine is down.</li>
+      <li><strong>Session tags carry the platform id.</strong> Per-user policy means the engine
+        sees <code>platform:user_id</code> with every check — inherent to the design; the
+        operator chooses the engine.</li>
+      <li><strong>English-first docs.</strong> The code is documented to ship, not yet translated.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>The ecosystem around it</h2>
+  <p>Amparo is the open agent; the rest of the stack stays optional and behind seams:</p>
+  <ul>
+    <li><strong>Guardrail</strong> — the commercial policy engine: a firewall for AI agents that
+      act. A commercial implementation of the same open wire protocol Amparo checks against.
+      Recommended, never required.</li>
+    <li><strong>Engram</strong> — the memory backend: durable, private, syncable. The recommended
+      implementation of Amparo&rsquo;s memory interface. Recommended, never required.</li>
+    <li><strong>The wire spec</strong> — <code>POST /check {tool_name, target} &#8594;
+      {verdict, reason, enforced}</code>, published openly so anyone can build an engine.</li>
+  </ul>
+</section>
+
+<footer>
+  Amparo &mdash; Spanish for protection, shelter. In Spanish and Latin American law, a
+  <em>recurso de amparo</em> is the action you file to protect a right.
+  &copy; 2026 EL AI Intelligence, LLC. Apache-2.0.
+</footer>
+
+</div>

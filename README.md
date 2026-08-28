@@ -219,7 +219,10 @@ The agent loop was extracted from
 [Axiom-OS](https://github.com/PixelPhantomAI/Axiom-OS) (MIT), which contains a
 working ReAct loop with tool retry, self-verification, and conversation
 trimming. What did *not* come across: the desktop compositor, screen ingestion,
-the companion loop, and the ELLM proxy coupling — see [NOTICE](NOTICE).
+the companion loop, and the ELLM proxy coupling — see [NOTICE](NOTICE). What
+Amparo adds on top of the extracted mechanics is the runtime gate chain that
+sits between "the model asked" and "it ran" — the gap Axiom left open — shipped
+as a headless, installable, versioned binary.
 
 Amparo is Apache-2.0 rather than MIT for the explicit patent grant, which
 matters more than usual for software that executes arbitrary code.
