@@ -444,6 +444,7 @@ fn flags() -> ChatFlags {
         auto_approve: true,
         trust_ceiling: ToolTrustTier::SystemControl,
         chat_config: None,
+        growth: false,
     }
 }
 

@@ -716,6 +716,83 @@ async fn chat_telegram_roundtrip_message_approval_tool_answer() {
     );
 }
 
+// ── Growth notebook (M6a) ────────────────────────────────────────────────────
+
+/// Whether the notebook file holds a record tagged with `tenant`.
+///
+/// Each line is a memory entry whose `content` field is the escaped record
+/// JSON — parsed twice, like any consumer of the store.
+fn record_landed(path: &std::path::Path, tenant: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else { return false };
+    raw.lines().any(|line| {
+        let Ok(outer) = serde_json::from_str::<Value>(line) else { return false };
+        let Some(content) = outer.get("content").and_then(|c| c.as_str()) else {
+            return false;
+        };
+        let Ok(inner) = serde_json::from_str::<Value>(content) else { return false };
+        inner.get("tenant_id").and_then(|t| t.as_str()) == Some(tenant)
+    })
+}
+
+#[tokio::test]
+async fn chat_telegram_growth_writes_run_record() {
+    let _guard = LOCK.lock().await;
+
+    // A text-only turn (no tools, no approval): the record is written when
+    // the task completes. The mock repeats its last script, so one script
+    // covers the whole task.
+    let llm = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(
+        701,
+        111,
+        111,
+        "remember my email user@example.com please",
+    ));
+
+    let ws = fresh_workspace("growth").display().to_string();
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_ALLOWLIST", "111"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_WORKSPACE", ws.as_str()),
+        ],
+        &[],
+    );
+
+    let mut child = spawn_serve(&["chat", "telegram", "--allow-all", "--growth"]);
+
+    // Poll the record FILE itself — not a sendMessage — so the assert can
+    // never race the spawned record write against the child being killed.
+    let records_path = PathBuf::from(&ws).join(".amparo/notebook/records.jsonl");
+    let written = wait_until(|| record_landed(&records_path, "telegram:111")).await;
+
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(written, "no tenant-tagged record within 30s; child stderr: {err}");
+    assert!(err.contains("[growth]"), "startup reports the notebook: {err}");
+
+    let raw = std::fs::read_to_string(&records_path).expect("records file exists");
+    let record = raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|outer| outer.get("content")?.as_str().map(str::to_string))
+        .filter_map(|content| serde_json::from_str::<Value>(&content).ok())
+        .find(|inner| inner.get("tenant_id").and_then(|t| t.as_str()) == Some("telegram:111"))
+        .expect("the tenant-tagged record");
+    let task_text = record.get("task_text").and_then(|t| t.as_str()).expect("task text");
+    assert!(task_text.contains("[EMAIL_1]"), "stripped placeholder kept: {task_text}");
+    assert!(!task_text.contains("user@example.com"), "raw email stripped: {task_text}");
+}
+
 // ── Chat config (M5 tenant directory) ───────────────────────────────────────
 
 /// Spawn `amparo chat telegram` as a serve process (closed stdin, piped

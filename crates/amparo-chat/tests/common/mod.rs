@@ -25,6 +25,7 @@ use amparo_tools::{
 };
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,6 +39,25 @@ pub async fn wait_until(cond: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
     loop {
         if cond() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition not met within {WAIT_BUDGET:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Async sibling of [`wait_until`] for conditions that must await — e.g.
+/// polling a store whose writes land on a spawned task.
+pub async fn wait_until_async<Fut>(cond: impl Fn() -> Fut)
+where
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
+    loop {
+        if cond().await {
             return;
         }
         assert!(

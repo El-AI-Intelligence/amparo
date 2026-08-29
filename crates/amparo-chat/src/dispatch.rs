@@ -25,6 +25,7 @@ use crate::driver::{ChatDriver, PolicySource, Tenants};
 use crate::router::ApprovalRouter;
 use crate::transport::ChatTransport;
 use amparo_inference::InferenceConfig;
+use amparo_notebook::JsonlStore;
 use amparo_policy::{AllowAllPolicyEngine, DenyAllPolicyEngine};
 use amparo_tools::{default_registry, ToolTrustTier};
 use std::collections::HashSet;
@@ -51,6 +52,8 @@ FLAGS:
   --trust-ceiling T   observational | local_mutating |
                       external_effector | system_control (default)
   --chat-config PATH  load the tenant directory from a TOML config file
+  --growth            record PII-stripped run records (off by default)
+  --no-growth         never record (overrides an earlier --growth)
   --help              print this help and exit
 
 Deny-by-default: without --policy-url or --allow-all every tool call is
@@ -64,7 +67,14 @@ per-user trust_ceiling and workspace subpath; AMPARO_CHAT_ALLOWLIST is
 ignored while one is set. The bot token comes from AMPARO_CHAT_TELEGRAM_TOKEN
 (Telegram), the workspace root from AMPARO_WORKSPACE, and the inference
 endpoint from the AMPARO_INFERENCE_* environment surface — see the README
-chat section.";
+chat section.
+
+--growth enables the lab notebook: every completed or failed task is
+recorded as a PII-stripped JSON line at
+<workspace>/.amparo/notebook/records.jsonl, tagged platform:user_id (task
+text, tool-sequence hash, per-call gate log, verification, truncated
+answer). Recording is off by default — growth never happens unless asked
+for — and the last --growth/--no-growth wins.";
 
 /// The messaging platform `amparo chat` serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +123,8 @@ pub struct ChatFlags {
     pub trust_ceiling: ToolTrustTier,
     /// The tenant-directory config file (flag form of `AMPARO_CHAT_CONFIG`).
     pub chat_config: Option<PathBuf>,
+    /// Record PII-stripped run records to the workspace notebook.
+    pub growth: bool,
 }
 
 impl Default for ChatFlags {
@@ -124,6 +136,7 @@ impl Default for ChatFlags {
             auto_approve: false,
             trust_ceiling: ToolTrustTier::SystemControl,
             chat_config: None,
+            growth: false,
         }
     }
 }
@@ -179,6 +192,8 @@ pub fn parse_chat_flags(args: impl Iterator<Item = String>) -> ParseChatResult {
                 None => return ParseChatResult::Error("--policy-url requires a URL".into()),
             },
             "--allow-all" => flags.allow_all = true,
+            "--growth" => flags.growth = true,
+            "--no-growth" => flags.growth = false,
             "--chat-config" => match args.next() {
                 Some(path) => flags.chat_config = Some(PathBuf::from(path)),
                 None => return ParseChatResult::Error("--chat-config requires a path".into()),
@@ -308,8 +323,13 @@ pub async fn build_driver(
     let router = Arc::new(ApprovalRouter::new());
     let workspace_root =
         std::env::var("AMPARO_WORKSPACE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    // The growth notebook's path is resolved before the root moves into the
+    // driver; without --growth nothing is opened and nothing is recorded.
+    let notebook_path = flags
+        .growth
+        .then(|| workspace_root.join(".amparo/notebook/records.jsonl"));
 
-    let driver = ChatDriver::new(
+    let mut driver = ChatDriver::new(
         tenants,
         provider,
         policy_source,
@@ -320,6 +340,13 @@ pub async fn build_driver(
         flags.auto_approve,
     )
     .with_trust_ceiling(flags.trust_ceiling);
+    if let Some(path) = notebook_path {
+        let store = JsonlStore::open(&path).map_err(|e| {
+            ChatServeError::new(format!("cannot open the growth notebook: {e}"), 2)
+        })?;
+        eprintln!("[growth] recording PII-stripped run records to {}", path.display());
+        driver = driver.with_growth(Arc::new(store));
+    }
     Ok(Arc::new(driver))
 }
 
@@ -410,11 +437,13 @@ mod tests {
             "--auto-approve",
             "--trust-ceiling",
             "observational",
+            "--growth",
         ]));
         assert_eq!(f.policy_url.as_deref(), Some("http://policy.test"));
         assert!(f.auto_approve);
         assert!(!f.allow_all);
         assert_eq!(f.trust_ceiling, ToolTrustTier::Observational);
+        assert!(f.growth);
         assert_eq!(f.platform, Platform::Telegram);
     }
 
@@ -459,6 +488,21 @@ mod tests {
     }
 
     #[test]
+    fn usage_mentions_growth() {
+        assert!(CHAT_USAGE.contains("--growth"), "usage documents the flag");
+        assert!(CHAT_USAGE.contains("--no-growth"), "usage documents the off flag");
+        assert!(CHAT_USAGE.contains("records.jsonl"), "usage documents the record path");
+    }
+
+    #[test]
+    fn growth_flag_last_wins_and_defaults_off() {
+        assert!(!flags(parse(&["telegram"])).growth);
+        assert!(flags(parse(&["telegram", "--growth"])).growth);
+        assert!(!flags(parse(&["telegram", "--growth", "--no-growth"])).growth);
+        assert!(flags(parse(&["telegram", "--no-growth", "--growth"])).growth);
+    }
+
+    #[test]
     fn rejects_conflicting_modes_and_bad_platforms() {
         assert_eq!(
             error(parse(&["telegram", "--policy-url", "http://p.test", "--allow-all"])),
@@ -484,6 +528,7 @@ mod tests {
         assert!(f.policy_url.is_none());
         assert!(!f.allow_all);
         assert!(!f.auto_approve);
+        assert!(!f.growth);
         assert_eq!(f.trust_ceiling, ToolTrustTier::SystemControl);
     }
 

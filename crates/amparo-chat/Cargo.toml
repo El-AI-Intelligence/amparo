@@ -10,6 +10,7 @@ description = "Amparo's chat adapter layer: a platform-neutral transport seam, a
 [dependencies]
 amparo-agent = { path = "../amparo-agent" }
 amparo-inference = { path = "../amparo-inference" }
+amparo-notebook = { path = "../amparo-notebook" }
 amparo-policy = { path = "../amparo-policy" }
 amparo-privacy = { path = "../amparo-privacy" }
 amparo-tools = { path = "../amparo-tools" }

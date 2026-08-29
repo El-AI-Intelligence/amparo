@@ -10,13 +10,14 @@ use crate::gate::ChatApprovalGate;
 use crate::router::{ApprovalRouter, TakeResult};
 use crate::sink::ChatEventSink;
 use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport, PressOutcome};
-use amparo_agent::{Agent, AgentConfig};
+use amparo_agent::{Agent, AgentConfig, EventSink, FanoutSink};
 use amparo_inference::InferenceProvider;
+use amparo_notebook::NotebookSink;
 use amparo_policy::wire::WirePolicyEngine;
 use amparo_policy::PolicyEngine;
 use amparo_privacy::PrivacyPolicy;
 use amparo_tools::registry::default_registry_with_policy;
-use amparo_tools::{PathPolicy, ToolRegistry, ToolTrustTier};
+use amparo_tools::{Memory, PathPolicy, ToolRegistry, ToolTrustTier};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -98,6 +99,9 @@ pub struct ChatDriver {
     policy_source: PolicySource,
     /// Optional privacy policy, attached to every task's agent.
     privacy: Option<Arc<PrivacyPolicy>>,
+    /// The optional lab notebook: with `--growth`, every completed or failed
+    /// task is recorded as a PII-stripped, tenant-tagged run record.
+    notebook: Option<Arc<dyn Memory>>,
     /// The legacy shared tool registry, cloned per task — ignored in
     /// directory mode, where each task gets a fresh registry rooted at its
     /// own workspace (tools are Send+Sync).
@@ -160,6 +164,7 @@ impl ChatDriver {
             provider,
             policy_source,
             privacy: None,
+            notebook: None,
             registry,
             workspace_root,
             transport,
@@ -184,6 +189,17 @@ impl ChatDriver {
     /// fallback for profiles without their own ceiling.
     pub fn with_trust_ceiling(mut self, ceiling: ToolTrustTier) -> Self {
         self.trust_ceiling = ceiling;
+        self
+    }
+
+    /// Attach a lab notebook to every task this driver runs.
+    ///
+    /// Each task's events are fanned out to the notebook and recorded as a
+    /// PII-stripped run record tagged `platform:user_id` (the same key
+    /// tenancy uses). This is the `--growth` knob of `amparo chat`; the
+    /// default (no notebook) records nothing.
+    pub fn with_growth(mut self, store: Arc<dyn Memory>) -> Self {
+        self.notebook = Some(store);
         self
     }
 
@@ -333,6 +349,10 @@ impl ChatDriver {
         let router = Arc::clone(&self.router);
         let busy = Arc::clone(&self.busy);
         let auto_approve = self.auto_approve;
+        // The notebook's tenant tag is computed fresh per message — the
+        // same `platform:user_id` key tenancy uses.
+        let tenant_key = format!("{}:{}", chat.platform, chat.user_id);
+        let notebook = self.notebook.clone();
 
         tokio::spawn(async move {
             // The claim is the busy-map entry; dropping it (however this
@@ -340,8 +360,17 @@ impl ChatDriver {
             let _claim = ChatClaim { busy, chat_id: chat.chat_id.clone() };
 
             // Progress events flow through a best-effort outbox; the final
-            // answer below bypasses it.
-            let (sink, rx) = ChatEventSink::channel();
+            // answer below bypasses it. With a notebook attached, the same
+            // events also fan out to it (growth is observational — a record
+            // write can never fail or block the task).
+            let (chat_sink, rx) = ChatEventSink::channel();
+            let sink: Arc<dyn EventSink> = match &notebook {
+                Some(store) => Arc::new(FanoutSink::new(vec![
+                    chat_sink,
+                    Arc::new(NotebookSink::new(Arc::clone(store), tenant_key)),
+                ])),
+                None => chat_sink,
+            };
             let drain_transport = Arc::clone(&transport);
             let drain_chat = chat.clone();
             tokio::spawn(async move {
@@ -415,10 +444,10 @@ mod tests {
 
     use super::*;
     use amparo_policy::AllowAllPolicyEngine;
-    use amparo_tools::ToolTrustTier;
+    use amparo_tools::{InMemoryStore, ToolTrustTier};
     use common::{
         done_frame, registry_with_echo, tool_call_frame, turn_text, turn_tool_call,
-        wait_for_text, wait_until, MockTransport, StubProvider,
+        wait_for_text, wait_until, wait_until_async, MockTransport, StubProvider,
     };
     use std::collections::BTreeMap;
 
@@ -615,6 +644,34 @@ mod tests {
         let driver = driver(transport.clone(), StubProvider::panicking(), true);
         driver.on_message(chat(), "cause a panic".into()).await;
         wait_for_text(&transport, "The task crashed").await;
+    }
+
+    #[tokio::test]
+    async fn growth_records_a_tenant_tagged_stripped_record() {
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![turn_text("Done.")]);
+        let store = Arc::new(InMemoryStore::new());
+        let driver = driver(transport.clone(), provider, true).with_growth(store.clone());
+        driver
+            .on_message(chat(), "remember my email user@example.com please".into())
+            .await;
+        wait_for_text(&transport, "Done.").await;
+        // The record write lands on a spawned task — poll the store.
+        wait_until_async(|| async {
+            store
+                .search("mock:user_1", 10)
+                .await
+                .iter()
+                .any(|e| e.content.contains(r#""tenant_id":"mock:user_1""#))
+        })
+        .await;
+        let entries = store.search("mock:user_1", 10).await;
+        let record = entries
+            .iter()
+            .find(|e| e.content.contains(r#""tenant_id":"mock:user_1""#))
+            .expect("a tenant-tagged record landed");
+        assert!(!record.content.contains("user@example.com"), "raw email stripped");
+        assert!(record.content.contains("[EMAIL_1]"), "stripped placeholder kept");
     }
 
     #[tokio::test]
