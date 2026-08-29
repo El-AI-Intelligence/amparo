@@ -32,6 +32,7 @@ mod notebook;
 mod privacy;
 mod run;
 mod skill;
+mod stderr_subscriber;
 
 use amparo_mcp::serve::{self, ParseResult};
 
@@ -65,6 +66,11 @@ for flags.";
 
 #[tokio::main]
 async fn main() {
+    // Agent warnings (a checkpoint save failure, a corrupt session file)
+    // travel over tracing — install the minimal warn/error subscriber so
+    // the operator sees them on stderr. If a host already installed one,
+    // keep theirs.
+    let _ = tracing::subscriber::set_global_default(stderr_subscriber::StderrWarnSubscriber);
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
         println!("{USAGE}");

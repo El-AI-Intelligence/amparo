@@ -16,8 +16,8 @@
 //! stdout carries the final answer only; the report goes to stderr.
 
 use amparo_agent::{
-    Agent, AgentConfig, ApprovalGate, AutoApprove, AutoDeny, CaseLibrary, EventSink, FanoutSink,
-    LedgerSink, TaskStatus,
+    Agent, AgentConfig, AgentReport, ApprovalGate, AutoApprove, AutoDeny, CaseLibrary,
+    CheckpointStore, EventSink, FanoutSink, JsonCheckpointStore, LedgerSink, TaskStatus,
 };
 use amparo_inference::{InferenceConfig, MAX_TIMEOUT_SECS};
 use amparo_notebook::{
@@ -54,6 +54,8 @@ FLAGS:
   --timeout SECS      per-request timeout in seconds (clamped 1-3600)
   --workspace DIR     working directory the tools are confined to
                       (sets AMPARO_WORKSPACE)
+  --resume            resume the newest incomplete checkpoint (tenant cli);
+                      takes no task — the prompt comes from the checkpoint
 
 The task is the joined positional arguments. stdout carries the final answer
 only; progress, gate decisions and the report go to stderr.
@@ -68,7 +70,13 @@ recorded as a PII-stripped, tenant-tagged JSON line at
 <workspace>/.amparo/notebook/records.jsonl (task text, tool-sequence hash,
 per-call gate log, verification, truncated answer). Recording is off by
 default — growth never happens unless asked for — and the last
---growth/--no-growth wins.";
+--growth/--no-growth wins.
+
+--resume continues a crashed run from <workspace>/.amparo/sessions/cli:
+the prompt comes from the checkpoint, and the loop re-judges every tool
+call through the current flags' gate chain. A checkpoint older than 7
+days is skipped (never resumed) — its gate decisions are too old to
+trust.";
 
 /// Parsed `amparo run` flags.
 #[derive(Debug, Clone)]
@@ -84,7 +92,9 @@ pub struct RunFlags {
     pub workspace: Option<String>,
     /// Record PII-stripped run records to the workspace notebook.
     pub growth: bool,
-    /// The task — joined positional arguments.
+    /// Resume the newest incomplete checkpoint instead of running a task.
+    pub resume: bool,
+    /// The task — joined positional arguments (empty when resuming).
     pub task: String,
 }
 
@@ -101,6 +111,7 @@ impl Default for RunFlags {
             timeout_secs: None,
             workspace: None,
             growth: false,
+            resume: false,
             task: String::new(),
         }
     }
@@ -133,6 +144,7 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
             "--auto-deny" => flags.auto_deny = true,
             "--growth" => flags.growth = true,
             "--no-growth" => flags.growth = false,
+            "--resume" => flags.resume = true,
             "--trust-ceiling" => match args.next() {
                 Some(tier) => match tier.as_str() {
                     "observational" => flags.trust_ceiling = ToolTrustTier::Observational,
@@ -199,7 +211,12 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
             "--auto-approve and --auto-deny are mutually exclusive".into(),
         );
     }
-    if positional.is_empty() {
+    if flags.resume && !positional.is_empty() {
+        return ParseRunResult::Error(
+            "`--resume` takes no task — the prompt comes from the checkpoint".into(),
+        );
+    }
+    if !flags.resume && positional.is_empty() {
         return ParseRunResult::Error(
             "amparo run requires a task (e.g. amparo run \"list the files\")".into(),
         );
@@ -226,8 +243,80 @@ pub async fn dispatch(args: impl Iterator<Item = String>) {
     }
 }
 
-/// Wire the gate chain and run the loop. `Err` is a runtime failure (exit 1).
+/// Run a fresh task or resume a checkpoint. `Err` is a runtime failure
+/// (exit 1); parse problems exit 2 in [`dispatch`].
 pub async fn execute(flags: RunFlags) -> Result<(), String> {
+    if flags.resume {
+        return execute_resume(&flags).await;
+    }
+    // AMPARO_WORKSPACE must be set before the tools capture the path
+    // policy at construction — see [`wire`].
+    apply_workspace(&flags);
+    let wired = wire(&flags).await?;
+    let report = wired.agent.run(flags.task.clone()).await;
+    finish(wired.notebook, report).await
+}
+
+/// Apply `--workspace` to the process env before anything reads it: the
+/// tools capture `AMPARO_WORKSPACE` when the registry is built, and the
+/// checkpoint store roots at the same workspace — both must see the flag.
+fn apply_workspace(flags: &RunFlags) {
+    if let Some(dir) = &flags.workspace {
+        std::env::set_var("AMPARO_WORKSPACE", dir);
+    }
+}
+
+/// How long a `Running` checkpoint stays resumable. A crash whose
+/// checkpoint is older than this is abandoned, never resumed: its gate
+/// decisions and claims are too old to trust.
+const STALE_CHECKPOINT_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The `--resume` path: no task on the command line — the prompt comes
+/// from the newest `Running` checkpoint for tenant `cli` under the
+/// workspace. The resumed loop re-judges every tool call through the
+/// current flags' gate chain, exactly like a fresh run.
+async fn execute_resume(flags: &RunFlags) -> Result<(), String> {
+    apply_workspace(flags);
+    let workspace_root = PathPolicy::from_env().workspace_root;
+    let store = JsonCheckpointStore::new(&workspace_root);
+    let Some(checkpoint) = store.latest_incomplete("cli") else {
+        return Err(format!(
+            "no incomplete checkpoint for tenant cli under {} — nothing to resume",
+            workspace_root.display()
+        ));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let age_secs = now.saturating_sub(checkpoint.started_at);
+    if age_secs > STALE_CHECKPOINT_SECS {
+        eprintln!(
+            "[session] skipping stale running checkpoint {} (started {} day(s) ago) — run a fresh task",
+            checkpoint.task_id,
+            age_secs / 86_400
+        );
+        return Err("no resumable checkpoint".into());
+    }
+    // `wire` attaches the checkpoint store (both paths — a resumed task
+    // writes its terminal snapshot through the same store).
+    let wired = wire(flags).await?;
+    let report = wired.agent.resume(checkpoint).await;
+    finish(wired.notebook, report).await
+}
+
+/// Everything the loop needs once the flags are parsed: the built agent,
+/// plus the growth notebook sink that must be flushed after the task.
+struct WiredRun {
+    agent: Agent,
+    notebook: Option<Arc<NotebookSink>>,
+}
+
+/// Wire the gate chain from flags: provider, policy, approval, sinks
+/// (printing + optional growth notebook + always-on privacy ledger) and
+/// the agent. Shared by a fresh run and a resume — a resumed task is the
+/// same loop and the same gates; only the starting state differs.
+async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
     let mut config = InferenceConfig::from_env().map_err(|e| {
         format!(
             "{e}\nset AMPARO_INFERENCE_URL and AMPARO_INFERENCE_MODEL — see the README \
@@ -242,9 +331,6 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     }
     let provider = config.build().map_err(|e| e.to_string())?;
 
-    if let Some(dir) = &flags.workspace {
-        std::env::set_var("AMPARO_WORKSPACE", dir);
-    }
     let mut registry = default_registry();
 
     let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
@@ -401,6 +487,10 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
         // was applied above) drives the blast-radius label on approval
         // prompts. Display-only.
         .with_path_policy(Arc::new(PathPolicy::from_env()))
+        // Session persistence (M7 W6): every run — fresh or resumed —
+        // snapshots its loop so a crash can be resumed. The store roots
+        // at the same workspace as the ledger and notebook.
+        .with_checkpoints(Arc::new(JsonCheckpointStore::new(&workspace_root)), "cli")
         .with_config(agent_config);
     if let Some(library) = case_library {
         agent = agent.with_case_library(library);
@@ -409,9 +499,17 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
         agent = agent.with_skills(library);
     }
 
-    let report = agent.run(flags.task).await;
-    // The CLI is a short-lived host: await the pending record write so it
-    // cannot lose the race with process exit. Failed tasks write records too.
+    Ok(WiredRun { agent, notebook })
+}
+
+/// The shared terminal for a fresh run and a resume: flush the growth
+/// notebook — the CLI is a short-lived host, so the pending record write
+/// must not lose the race with process exit (failed tasks write records
+/// too) — then map the report to stdout/stderr and the exit code.
+async fn finish(
+    notebook: Option<Arc<NotebookSink>>,
+    report: AgentReport,
+) -> Result<(), String> {
     if let Some(nb) = &notebook {
         nb.flush().await;
     }
@@ -556,5 +654,25 @@ mod tests {
         assert!(flags(parse(&["--growth", "task"])).growth);
         assert!(!flags(parse(&["--growth", "--no-growth", "task"])).growth);
         assert!(flags(parse(&["--no-growth", "--growth", "task"])).growth);
+    }
+
+    #[test]
+    fn resume_parses_without_a_task_and_rejects_one() {
+        let f = flags(parse(&["--resume"]));
+        assert!(f.resume);
+        assert!(f.task.is_empty());
+        assert_eq!(
+            error(parse(&["--resume", "a task"])),
+            "`--resume` takes no task — the prompt comes from the checkpoint"
+        );
+    }
+
+    #[test]
+    fn resume_combines_with_flags_and_defaults_off() {
+        assert!(!flags(parse(&["task"])).resume);
+        let f = flags(parse(&["--resume", "--max-steps", "3", "--auto-approve"]));
+        assert!(f.resume);
+        assert_eq!(f.max_steps, Some(3));
+        assert!(f.auto_approve);
     }
 }

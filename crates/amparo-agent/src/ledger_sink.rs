@@ -2,11 +2,12 @@
 //! rows for network-touching executions and PII strips.
 //!
 //! The ledger is an I6 instrument: always-on, and it records *evidence*
-//! rather than content. For every execution attempt of a network tool the
-//! row carries the tool name, the host at most (never a path, query or
-//! command), the outcome, and whether a human approved or denied it — the
-//! "who allowed this, and under what policy" answer. PII strips are
-//! recorded as per-category counts, never values.
+//! rather than content. For every execution attempt of a network tool —
+//! or a human denial, which never reaches execution — the row carries the
+//! tool name, the host at most (never a path, query or command), the
+//! outcome, and whether a human approved or denied it — the "who allowed
+//! this, and under what policy" answer. PII strips are recorded as
+//! per-category counts, never values.
 //!
 //! Open or write failures never fail the task: the host decides what to
 //! do when the store cannot be opened, and a write failure warns once per
@@ -35,8 +36,8 @@ struct CallTracker {
 
 /// The privacy ledger's [`EventSink`]: tracks network-tool calls from
 /// request to execution, records the human gate's answer, and appends one
-/// [`LedgerRow`] per execution attempt or PII strip. Cheap to clone behind
-/// an `Arc` for fanout.
+/// [`LedgerRow`] per execution attempt, human denial, or PII strip. Cheap
+/// to clone behind an `Arc` for fanout.
 pub struct LedgerSink {
     store: LedgerStore,
     tenant_id: String,
@@ -87,13 +88,29 @@ impl EventSink for LedgerSink {
                 }
             }
             AgentEvent::ApprovalResolved { call_id, approved } => {
-                if let Some(tracker) = self.calls.lock().unwrap().get_mut(call_id) {
-                    tracker.gate = Some(if *approved {
-                        "human_approved"
-                    } else {
-                        "human_denied"
+                if *approved {
+                    // Execution follows — remember the verdict for the
+                    // row written at `ToolExecuted`.
+                    if let Some(tracker) = self.calls.lock().unwrap().get_mut(call_id) {
+                        tracker.gate = Some("human_approved".to_string());
                     }
-                    .to_string());
+                } else {
+                    // Denied: the execution never happens, but the
+                    // denial is itself the answer the ledger exists to
+                    // record — write the row now.
+                    let denied = self.calls.lock().unwrap().remove(call_id);
+                    if let Some(tracker) = denied {
+                        self.append(LedgerRow {
+                            ts: chrono::Utc::now().to_rfc3339(),
+                            tenant: self.tenant_id.clone(),
+                            kind: LedgerKind::NetworkCall,
+                            tool: Some(tracker.tool),
+                            site: tracker.site,
+                            outcome: Some("denied".to_string()),
+                            gate: Some("human_denied".to_string()),
+                            pii_counts: Vec::new(),
+                        });
+                    }
                 }
             }
             AgentEvent::ToolExecuted { result } => {
@@ -205,11 +222,18 @@ mod tests {
         let sink = sink(&dir);
         request(&sink, "c1", "web_search", json!({"query": "weather"}));
         sink.emit(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: false });
-        executed(&sink, "c1", "web_search", true);
 
-        let rows = rows(&dir);
-        assert_eq!(rows[0].gate.as_deref(), Some("human_denied"));
-        assert_eq!(rows[0].site, None);
+        // The denial alone is the row — the execution never happens.
+        let written = rows(&dir);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].gate.as_deref(), Some("human_denied"));
+        assert_eq!(written[0].outcome.as_deref(), Some("denied"));
+        assert_eq!(written[0].tool.as_deref(), Some("web_search"));
+        assert_eq!(written[0].site, None);
+        // A spurious later execution (the loop never sends one after a
+        // denial) finds no tracker and writes nothing.
+        executed(&sink, "c1", "web_search", true);
+        assert_eq!(rows(&dir).len(), 1);
     }
 
     #[test]

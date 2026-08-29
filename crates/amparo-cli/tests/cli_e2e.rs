@@ -1768,8 +1768,254 @@ async fn run_with_unwritable_ledger_warns_and_continues() {
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
     assert!(err.contains("[ledger] unavailable"), "open failure warns: {err}");
+    assert!(
+        err.contains("checkpoint save failed"),
+        "the checkpoint store's failure also warns, never fatal: {err}"
+    );
     assert_eq!(stdout(&out).trim(), "Done.");
 
     // Clean up so later tests can create the directory.
     std::fs::remove_file(workspace().join(".amparo")).unwrap();
+}
+
+// ── M7 W7: `amparo run --resume` ─────────────────────────────────────────────
+
+/// Set `AMPARO_WORKSPACE` to a specific directory for one test; the return
+/// restores whatever was set before (see [`restore_workspace_env`]).
+fn set_workspace_env_to(dir: &std::path::Path) -> Option<String> {
+    let prior = std::env::var("AMPARO_WORKSPACE").ok();
+    std::env::set_var("AMPARO_WORKSPACE", dir);
+    prior
+}
+
+/// A fresh, empty workspace for one test. The shared [`workspace`] root is
+/// reused by many tests, but resume tests need a controlled checkpoint dir.
+fn fresh_workspace(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("amparo-cli-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Write a `Running` checkpoint for tenant `cli` under `ws`, in the
+/// agent's own W6 layout — the fixture a resume replays.
+fn write_checkpoint(ws: &std::path::Path, task_id: &str, started_at: u64, steps_used: usize) {
+    let dir = ws.join(".amparo").join("sessions").join("cli");
+    std::fs::create_dir_all(&dir).unwrap();
+    let checkpoint = json!({
+        "version": 1,
+        "tenant": "cli",
+        "task_id": task_id,
+        "started_at": started_at,
+        "prompt": "fixture task",
+        "status": "running",
+        "conversation": [{"role": "user", "content": "fixture task"}],
+        "loop_state": {
+            "last_tool_name": null,
+            "same_tool_count": 0,
+            "empty_turn_retried": false,
+            "last_good_summary": null,
+            "used_tool_names": [],
+            "steps_used": steps_used
+        },
+        "final_answer": null
+    });
+    std::fs::write(dir.join(format!("{task_id}.json")), checkpoint.to_string()).unwrap();
+}
+
+#[test]
+fn resume_with_a_task_exits_2() {
+    let out = std::process::Command::new(bin())
+        .args(["run", "--resume", "a task"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("takes no task"), "{}", stderr(&out));
+}
+
+#[tokio::test]
+async fn resume_without_a_checkpoint_exits_1() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("resume-none");
+    // No inference env: the checkpoint lookup precedes any wiring, so a
+    // missing session must fail on its own, not on the environment.
+    let env = set_env(&[], &["AMPARO_INFERENCE_URL", "AMPARO_INFERENCE_MODEL"]);
+    let prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--resume"]).await;
+    restore_workspace_env(prior);
+    drop(env);
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no incomplete checkpoint for tenant cli"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[tokio::test]
+async fn resume_replays_a_checkpoint_to_completion() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("resume-replay");
+    write_checkpoint(&ws, "sess-1", unix_now(), 2);
+
+    let mock = MockLlm::start(vec![vec![content_frame("Resumed and done.")]]).await;
+    let env_pairs = mock.env();
+    let vars: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let env = set_env(&vars, &[]);
+    let prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--resume", "--allow-all"]).await;
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[session] resumed sess-1 (step 2)"), "{err}");
+    assert_eq!(stdout(&out).trim(), "Resumed and done.");
+    // The resumed agent replaced the Running checkpoint with a terminal
+    // one in place — same file, now complete.
+    let saved: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            ws.join(".amparo").join("sessions").join("cli").join("sess-1.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["status"], "complete");
+    assert!(
+        saved["final_answer"].is_string(),
+        "terminal checkpoint carries the answer"
+    );
+}
+
+#[tokio::test]
+async fn resume_skips_a_stale_checkpoint_with_a_warn() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("resume-stale");
+    write_checkpoint(&ws, "sess-old", unix_now() - 8 * 86_400, 1);
+    let env = set_env(&[], &["AMPARO_INFERENCE_URL", "AMPARO_INFERENCE_MODEL"]);
+    let prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--resume"]).await;
+    restore_workspace_env(prior);
+    drop(env);
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[session] skipping stale running checkpoint sess-old"),
+        "{}",
+        stderr(&out)
+    );
+    // The stale checkpoint is untouched — still Running, still one file.
+    let saved: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            ws.join(".amparo").join("sessions").join("cli").join("sess-old.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["status"], "running");
+}
+
+// ── M7 W9: cross-feature e2e ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn resume_lands_ledger_growth_and_checkpoint_together() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("w9-resume-cross");
+    write_checkpoint(&ws, "sess-1", unix_now(), 2);
+
+    let mock = MockLlm::start(vec![
+        tool_script("fetch_url", "{\"url\":\"http://127.0.0.1:1/w9-cross\"}"),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let env_pairs = mock.env();
+    let vars: Vec<(&str, &str)> =
+        env_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let env = set_env(&vars, &[]);
+    let prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--resume", "--allow-all", "--auto-approve", "--growth"]).await;
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[session] resumed sess-1 (step 2)"), "{err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // Ledger (always-on) recorded the resumed task's fetch attempt.
+    let ledger = ws.join(".amparo/privacy/ledger.jsonl");
+    let ledger_text = std::fs::read_to_string(&ledger).expect("ledger exists");
+    assert!(ledger_text.contains("fetch_url"), "{ledger_text}");
+    assert!(ledger_text.contains("http://127.0.0.1:1"), "{ledger_text}");
+    assert!(
+        !ledger_text.contains("w9-cross"),
+        "the path never reaches the ledger: {ledger_text}"
+    );
+
+    // Growth wired on the resumed task — startup lines prove the notebook
+    // and case retrieval attached. (A resume opens no NEW record: the
+    // checkpoint is the session trail — locked in W6.)
+    assert!(
+        err.contains("[growth] recording PII-stripped run records to"),
+        "the growth notebook attached: {err}"
+    );
+    assert!(
+        err.contains("[growth] retrieval: prior cli cases (hot layer) inform self-verification"),
+        "the case library attached: {err}"
+    );
+
+    // The resume replaced the Running checkpoint with the terminal one.
+    let saved: Value = serde_json::from_str(
+        &std::fs::read_to_string(ws.join(".amparo/sessions/cli/sess-1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["status"], "complete");
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn destructive_call_denied_shows_radius_and_lands_a_human_denied_row() {
+    let _guard = LOCK.lock().await;
+    let marker = format!("amparo-w9-{}", std::process::id());
+    let mock = MockLlm::start(vec![
+        tool_call_script(&format!("rm -rf /tmp/{marker}")),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    let out = run_with_stdin(&["run", "--allow-all", "clean up the temp dir"], b"n\n").await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains("[preflight] blast radius: destructive"),
+        "the prompt names the concrete consequence: {err}"
+    );
+    assert!(err.contains("[approval] denied"), "{err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // The denial itself is the ledger row: the loop never executes a
+    // denied call, but the audit question has its answer.
+    let ledger = workspace().join(".amparo/privacy/ledger.jsonl");
+    let text = std::fs::read_to_string(&ledger).expect("ledger exists");
+    assert!(text.contains(r#""gate":"human_denied""#), "{text}");
+    assert!(text.contains(r#""outcome":"denied""#), "{text}");
+    assert!(text.contains(r#""tool":"run_command""#), "{text}");
+    assert!(!text.contains("rm -rf"), "the command never reaches the ledger: {text}");
 }

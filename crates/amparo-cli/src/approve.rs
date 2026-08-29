@@ -6,7 +6,7 @@
 //! hang waiting for a human. `--auto-approve`/`--auto-deny` never construct
 //! this gate at all.
 
-use amparo_agent::{ApprovalGate, ApprovalRequest, BlastRadius};
+use amparo_agent::{ApprovalGate, ApprovalRequest};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::Mutex;
@@ -127,6 +127,7 @@ fn prompt_text(request: &ApprovalRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amparo_agent::BlastRadius;
     use std::io::Cursor;
     use std::pin::Pin;
     use std::task::{Context, Poll};

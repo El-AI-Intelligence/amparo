@@ -65,6 +65,7 @@ pub mod cases;
 pub mod events;
 pub mod ledger_sink;
 pub mod preflight;
+pub mod session;
 mod sse;
 
 pub use agent::{
@@ -76,3 +77,7 @@ pub use cases::{evidence_section, CaseLibrary, EvidenceCase};
 pub use events::{format_event, truncate, AgentEvent, EventSink, FanoutSink, InMemoryEventSink, TRUNCATE};
 pub use ledger_sink::{LedgerSink, NETWORK_TOOLS};
 pub use preflight::{classify, BlastRadius};
+pub use session::{
+    continuity_context, Checkpoint, CheckpointStore, JsonCheckpointStore, LoopState,
+    SessionStatus, CONTINUITY_TAIL,
+};

@@ -97,6 +97,14 @@ pub enum AgentEvent {
         /// Why the task failed.
         message: String,
     },
+    /// A checkpointed task resumed (M7) instead of starting fresh — the
+    /// loop continues from the stored conversation and loop state.
+    TaskResumed {
+        /// The resumed checkpoint's task id.
+        task_id: String,
+        /// Loop iterations already used when the checkpoint was written.
+        steps_used: usize,
+    },
 }
 
 /// Observability seam — everything the loop emits goes through here.
@@ -241,6 +249,9 @@ pub fn format_event(event: &AgentEvent) -> String {
             format!("[complete] {}", truncate(final_answer))
         }
         AgentEvent::TaskFailed { message } => format!("[failed] {}", truncate(message)),
+        AgentEvent::TaskResumed { task_id, steps_used } => {
+            format!("[session] resumed {task_id} (step {steps_used})")
+        }
     }
 }
 
@@ -367,6 +378,10 @@ mod tests {
             ),
             ("[complete]", format_event(&AgentEvent::TaskComplete { final_answer: "a".into() })),
             ("[failed]", format_event(&AgentEvent::TaskFailed { message: "m".into() })),
+            (
+                "[session] resumed",
+                format_event(&AgentEvent::TaskResumed { task_id: "sess-1".into(), steps_used: 3 }),
+            ),
         ];
         for (tag, line) in cases {
             assert!(line.starts_with(tag), "{tag} vs {line}");

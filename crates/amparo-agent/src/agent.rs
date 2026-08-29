@@ -23,8 +23,12 @@ use crate::approval::{ApprovalGate, ApprovalRequest, AutoDeny};
 use crate::cases::{evidence_section, CaseLibrary};
 use crate::events::{truncate, AgentEvent, EventSink, InMemoryEventSink};
 use crate::preflight::classify;
+use crate::session::{Checkpoint, CheckpointStore, LoopState, SessionStatus};
 use crate::sse::accumulate_turn;
-use amparo_inference::{ChatMessage, ChatRequest, InferenceProvider, InferenceRequest, Tool};
+use amparo_inference::{
+    AssistantToolCall, ChatMessage, ChatRequest, FunctionCall, InferenceProvider, InferenceRequest,
+    Tool,
+};
 use amparo_policy::{PolicyEngine, PolicyVerdict};
 use amparo_privacy::{DataCategory, PiiPlaceholder};
 use amparo_tools::{
@@ -374,7 +378,62 @@ pub struct Agent {
     /// blast-radius classification. Display-only — its absence silences
     /// the `[preflight]` label, never changes the gate.
     path_policy: Option<Arc<PathPolicy>>,
+    /// The optional checkpoint store (M7): when attached, every loop
+    /// iteration and every terminal exit is snapshotted through it.
+    /// Failures warn, never fatal.
+    checkpoints: Option<Arc<dyn CheckpointStore>>,
+    /// The tenant this agent's fresh tasks are saved under. A resume
+    /// reuses the checkpoint's own tenant instead, so a restored task
+    /// always lands back in its file.
+    checkpoint_tenant: Option<String>,
+    /// The one-shot continuity context the next fresh task receives
+    /// (M7 W8): built by the host from the tenant's latest complete
+    /// checkpoint, injected as one user-role message between the system
+    /// prompt and the task prompt. A resume ignores it — its own
+    /// conversation continues.
+    continuity: Option<String>,
     config: AgentConfig,
+}
+
+/// The checkpoint handle a loop carries (M7): the task id and start time
+/// are fixed for the task's whole life, including a resume. `tenant` is
+/// `None` when no checkpoint store is attached — saves then no-op.
+struct SessionHandle {
+    task_id: String,
+    tenant: Option<String>,
+    started_at: u64,
+}
+
+/// The loop locals that move between turns — what a checkpoint snapshots
+/// and a resume restores, plus the in-run steps/answer history, which a
+/// resume starts fresh (the event stream is the full trail).
+struct LoopVars {
+    steps: Vec<AgentStep>,
+    last_tool_name: Option<String>,
+    same_tool_count: u32,
+    empty_turn_retried: bool,
+    last_good_summary: Option<String>,
+    final_answer: Option<String>,
+    verification: Option<Verification>,
+    steps_used: usize,
+    used_tool_names: Vec<String>,
+}
+
+impl LoopVars {
+    /// A fresh run's starting locals.
+    fn fresh() -> Self {
+        Self {
+            steps: Vec::new(),
+            last_tool_name: None,
+            same_tool_count: 0,
+            empty_turn_retried: false,
+            last_good_summary: None,
+            final_answer: None,
+            verification: None,
+            steps_used: 0,
+            used_tool_names: Vec::new(),
+        }
+    }
 }
 
 impl Agent {
@@ -397,6 +456,9 @@ impl Agent {
             cases: None,
             skills: None,
             path_policy: None,
+            checkpoints: None,
+            checkpoint_tenant: None,
+            continuity: None,
             config: AgentConfig::default(),
         }
     }
@@ -442,6 +504,33 @@ impl Agent {
     /// approval copy and never feeds the gate (I1).
     pub fn with_path_policy(mut self, policy: Arc<PathPolicy>) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Attach a checkpoint store (M7) and the tenant this agent's fresh
+    /// tasks are saved under — `platform:user_id` in chat hosts, `cli`
+    /// in the CLI. Without this the agent runs unpersisted; a resume
+    /// still works but saves nothing further.
+    pub fn with_checkpoints(
+        mut self,
+        store: Arc<dyn CheckpointStore>,
+        tenant: impl Into<String>,
+    ) -> Self {
+        self.checkpoints = Some(store);
+        self.checkpoint_tenant = Some(tenant.into());
+        self
+    }
+
+    /// Hand the next fresh task a one-shot context message (M7 W8): the
+    /// host builds it from the tenant's latest complete checkpoint (see
+    /// [`crate::session::continuity_context`]) and it arrives as one
+    /// user-role message between the system prompt and the task prompt —
+    /// the loop reads it as prior conversation, never as instruction
+    /// (I5 holds: the system prompt stays byte-identical). A resume
+    /// ignores it. The string must already be PII-stripped (I6); the
+    /// loop strips it again before every inference anyway.
+    pub fn with_continuity(mut self, context: Option<String>) -> Self {
+        self.continuity = context;
         self
     }
 
@@ -505,25 +594,117 @@ impl Agent {
             _ => prompt.clone(),
         };
 
-        let mut conversation: Vec<ChatMessage> = vec![
-            ChatMessage::system(SYSTEM_PROMPT),
-            ChatMessage::user(prompt.clone()),
-        ];
+        let mut conversation: Vec<ChatMessage> = vec![ChatMessage::system(SYSTEM_PROMPT)];
+        // Continuity (M7 W8): a fresh task in a long-lived chat carries
+        // the prior task's tail as one user-role context message before
+        // the task prompt. The host built it from a PII-stripped
+        // checkpoint; a resume never reaches here.
+        if let Some(context) = &self.continuity {
+            conversation.push(ChatMessage::user(context.clone()));
+        }
+        conversation.push(ChatMessage::user(prompt.clone()));
 
-        let mut steps: Vec<AgentStep> = Vec::new();
-        let mut last_tool_name: Option<String> = None;
-        let mut same_tool_count: u32 = 0;
-        let mut empty_turn_retried = false;
-        let mut last_good_summary: Option<String> = None;
-        let mut final_answer: Option<String> = None;
-        let mut verification: Option<Verification> = None;
-        let mut steps_used = 0;
-        // Tool names this run has called, in first-use order — the case
-        // library's retrieval query uses them as a sequence signal (M6b).
-        let mut used_tool_names: Vec<String> = Vec::new();
+        // The task id is generated even without a store — it is the stable
+        // handle a later resume would use.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let session = SessionHandle {
+            task_id: format!("sess-{}-{}", now.as_nanos(), std::process::id()),
+            tenant: self.checkpoint_tenant.clone(),
+            started_at: now.as_secs(),
+        };
+        self.run_loop(prompt, safe_prompt, conversation, LoopVars::fresh(), session, 0)
+            .await
+    }
 
-        for step in 0..self.config.max_steps {
-            steps_used = step + 1;
+    /// Resume a checkpointed task (M7): restore the conversation and loop
+    /// state, re-prepend the current `SYSTEM_PROMPT` (I5 — checkpoints
+    /// never store the system message), and run the same loop. The stored
+    /// conversation is already PII-stripped (I6), so the checkpoint's
+    /// prompt doubles as the safe prompt. The iteration budget is the
+    /// remainder: `max_steps - steps_used`; an exhausted budget fails
+    /// with "Max steps reached" like any run.
+    pub async fn resume(&self, checkpoint: Checkpoint) -> AgentReport {
+        let conversation = std::iter::once(ChatMessage::system(SYSTEM_PROMPT))
+            .chain(checkpoint.conversation.into_iter())
+            .collect();
+        let starting_steps = checkpoint.loop_state.steps_used;
+        self.events.emit(&AgentEvent::TaskResumed {
+            task_id: checkpoint.task_id.clone(),
+            steps_used: starting_steps,
+        });
+        let vars = LoopVars {
+            steps: Vec::new(),
+            last_tool_name: checkpoint.loop_state.last_tool_name,
+            same_tool_count: checkpoint.loop_state.same_tool_count,
+            empty_turn_retried: checkpoint.loop_state.empty_turn_retried,
+            last_good_summary: checkpoint.loop_state.last_good_summary,
+            final_answer: None,
+            verification: None,
+            steps_used: starting_steps,
+            used_tool_names: checkpoint.loop_state.used_tool_names,
+        };
+        let session = SessionHandle {
+            task_id: checkpoint.task_id,
+            tenant: Some(checkpoint.tenant),
+            started_at: checkpoint.started_at,
+        };
+        self.run_loop(
+            checkpoint.prompt.clone(),
+            checkpoint.prompt,
+            conversation,
+            vars,
+            session,
+            starting_steps,
+        )
+        .await
+    }
+
+    /// The shared loop — a fresh run and a resume execute the same body.
+    /// `vars` carry the loop locals, `session` the checkpoint handle,
+    /// `starting_steps` the iteration offset (0 for a fresh run).
+    async fn run_loop(
+        &self,
+        prompt: String,
+        safe_prompt: String,
+        mut conversation: Vec<ChatMessage>,
+        vars: LoopVars,
+        session: SessionHandle,
+        starting_steps: usize,
+    ) -> AgentReport {
+        let LoopVars {
+            mut steps,
+            mut last_tool_name,
+            mut same_tool_count,
+            mut empty_turn_retried,
+            mut last_good_summary,
+            mut final_answer,
+            mut verification,
+            mut steps_used,
+            mut used_tool_names,
+        } = vars;
+
+        for step in 0..self.config.max_steps.saturating_sub(starting_steps) {
+            steps_used = starting_steps + step + 1;
+
+            // ── Checkpoint (M7): once per iteration, before the LLM call —
+            // a crash loses at most one turn. Failures warn, never fatal.
+            self.persist_checkpoint(
+                &session,
+                SessionStatus::Running,
+                &prompt,
+                &conversation,
+                LoopState {
+                    last_tool_name: last_tool_name.clone(),
+                    same_tool_count,
+                    empty_turn_retried,
+                    last_good_summary: last_good_summary.clone(),
+                    used_tool_names: used_tool_names.clone(),
+                    steps_used,
+                },
+                None,
+            );
 
             // ── Trim conversation to prevent unbounded growth ───────────────
             if conversation.len() > MAX_CONVERSATION_TAIL + 1 {
@@ -543,6 +724,21 @@ impl Agent {
                         format!("Privacy policy blocked inference: {}", decision.reason);
                     steps.push(AgentStep::Error { message: message.clone() });
                     self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+                    self.persist_checkpoint(
+                        &session,
+                        SessionStatus::Failed,
+                        &prompt,
+                        &conversation,
+                        LoopState {
+                            last_tool_name: last_tool_name.clone(),
+                            same_tool_count,
+                            empty_turn_retried,
+                            last_good_summary: last_good_summary.clone(),
+                            used_tool_names: used_tool_names.clone(),
+                            steps_used,
+                        },
+                        None,
+                    );
                     return AgentReport {
                         status: TaskStatus::Failed,
                         final_answer: None,
@@ -584,6 +780,21 @@ impl Agent {
                         let message = format!("Inference stream failed: {}", e);
                         steps.push(AgentStep::Error { message: message.clone() });
                         self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+                        self.persist_checkpoint(
+                            &session,
+                            SessionStatus::Failed,
+                            &prompt,
+                            &conversation,
+                            LoopState {
+                                last_tool_name: last_tool_name.clone(),
+                                same_tool_count,
+                                empty_turn_retried,
+                                last_good_summary: last_good_summary.clone(),
+                                used_tool_names: used_tool_names.clone(),
+                                steps_used,
+                            },
+                            None,
+                        );
                         return AgentReport {
                             status: TaskStatus::Failed,
                             final_answer: None,
@@ -597,6 +808,21 @@ impl Agent {
                     let message = format!("Inference request failed: {}", e);
                     steps.push(AgentStep::Error { message: message.clone() });
                     self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+                    self.persist_checkpoint(
+                        &session,
+                        SessionStatus::Failed,
+                        &prompt,
+                        &conversation,
+                        LoopState {
+                            last_tool_name: last_tool_name.clone(),
+                            same_tool_count,
+                            empty_turn_retried,
+                            last_good_summary: last_good_summary.clone(),
+                            used_tool_names: used_tool_names.clone(),
+                            steps_used,
+                        },
+                        None,
+                    );
                     return AgentReport {
                         status: TaskStatus::Failed,
                         final_answer: None,
@@ -633,6 +859,24 @@ impl Agent {
                     steps.push(AgentStep::FinalAnswer { content: content.clone() });
                     self.events.emit(&AgentEvent::FinalAnswer { content: content.clone() });
                     self.events.emit(&AgentEvent::TaskComplete { final_answer: content.clone() });
+                    self.persist_checkpoint(
+                        &session,
+                        SessionStatus::Complete,
+                        &prompt,
+                        &conversation,
+                        LoopState {
+                            last_tool_name: last_tool_name.clone(),
+                            same_tool_count,
+                            empty_turn_retried,
+                            // The take above emptied the local — the summary
+                            // lives on as `content`, which is what continuity
+                            // reads from complete checkpoints.
+                            last_good_summary: Some(content.clone()),
+                            used_tool_names: used_tool_names.clone(),
+                            steps_used,
+                        },
+                        Some(&content),
+                    );
                     return AgentReport {
                         status: TaskStatus::Complete,
                         final_answer: Some(content),
@@ -646,6 +890,21 @@ impl Agent {
                     .to_string();
                 steps.push(AgentStep::Error { message: message.clone() });
                 self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+                self.persist_checkpoint(
+                    &session,
+                    SessionStatus::Failed,
+                    &prompt,
+                    &conversation,
+                    LoopState {
+                        last_tool_name: last_tool_name.clone(),
+                        same_tool_count,
+                        empty_turn_retried,
+                        last_good_summary: last_good_summary.clone(),
+                        used_tool_names: used_tool_names.clone(),
+                        steps_used,
+                    },
+                    None,
+                );
                 return AgentReport {
                     status: TaskStatus::Failed,
                     final_answer: None,
@@ -805,6 +1064,24 @@ impl Agent {
                     steps.push(AgentStep::FinalAnswer { content: summary.clone() });
                     self.events.emit(&AgentEvent::FinalAnswer { content: summary.clone() });
                     self.events.emit(&AgentEvent::TaskComplete { final_answer: summary.clone() });
+                    self.persist_checkpoint(
+                        &session,
+                        SessionStatus::Complete,
+                        &prompt,
+                        &conversation,
+                        LoopState {
+                            last_tool_name: last_tool_name.clone(),
+                            same_tool_count,
+                            empty_turn_retried,
+                            // One-shot returns before the summary-update
+                            // loop — the joined summaries are the good
+                            // summary continuity reads.
+                            last_good_summary: Some(summary.clone()),
+                            used_tool_names: used_tool_names.clone(),
+                            steps_used,
+                        },
+                        Some(&summary),
+                    );
                     return AgentReport {
                         status: TaskStatus::Complete,
                         final_answer: Some(summary),
@@ -999,6 +1276,21 @@ impl Agent {
             conversation.push(ChatMessage::assistant("VERIFIED"));
             let content = final_answer.take().unwrap_or_default();
             self.events.emit(&AgentEvent::TaskComplete { final_answer: content.clone() });
+            self.persist_checkpoint(
+                &session,
+                SessionStatus::Complete,
+                &prompt,
+                &conversation,
+                LoopState {
+                    last_tool_name: last_tool_name.clone(),
+                    same_tool_count,
+                    empty_turn_retried,
+                    last_good_summary: last_good_summary.clone(),
+                    used_tool_names: used_tool_names.clone(),
+                    steps_used,
+                },
+                Some(&content),
+            );
             return AgentReport {
                 status: TaskStatus::Complete,
                 final_answer: Some(content),
@@ -1012,7 +1304,96 @@ impl Agent {
         let message = "Max steps reached".to_string();
         steps.push(AgentStep::Error { message: message.clone() });
         self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+        self.persist_checkpoint(
+            &session,
+            SessionStatus::Failed,
+            &prompt,
+            &conversation,
+            LoopState {
+                last_tool_name: last_tool_name.clone(),
+                same_tool_count,
+                empty_turn_retried,
+                last_good_summary: last_good_summary.clone(),
+                used_tool_names: used_tool_names.clone(),
+                steps_used,
+            },
+            final_answer.as_deref(),
+        );
         AgentReport { status: TaskStatus::Failed, final_answer, steps, steps_used, verification }
+    }
+
+    /// Snapshot the task through the attached checkpoint store (M7):
+    /// PII-stripped at write with the placeholder map discarded (I6) —
+    /// the prompt, every message, the last tool summary and the final
+    /// answer — and system-role messages excluded (I5). With no store
+    /// attached this is a no-op; a failing save only warns — persistence
+    /// must never fail the task.
+    fn persist_checkpoint(
+        &self,
+        session: &SessionHandle,
+        status: SessionStatus,
+        prompt: &str,
+        conversation: &[ChatMessage],
+        loop_state: LoopState,
+        final_answer: Option<&str>,
+    ) {
+        let (Some(store), Some(tenant)) = (&self.checkpoints, &session.tenant) else {
+            return;
+        };
+        let checkpoint = Checkpoint {
+            version: crate::session::CHECKPOINT_VERSION,
+            tenant: tenant.clone(),
+            task_id: session.task_id.clone(),
+            started_at: session.started_at,
+            prompt: amparo_privacy::secure_minions_strip(prompt).sanitised_text,
+            status,
+            conversation: conversation
+                .iter()
+                .filter(|message| message.role != "system")
+                .map(|message| ChatMessage {
+                    role: message.role.clone(),
+                    content: amparo_privacy::secure_minions_strip(&message.content)
+                        .sanitised_text,
+                    // Tool-call arguments are user data too (I6) — strip
+                    // them like any other persisted field.
+                    tool_calls: message.tool_calls.as_ref().map(|calls| {
+                        calls
+                            .iter()
+                            .map(|call| AssistantToolCall {
+                                id: call.id.clone(),
+                                call_type: call.call_type.clone(),
+                                function: FunctionCall {
+                                    name: call.function.name.clone(),
+                                    arguments: amparo_privacy::secure_minions_strip(
+                                        &call.function.arguments,
+                                    )
+                                    .sanitised_text,
+                                },
+                            })
+                            .collect()
+                    }),
+                    tool_call_id: message.tool_call_id.clone(),
+                })
+                .collect(),
+            loop_state: LoopState {
+                last_tool_name: loop_state.last_tool_name,
+                same_tool_count: loop_state.same_tool_count,
+                empty_turn_retried: loop_state.empty_turn_retried,
+                // The summary is tool-output-derived — strip it like
+                // every other persisted field, or continuity would
+                // carry a live PII string into the next task (I6).
+                last_good_summary: loop_state
+                    .last_good_summary
+                    .map(|summary| amparo_privacy::secure_minions_strip(&summary).sanitised_text),
+                used_tool_names: loop_state.used_tool_names,
+                steps_used: loop_state.steps_used,
+            },
+            final_answer: final_answer
+                .map(|answer| amparo_privacy::secure_minions_strip(answer).sanitised_text),
+        };
+        if let Err(error) = store.save(&checkpoint) {
+            tracing::warn!("[amparo-agent] checkpoint save failed: {error}");
+        }
     }
 
     /// Record a call that a gate blocked: a failed ToolResult step, a
@@ -2778,5 +3159,243 @@ mod tests {
                 .all(|e| !matches!(e, AgentEvent::ApprovalRequested { .. })),
             "the dry run never emits approval events"
         );
+    }
+
+    // ── M7 W6: checkpoints and resume ────────────────────────────────────────
+
+    use crate::JsonCheckpointStore;
+
+    fn running_checkpoint(task_id: &str, steps_used: usize) -> Checkpoint {
+        Checkpoint {
+            version: crate::session::CHECKPOINT_VERSION,
+            tenant: "cli".to_string(),
+            task_id: task_id.to_string(),
+            started_at: 100,
+            prompt: "echo hi".to_string(),
+            status: SessionStatus::Running,
+            conversation: vec![ChatMessage::user("echo hi"), ChatMessage::assistant("working")],
+            loop_state: LoopState { steps_used, ..Default::default() },
+            final_answer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_writes_a_terminal_checkpoint_without_system_messages_or_pii() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-agent-w6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+        let store = Arc::new(JsonCheckpointStore::new(&root));
+        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_checkpoints(store.clone(), "cli");
+        let report = agent.run("email me at alice@example.com please").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        let complete = store.latest_complete("cli").expect("the terminal checkpoint");
+        assert!(
+            store.latest_incomplete("cli").is_none(),
+            "Running must transition to Complete at the terminal exit"
+        );
+        // I5: the system message is never stored.
+        assert!(complete.conversation.iter().all(|m| m.role != "system"));
+        // I6: PII is stripped at write, even without a privacy policy.
+        let file = crate::session::checkpoint_path(&root, "cli", &complete.task_id);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains("alice@example.com"),
+            "stored checkpoint leaks PII: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resume_reprepends_the_system_prompt_and_restores_the_conversation() {
+        let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+        let events = Arc::new(InMemoryEventSink::new());
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove))
+        .with_events(events.clone());
+
+        let report = agent.resume(running_checkpoint("sess-1", 2)).await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        // I5: the current system prompt is re-prepended, byte-identical —
+        // a resumed task sees the prompt of THIS build, not the stored one.
+        let messages = &provider.recorded_requests()[0].messages;
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, SYSTEM_PROMPT);
+        // The stored conversation follows in order.
+        assert_eq!(messages[1].content, "echo hi");
+        assert_eq!(messages[2].content, "working");
+        // TaskResumed — not TaskStarted — marks the resume.
+        let resumed = events
+            .snapshot()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TaskResumed { task_id, steps_used }
+                if task_id == "sess-1" && *steps_used == 2));
+        assert!(resumed, "the resume emits TaskResumed");
+        assert!(
+            events
+                .snapshot()
+                .iter()
+                .all(|e| !matches!(e, AgentEvent::TaskStarted { .. })),
+            "a resume never emits TaskStarted"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_restores_the_same_tool_guard_across_the_restart() {
+        let (echo, calls) = EchoTool::new(ToolTrustTier::Observational);
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("c1", "echo", r#"{"message":"again"}"#));
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove));
+
+        // The killed run had already called `echo` twice in a row.
+        let mut checkpoint = running_checkpoint("sess-2", 1);
+        checkpoint.loop_state.last_tool_name = Some("echo".to_string());
+        checkpoint.loop_state.same_tool_count = 2;
+
+        let report = agent.resume(checkpoint).await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 2 + 1 = 3 consecutive — the hard-stop nudge must fire on the
+        // next request, exactly as it would have without the restart.
+        let nudged = provider.recorded_requests().iter().any(|request| {
+            request.messages.iter().any(|m| m.content.contains("MUST answer NOW"))
+        });
+        assert!(nudged, "the hard-stop nudge must fire across a resume");
+    }
+
+    /// A checkpoint store whose writes always fail — the task must still
+    /// run to completion (persistence warns, never fatal).
+    struct FailingStore;
+    impl CheckpointStore for FailingStore {
+        fn save(&self, _checkpoint: &Checkpoint) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "disk on fire"))
+        }
+
+        fn latest_incomplete(&self, _tenant: &str) -> Option<Checkpoint> {
+            None
+        }
+
+        fn latest_complete(&self, _tenant: &str) -> Option<Checkpoint> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_checkpoint_store_never_fails_the_task() {
+        let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_checkpoints(Arc::new(FailingStore), "cli");
+        let report = agent.run("hi").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn resume_with_an_exhausted_budget_fails_like_a_fresh_run() {
+        let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
+        let provider = ScriptedProvider::new();
+        let events = Arc::new(InMemoryEventSink::new());
+        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_events(events.clone());
+        // steps_used == max_steps: no iterations remain.
+        let report = agent.resume(running_checkpoint("sess-3", DEFAULT_MAX_STEPS)).await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert!(
+            events
+                .snapshot()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TaskFailed { message } if message == "Max steps reached"))
+        );
+    }
+
+    // ── M7 W8: chat continuity ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn continuity_arrives_as_one_user_message_before_the_prompt() {
+        let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove))
+        .with_continuity(Some("[earlier context]".into()));
+        let report = agent.run("do the thing").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        // One user-role message, between the system prompt and the task
+        // prompt — the loop reads it as prior conversation, never as
+        // instruction (I5: the system prompt stays byte-identical).
+        let messages = &provider.recorded_requests()[0].messages;
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "[earlier context]");
+        assert_eq!(messages[2].content, "do the thing");
+    }
+
+    #[tokio::test]
+    async fn checkpoints_strip_the_tool_summary_and_final_answer_too() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-agent-w8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
+        let provider = ScriptedProvider::new();
+        // Turn 1: a tool call whose echoed output carries an email.
+        // Turns 2+3: empty — the loop finalizes from the last good
+        // summary, which means both the summary AND the final answer
+        // hold the email.
+        provider.push_chat(turn_tool_call("c1", "echo", r#"{"message": "mail alice@example.com"}"#));
+        provider.push_chat(vec![]);
+        provider.push_chat(vec![]);
+        let store = Arc::new(JsonCheckpointStore::new(&root));
+        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_checkpoints(store.clone(), "cli");
+        let report = agent.run("echo the message").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        let complete = store.latest_complete("cli").expect("the terminal checkpoint");
+        // I6: the summary and the final answer are stripped at write —
+        // continuity reads both, so neither may carry a live PII string.
+        assert!(
+            complete
+                .loop_state
+                .last_good_summary
+                .as_deref()
+                .is_none_or(|s| !s.contains("alice@example.com")),
+            "stored summary leaks PII: {:?}",
+            complete.loop_state.last_good_summary
+        );
+        let file = crate::session::checkpoint_path(&root, "cli", &complete.task_id);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains("alice@example.com"),
+            "stored checkpoint leaks PII anywhere: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

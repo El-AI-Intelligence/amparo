@@ -57,7 +57,8 @@ pub struct LedgerRow {
     /// absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
-    /// `NetworkCall`: `ok` when the execution succeeded, `error` otherwise.
+    /// `NetworkCall`: `ok` when the execution succeeded, `error` when it
+    /// failed, `denied` when the human denied it before execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     /// `NetworkCall`: `human_approved` / `human_denied` when the human

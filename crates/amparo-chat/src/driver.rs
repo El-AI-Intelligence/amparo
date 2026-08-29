@@ -10,7 +10,10 @@ use crate::gate::ChatApprovalGate;
 use crate::router::{ApprovalRouter, TakeResult};
 use crate::sink::ChatEventSink;
 use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport, PressOutcome};
-use amparo_agent::{Agent, AgentConfig, CaseLibrary, EventSink, FanoutSink, LedgerSink};
+use amparo_agent::{
+    continuity_context, Agent, AgentConfig, CaseLibrary, CheckpointStore, EventSink, FanoutSink,
+    JsonCheckpointStore, LedgerSink,
+};
 use amparo_inference::InferenceProvider;
 use amparo_notebook::{
     CaseRetriever, NotebookSink, SkillLogEvent, SkillSet, append_event, auto_rollup,
@@ -439,6 +442,21 @@ impl ChatDriver {
                         None
                     }
                 };
+            // Session persistence (M7 W8): chat tasks checkpoint like CLI
+            // runs — one format, both hosts — rooted at this task's ledger
+            // root (the per-user workspace in directory mode) and tagged
+            // with the tenant key. Continuity: a fresh task loads the
+            // tenant's latest complete checkpoint and hands the agent its
+            // conversation tail + last tool summary as one user-role
+            // context message. `Running` files are never read here — a
+            // killed task's mid-loop state cannot be continued.
+            let checkpoint_store = Arc::new(JsonCheckpointStore::new(&ledger_root));
+            let continuity = checkpoint_store
+                .latest_complete(&tenant_key)
+                .and_then(|checkpoint| continuity_context(&checkpoint));
+            // The case-library closure below moves `tenant_key` — keep a
+            // copy for the checkpoint tenant tag.
+            let checkpoint_tenant = tenant_key.clone();
             let mut sinks: Vec<Arc<dyn EventSink>> = vec![chat_sink];
             if let Some(nb) = &notebook_sink {
                 sinks.push(Arc::clone(nb) as Arc<dyn EventSink>);
@@ -546,7 +564,12 @@ impl ChatDriver {
                 .with_approval(gate)
                 // Preflight (M7): the task's path policy drives the
                 // blast-radius label on the approval message. Display-only.
-                .with_path_policy(Arc::clone(&path_policy));
+                .with_path_policy(Arc::clone(&path_policy))
+                // Checkpoints (M7 W8): every loop iteration snapshots
+                // through the tenant-tagged store; the continuity context
+                // (if any) carries the prior task's tail into this one.
+                .with_checkpoints(checkpoint_store, checkpoint_tenant)
+                .with_continuity(continuity);
             if let Some(privacy) = privacy {
                 agent = agent.with_privacy(privacy);
             }
@@ -1465,5 +1488,124 @@ mod tests {
             bodies.iter().any(|b| b.contains("\"session_id\":\"mock:user_b\"")),
             "user_b's check carries its session: {bodies:?}"
         );
+    }
+
+    // ── M7 W8: chat continuity ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_second_task_receives_the_prior_tail_without_its_pii() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-chat-w8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![
+            turn_text("First answer — reach me at alice@example.com"),
+            turn_text("Second answer."),
+        ]);
+        let driver = driver_directory(
+            BTreeMap::from([("mock:user_1".to_string(), profile())]),
+            transport.clone(),
+            provider.clone(),
+            true,
+            root.clone(),
+        );
+        let chat = chat_for("user_1");
+        driver.on_message(chat.clone(), "first task".into()).await;
+        wait_for_text(&transport, "First answer").await;
+        driver.on_message(chat, "second task".into()).await;
+        wait_for_text(&transport, "Second answer.").await;
+
+        // Two tasks, one chat call each — the second task's first request
+        // carries the prior tail as one user-role context message...
+        let requests = provider.recorded_requests();
+        assert_eq!(requests.len(), 2, "one chat call per task: {requests:?}");
+        let second = &requests[1];
+        assert!(
+            second.contains("Earlier in this chat"),
+            "the second task receives the continuity context: {second}"
+        );
+        assert!(
+            second.contains("First answer"),
+            "the prior tail is part of the context: {second}"
+        );
+        // ...and the checkpoint strips task-1 PII at write (I6), so the
+        // context can never carry it into the next inference.
+        assert!(
+            !second.contains("alice@example.com"),
+            "task-1 PII leaked into the second task's context: {second}"
+        );
+
+        // Both tasks checkpointed under the tenant — one format, both hosts.
+        let session_dir = root.join("users/mock-user_1/.amparo/sessions/mock-user_1");
+        let files: Vec<_> = std::fs::read_dir(&session_dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 2, "both tasks checkpointed: {files:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn continuity_stays_within_the_tenant() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-chat-w9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        // Sequential tasks, one chat call each: user_a first, user_b,
+        // then user_a again.
+        let provider = StubProvider::new(vec![
+            turn_text("A first answer."),
+            turn_text("B answer."),
+            turn_text("A second answer."),
+        ]);
+        let mut users = BTreeMap::new();
+        users.insert("mock:user_a".to_string(), profile());
+        users.insert("mock:user_b".to_string(), profile());
+        let driver =
+            driver_directory(users, transport.clone(), provider.clone(), true, root.clone());
+
+        driver.on_message(chat_for("user_a"), "first task".into()).await;
+        wait_for_text(&transport, "A first answer.").await;
+        driver.on_message(chat_for("user_b"), "b's task".into()).await;
+        wait_for_text(&transport, "B answer.").await;
+        driver.on_message(chat_for("user_a"), "second task".into()).await;
+        wait_for_text(&transport, "A second answer.").await;
+
+        let requests = provider.recorded_requests();
+        assert_eq!(requests.len(), 3, "one chat call per task: {requests:?}");
+        // user_b has no completed task of their own — no context, and
+        // nothing of user_a's tail.
+        assert!(
+            !requests[1].contains("Earlier in this chat"),
+            "user_b received no continuity context: {}",
+            requests[1]
+        );
+        assert!(
+            !requests[1].contains("A first answer"),
+            "user_a's tail never crosses into user_b's request: {}",
+            requests[1]
+        );
+        // user_a's second task carries user_a's own tail — and nothing
+        // of user_b's.
+        let second_a = &requests[2];
+        assert!(
+            second_a.contains("Earlier in this chat"),
+            "user_a's second task receives the continuity context: {second_a}"
+        );
+        assert!(
+            second_a.contains("A first answer"),
+            "the prior tail is part of the context: {second_a}"
+        );
+        assert!(
+            !second_a.contains("B answer"),
+            "user_b's answer never crosses into user_a's context: {second_a}"
+        );
+
+        // Per-tenant session dirs: two checkpoints for user_a, one for
+        // user_b — the continuity scan reads only its own tenant.
+        let a_dir = root.join("users/mock-user_a/.amparo/sessions/mock-user_a");
+        let b_dir = root.join("users/mock-user_b/.amparo/sessions/mock-user_b");
+        let a_files: Vec<_> = std::fs::read_dir(&a_dir).unwrap().flatten().collect();
+        let b_files: Vec<_> = std::fs::read_dir(&b_dir).unwrap().flatten().collect();
+        assert_eq!(a_files.len(), 2, "both of user_a's tasks checkpointed: {a_files:?}");
+        assert_eq!(b_files.len(), 1, "user_b's task checkpointed: {b_files:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

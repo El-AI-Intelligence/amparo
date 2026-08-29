@@ -233,9 +233,13 @@ impl EventSink for NotebookSink {
             // AssistantTurn, FinalAnswer: rendered by the event formatter, not
             // part of the record's shape. PrivacyStripped is the privacy
             // ledger's instrument (M7) — recorded there, not in the notebook.
+            // TaskResumed (M7): a resume opens no new record here — the
+            // checkpoint is the session trail, and a resumed run's events
+            // still reach the formatter.
             AgentEvent::AssistantTurn { .. }
             | AgentEvent::FinalAnswer { .. }
-            | AgentEvent::PrivacyStripped { .. } => {}
+            | AgentEvent::PrivacyStripped { .. }
+            | AgentEvent::TaskResumed { .. } => {}
         }
     }
 }
