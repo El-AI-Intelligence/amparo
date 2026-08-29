@@ -34,6 +34,7 @@ version = "0.3.0"
 dependencies = [
  "amparo-agent",
  "amparo-inference",
+ "amparo-notebook",
  "amparo-policy",
  "amparo-privacy",
  "amparo-tools",
@@ -57,6 +58,7 @@ dependencies = [
  "amparo-chat",
  "amparo-inference",
  "amparo-mcp",
+ "amparo-notebook",
  "amparo-policy",
  "amparo-privacy",
  "amparo-tools",
@@ -103,6 +105,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "amparo-notebook"
+version = "0.3.0"
+dependencies = [
+ "amparo-agent",
+ "amparo-privacy",
+ "amparo-tools",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
