@@ -329,10 +329,12 @@ impl ChatTransport for SlackTransport {
         // One section block (tool, arguments, reasons — block text is
         // limited to 3000 chars) and one actions block with the two
         // buttons; the top-level text is the non-rich fallback.
+        use crate::transport::preflight_line;
         let args = truncate(&request.arguments.to_string(), BLOCK_TEXT_LIMIT);
+        let preflight = preflight_line(request).map(|line| format!("{line}\n")).unwrap_or_default();
         let reasons = request.reasons.join("\n");
         let section_text = truncate(
-            &format!("*{}* needs approval\n```{args}```\n{reasons}", request.tool_name),
+            &format!("*{}* needs approval\n```{args}```\n{preflight}{reasons}", request.tool_name),
             BLOCK_TEXT_LIMIT,
         );
         let body = json!({

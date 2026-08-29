@@ -15,7 +15,7 @@
 #[allow(dead_code)]
 mod common;
 
-use amparo_agent::ApprovalRequest;
+use amparo_agent::{ApprovalRequest, BlastRadius};
 use amparo_chat::discord::DiscordTransport;
 use amparo_chat::driver::{ChatDriver, PolicySource, Tenants};
 use amparo_chat::router::ApprovalRouter;
@@ -422,6 +422,7 @@ async fn rest_retries_429_and_carries_approval_components() {
         tool_name: "run_command".into(),
         arguments: json!({ "command": "ls" }),
         reasons: vec!["external effector".into()],
+        blast_radius: Some(BlastRadius::Network),
     };
 
     let msg = transport.send_approval(&chat, &request, "call_1").await.expect("send approval");

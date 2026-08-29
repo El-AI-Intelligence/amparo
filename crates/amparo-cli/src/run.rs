@@ -397,6 +397,10 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
         .with_approval(approval)
         .with_events(sink)
         .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
+        // Preflight (M7): the env-derived path policy (AMPARO_WORKSPACE
+        // was applied above) drives the blast-radius label on approval
+        // prompts. Display-only.
+        .with_path_policy(Arc::new(PathPolicy::from_env()))
         .with_config(agent_config);
     if let Some(library) = case_library {
         agent = agent.with_case_library(library);

@@ -736,6 +736,9 @@ async fn adopt(name: &str, flags: &SkillFlags) -> Result<(), String> {
         tool_name: USE_SKILL.to_string(),
         arguments: serde_json::to_value(&spec).map_err(|e| e.to_string())?,
         reasons: vec![render_plan(&spec)],
+        // No agent runs here — no preflight classification (display-only
+        // context; the plan itself is the approver's subject).
+        blast_radius: None,
     };
     if !approval.request(&request).await {
         return Err(format!(

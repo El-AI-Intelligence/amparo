@@ -479,6 +479,30 @@ async fn run_executes_approved_tool_end_to_end() {
 }
 
 #[tokio::test]
+async fn run_approval_prompt_shows_the_blast_radius() {
+    let _guard = LOCK.lock().await;
+    let marker = format!("amparo-cli-e2e-{}", std::process::id());
+    let mock = MockLlm::start(vec![
+        tool_call_script(&format!("echo {marker}")),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with_stdin(&["run", "--allow-all", "run the e2e echo"], b"y\n").await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    // run_command is an external effector: the M7 preflight line must
+    // name the concrete consequence before the reasons.
+    assert!(err.contains("[preflight] blast radius: network"), "{err}");
+    assert!(err.contains("[approval] granted"), "{err}");
+}
+
+#[tokio::test]
 async fn run_auto_denies_on_piped_eof() {
     let _guard = LOCK.lock().await;
     let mock = MockLlm::start(vec![

@@ -116,7 +116,7 @@ mod tests {
     }
 
     use super::*;
-    use amparo_agent::ApprovalRequest;
+    use amparo_agent::{ApprovalRequest, BlastRadius};
     use common::{wait_until, MockTransport};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -131,6 +131,7 @@ mod tests {
             tool_name: "run_command".into(),
             arguments: serde_json::json!({"command": "ls"}),
             reasons: vec!["tool tier external_effector requires human approval".into()],
+            blast_radius: Some(BlastRadius::Network),
         }
     }
 

@@ -64,6 +64,7 @@ pub mod approval;
 pub mod cases;
 pub mod events;
 pub mod ledger_sink;
+pub mod preflight;
 mod sse;
 
 pub use agent::{
@@ -74,3 +75,4 @@ pub use approval::{ApprovalGate, ApprovalRequest, AutoApprove, AutoDeny};
 pub use cases::{evidence_section, CaseLibrary, EvidenceCase};
 pub use events::{format_event, truncate, AgentEvent, EventSink, FanoutSink, InMemoryEventSink, TRUNCATE};
 pub use ledger_sink::{LedgerSink, NETWORK_TOOLS};
+pub use preflight::{classify, BlastRadius};

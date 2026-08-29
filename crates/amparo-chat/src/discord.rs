@@ -233,10 +233,12 @@ impl ChatTransport for DiscordTransport {
         approval_id: &str,
     ) -> Result<ApprovalMessage, ChatError> {
         let path = format!("/channels/{}/messages", chat.chat_id);
+        use crate::transport::preflight_line;
         let body = json!({
             "content": truncate_content(&format!(
-                "Tool `{}` needs approval.\nArguments: {}\nReasons: {}",
+                "Tool `{}` needs approval.\n{}Arguments: {}\nReasons: {}",
                 request.tool_name,
+                preflight_line(request).map(|line| format!("{line}\n")).unwrap_or_default(),
                 request.arguments,
                 request.reasons.join("; ")
             )),

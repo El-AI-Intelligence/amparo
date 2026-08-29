@@ -6,7 +6,7 @@
 //! hang waiting for a human. `--auto-approve`/`--auto-deny` never construct
 //! this gate at all.
 
-use amparo_agent::{ApprovalGate, ApprovalRequest};
+use amparo_agent::{ApprovalGate, ApprovalRequest, BlastRadius};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::Mutex;
@@ -65,14 +65,7 @@ impl ApprovalGate for InteractiveApprovalGate {
     async fn request(&self, request: &ApprovalRequest) -> bool {
         // stderr is unbuffered, so this lands before the stdin read.
         eprintln!();
-        eprintln!(
-            "[approval] {} {}",
-            request.tool_name,
-            serde_json::to_string_pretty(&request.arguments).unwrap_or_default()
-        );
-        for reason in &request.reasons {
-            eprintln!("  because: {reason}");
-        }
+        eprintln!("{}", prompt_text(request));
 
         let mut input = self.input.lock().await;
         for attempt in 1..=MAX_PROMPTS {
@@ -112,6 +105,25 @@ impl ApprovalGate for InteractiveApprovalGate {
     }
 }
 
+/// The prompt block printed to stderr before the y/n question: the tool
+/// and its arguments, the M7 preflight blast-radius line (when the host
+/// classified the call — the human approves a concrete consequence, not
+/// an abstraction), and the gate reasons.
+fn prompt_text(request: &ApprovalRequest) -> String {
+    let mut lines = vec![format!(
+        "[approval] {} {}",
+        request.tool_name,
+        serde_json::to_string_pretty(&request.arguments).unwrap_or_default()
+    )];
+    if let Some(radius) = &request.blast_radius {
+        lines.push(format!("[preflight] blast radius: {radius} — {}", radius.note()));
+    }
+    for reason in &request.reasons {
+        lines.push(format!("  because: {reason}"));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +137,7 @@ mod tests {
             tool_name: "run_command".into(),
             arguments: serde_json::json!({"command": "echo hi"}),
             reasons: vec!["reaches outside the process".into()],
+            blast_radius: Some(BlastRadius::Network),
         }
     }
 
@@ -150,6 +163,24 @@ mod tests {
         assert!(gate("yes\n").request(&request()).await);
         assert!(!gate("n\n").request(&request()).await);
         assert!(!gate("no\n").request(&request()).await);
+    }
+
+    #[test]
+    fn prompt_text_puts_the_blast_radius_above_the_reasons() {
+        let text = prompt_text(&request());
+        let preflight = text.find("[preflight] blast radius: network");
+        let because = text.find("  because:");
+        let Some((preflight, because)) = preflight.zip(because) else {
+            panic!("expected both lines, got: {text}");
+        };
+        assert!(preflight < because, "preflight must come first: {text}");
+    }
+
+    #[test]
+    fn no_classification_omits_the_preflight_line() {
+        let mut request = request();
+        request.blast_radius = None;
+        assert!(!prompt_text(&request).contains("[preflight]"), "{}", prompt_text(&request));
     }
 
     #[tokio::test]

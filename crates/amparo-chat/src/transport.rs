@@ -78,6 +78,17 @@ pub struct ApprovalMessage {
     pub message_id: String,
 }
 
+/// The one-line M7 preflight note for an approval message, or `None`
+/// when the host computed no classification. Every adapter splices this
+/// into its approval copy so the human approves a concrete consequence,
+/// not an abstraction.
+pub fn preflight_line(request: &ApprovalRequest) -> Option<String> {
+    request
+        .blast_radius
+        .as_ref()
+        .map(|radius| format!("[preflight] blast radius: {radius} — {}", radius.note()))
+}
+
 /// The seam every chat adapter implements.
 ///
 /// The first three methods are outbound; [`receive`](ChatTransport::receive)
@@ -155,6 +166,29 @@ mod tests {
 
     use super::*;
     use common::MockTransport;
+
+    fn request(radius: Option<amparo_agent::BlastRadius>) -> ApprovalRequest {
+        ApprovalRequest {
+            call_id: "c1".into(),
+            tool_name: "run_command".into(),
+            arguments: serde_json::json!({}),
+            reasons: vec![],
+            blast_radius: radius,
+        }
+    }
+
+    #[test]
+    fn preflight_line_formats_the_classification() {
+        assert_eq!(
+            preflight_line(&request(Some(amparo_agent::BlastRadius::Destructive))).unwrap(),
+            "[preflight] blast radius: destructive — matches a blocked destructive pattern"
+        );
+    }
+
+    #[test]
+    fn preflight_line_is_none_without_a_classification() {
+        assert_eq!(preflight_line(&request(None)), None);
+    }
 
     #[tokio::test]
     async fn drain_outbox_delivers_lines_in_order() {

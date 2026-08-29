@@ -15,6 +15,8 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::preflight::BlastRadius;
+
 /// A request for human approval before a tool executes.
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
@@ -27,6 +29,11 @@ pub struct ApprovalRequest {
     /// Why approval is required — policy escalation reasons, the trust
     /// tier, or both.
     pub reasons: Vec<String>,
+    /// The preflight blast-radius classification (M7): what executing
+    /// this call could touch, for the approval copy. `None` at the
+    /// non-agent construction sites, which compute no classification —
+    /// display-only context, never a gate input (I1).
+    pub blast_radius: Option<BlastRadius>,
 }
 
 /// The approval seam.

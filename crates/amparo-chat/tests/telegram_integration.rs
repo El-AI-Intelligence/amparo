@@ -358,6 +358,19 @@ async fn message_to_approval_to_answer_roundtrip() {
     })
     .await;
 
+    // The approval copy carries the M7 preflight blast-radius line — the
+    // echo tool is an external effector, so the radius is "network".
+    let approval_body = mock
+        .log()
+        .iter()
+        .find(|r| r.path.contains("/sendMessage") && body_contains(&r.body, "approve:call_1"))
+        .map(|r| r.body.clone())
+        .expect("the approval sendMessage was recorded");
+    assert!(
+        body_contains(&approval_body, "[preflight] blast radius: network"),
+        "the approval copy must name the concrete consequence: {approval_body}"
+    );
+
     // Simulate the human pressing Approve, the way the receive loop would
     // route the callback query.
     let press = ApprovalButtonPress {

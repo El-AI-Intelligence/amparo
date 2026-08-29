@@ -22,11 +22,14 @@
 use crate::approval::{ApprovalGate, ApprovalRequest, AutoDeny};
 use crate::cases::{evidence_section, CaseLibrary};
 use crate::events::{truncate, AgentEvent, EventSink, InMemoryEventSink};
+use crate::preflight::classify;
 use crate::sse::accumulate_turn;
 use amparo_inference::{ChatMessage, ChatRequest, InferenceProvider, InferenceRequest, Tool};
 use amparo_policy::{PolicyEngine, PolicyVerdict};
 use amparo_privacy::{DataCategory, PiiPlaceholder};
-use amparo_tools::{SkillLibrary, ToolCall, ToolRegistry, ToolResult, ToolTrustTier, USE_SKILL};
+use amparo_tools::{
+    PathPolicy, SkillLibrary, ToolCall, ToolRegistry, ToolResult, ToolTrustTier, USE_SKILL,
+};
 use futures_util::future::join_all;
 use serde::Serialize;
 use std::sync::Arc;
@@ -367,6 +370,10 @@ pub struct Agent {
     /// The optional adopted-skill library (M6c): `use_skill` calls expand
     /// into their steps in the loop, each step gated individually.
     skills: Option<Arc<dyn SkillLibrary>>,
+    /// The optional workspace path policy (M7): drives the preflight
+    /// blast-radius classification. Display-only — its absence silences
+    /// the `[preflight]` label, never changes the gate.
+    path_policy: Option<Arc<PathPolicy>>,
     config: AgentConfig,
 }
 
@@ -389,6 +396,7 @@ impl Agent {
             privacy: None,
             cases: None,
             skills: None,
+            path_policy: None,
             config: AgentConfig::default(),
         }
     }
@@ -426,6 +434,14 @@ impl Agent {
     /// exemption.
     pub fn with_skills(mut self, library: Arc<dyn SkillLibrary>) -> Self {
         self.skills = Some(library);
+        self
+    }
+
+    /// Attach the workspace path policy (M7) so the preflight blast-radius
+    /// classification can run. Display-only: the label decorates the
+    /// approval copy and never feeds the gate (I1).
+    pub fn with_path_policy(mut self, policy: Arc<PathPolicy>) -> Self {
+        self.path_policy = Some(policy);
         self
     }
 
@@ -1056,6 +1072,15 @@ impl Agent {
             }
         };
 
+        // Preflight (M7): classify the call's blast radius for the
+        // approval copy. Display-only — the gate has already decided;
+        // this label tells the human what they are approving, never what
+        // may run (I1). No path policy attached → no classification.
+        let blast_radius = self
+            .path_policy
+            .as_ref()
+            .map(|policy| classify(&self.registry, policy, call));
+
         // Human-approval gate — tier ≥ ExternalEffector or a policy
         // Escalate. The gate decides how a human is asked and when to
         // auto-deny; Amparo's built-ins auto-deny.
@@ -1072,6 +1097,7 @@ impl Agent {
                 tool_name: call.name.clone(),
                 arguments: call.arguments.clone(),
                 reasons: ask_reasons.clone(),
+                blast_radius,
             };
             self.events.emit(&AgentEvent::ApprovalRequested {
                 call_id: call.id.clone(),

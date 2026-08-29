@@ -149,6 +149,10 @@ struct TaskParts {
     policy: Arc<dyn PolicyEngine>,
     registry: ToolRegistry,
     trust_ceiling: ToolTrustTier,
+    /// The task's path policy (M7): preflight blast-radius labels on the
+    /// approval copy. The per-user workspace policy in directory mode,
+    /// the shared root in allowlist mode — display-only.
+    path_policy: Arc<PathPolicy>,
     /// Where this task's privacy ledger lives: the per-user workspace in
     /// directory mode (each tenant keeps its own ledger file), the shared
     /// workspace root in allowlist mode.
@@ -279,8 +283,9 @@ impl ChatDriver {
                 let path_policy = Arc::new(PathPolicy::from_root(workspace.clone()));
                 Some(TaskParts {
                     policy: self.task_policy(chat),
-                    registry: default_registry_with_policy(path_policy),
+                    registry: default_registry_with_policy(Arc::clone(&path_policy)),
                     trust_ceiling: profile.trust_ceiling.unwrap_or(self.trust_ceiling),
+                    path_policy,
                     ledger_root: workspace,
                 })
             }
@@ -288,6 +293,7 @@ impl ChatDriver {
                 policy: self.task_policy(chat),
                 registry: self.registry.clone(),
                 trust_ceiling: self.trust_ceiling,
+                path_policy: Arc::new(PathPolicy::from_root(self.workspace_root.clone())),
                 ledger_root: self.workspace_root.clone(),
             }),
         }
@@ -385,7 +391,7 @@ impl ChatDriver {
             return;
         }
 
-        let TaskParts { policy, mut registry, trust_ceiling, ledger_root } = parts;
+        let TaskParts { policy, mut registry, trust_ceiling, path_policy, ledger_root } = parts;
         let provider = Arc::clone(&self.provider);
         let privacy = self.privacy.clone();
         let transport = Arc::clone(&self.transport);
@@ -537,7 +543,10 @@ impl ChatDriver {
             ));
             let mut agent = Agent::new(Arc::clone(&provider), registry, Arc::clone(&policy))
                 .with_events(sink)
-                .with_approval(gate);
+                .with_approval(gate)
+                // Preflight (M7): the task's path policy drives the
+                // blast-radius label on the approval message. Display-only.
+                .with_path_policy(Arc::clone(&path_policy));
             if let Some(privacy) = privacy {
                 agent = agent.with_privacy(privacy);
             }
