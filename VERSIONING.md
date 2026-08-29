@@ -1,7 +1,7 @@
 # Versioning and API stability
 
 Amparo is a workspace of Rust crates that share one version
-(`[workspace.package] version = 0.1.0`). This file is the contract for how
+(`[workspace.package] version = 0.4.0`). This file is the contract for how
 that version moves and what "stable" means at each stage.
 
 ## Semver
@@ -20,6 +20,9 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
   (`--chat-config` / `AMPARO_CHAT_CONFIG`), per-user policy session tags,
   per-user trust ceilings and workspace directories, and requester-only
   approval presses.
+- **0.4.0 (2026-08-29)** — controlled growth: the lab notebook
+  (`--growth`), the verification case library, gated skills with metrics
+  and retirement, and rollup + archival over the cold archive.
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 

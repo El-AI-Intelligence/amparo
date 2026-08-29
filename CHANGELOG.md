@@ -8,6 +8,13 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-29
+
+Controlled growth (M6): the lab notebook, the verification case library,
+gated skills with metrics and retirement, and rollup + archival over the
+cold archive — one `--growth` opt-in, PII-stripped records, the cold
+archive never modified.
+
 ### Added
 
 - New `amparo-notebook` crate — the lab notebook (M6a): every completed
