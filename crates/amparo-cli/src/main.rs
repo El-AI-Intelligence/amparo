@@ -11,9 +11,13 @@
 //!   messaging platform — long-polled Telegram with inline-button approval,
 //!   Discord gateway and Slack Socket Mode, all behind the same deny-by-
 //!   default gate chain as `run`.
-//! - `amparo skill add|propose|list|show|adopt [FLAGS]` manages skills
-//!   (M6c): operator-authored or distilled candidate procedures adopted
-//!   behind the same policy + approval gates as a tool call.
+//! - `amparo skill add|propose|list|show|adopt|check|retire [FLAGS]`
+//!   manages skills (M6c/M6d): operator-authored or distilled candidate
+//!   procedures adopted behind the same policy + approval gates as a tool
+//!   call, re-checked and retired on policy drift or performance.
+//! - `amparo notebook list|promote|rollup [FLAGS]` works the rollup and
+//!   archival layer (M6e): list cold-archive records, pin one into the hot
+//!   layer, or force the promote + fold on demand (cron-able).
 //! - `amparo version` prints the version.
 //!
 //! stdout carries the final answer only (a scripting contract); progress,
@@ -21,6 +25,7 @@
 
 mod approve;
 mod events;
+mod notebook;
 mod run;
 mod skill;
 
@@ -33,7 +38,8 @@ USAGE:
   amparo run [FLAGS] \"task\"
   amparo mcp-serve [FLAGS]
   amparo chat telegram|discord|slack [FLAGS]
-  amparo skill add|propose|list|show|adopt [FLAGS]
+  amparo skill add|propose|list|show|adopt|check|retire [FLAGS]
+  amparo notebook list|promote|rollup [FLAGS]
   amparo version
 
 SUBCOMMANDS:
@@ -42,10 +48,12 @@ SUBCOMMANDS:
   chat       serve the agent over a messaging platform (inline-button approval)
   skill      manage skills: author candidates, propose from the notebook,
              list/show adopted, adopt behind policy + approval
+  notebook   roll up and inspect the lab notebook: list records, promote a
+             case into the hot layer, force the promote + fold
   version    print the version
 
-Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help` or
-`amparo skill --help` for flags.";
+Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help`,
+`amparo skill --help` or `amparo notebook --help` for flags.";
 
 #[tokio::main]
 async fn main() {
@@ -59,6 +67,7 @@ async fn main() {
         "mcp-serve" => mcp_serve(args).await,
         "chat" => chat(args).await,
         "skill" => skill::dispatch(args).await,
+        "notebook" => notebook::dispatch(args),
         "version" | "-V" | "--version" => println!("amparo {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{USAGE}"),
         other => {

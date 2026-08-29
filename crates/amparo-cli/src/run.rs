@@ -20,7 +20,10 @@ use amparo_agent::{
     TaskStatus,
 };
 use amparo_inference::{InferenceConfig, MAX_TIMEOUT_SECS};
-use amparo_notebook::{CaseRetriever, JsonlStore, NotebookSink, SkillSet};
+use amparo_notebook::{
+    CaseRetriever, HOT_FILE, JsonlStore, NotebookSink, SkillLogEvent, SkillSet, append_event,
+    auto_rollup, check_skill_drift, notebook_dir, skills_dir,
+};
 use amparo_policy::{
     AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, wire::WirePolicyEngine,
 };
@@ -279,37 +282,80 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     let mut case_library: Option<Arc<dyn CaseLibrary>> = None;
     let mut skills: Option<Arc<dyn SkillLibrary>> = None;
     let notebook: Option<Arc<NotebookSink>> = if flags.growth {
-        let path = PathPolicy::from_env()
-            .workspace_root
-            .join(".amparo/notebook/records.jsonl");
+        let workspace_root = PathPolicy::from_env().workspace_root;
+        let nb_dir = notebook_dir(&workspace_root);
+        let cold_path = nb_dir.join("records.jsonl");
         let store: Arc<dyn amparo_tools::Memory> = Arc::new(
-            JsonlStore::open(&path)
+            JsonlStore::open(&cold_path)
                 .map_err(|e| format!("cannot open the growth notebook: {e}"))?,
         );
-        eprintln!("[growth] recording PII-stripped run records to {}", path.display());
-        eprintln!("[growth] retrieval: prior cli cases inform self-verification");
+        eprintln!("[growth] recording PII-stripped run records to {}", cold_path.display());
+        // Rollup and archival (M6e): promote the cold tail into the hot
+        // layer — folding it daily — before retrieval, so the case
+        // library reads this workspace's hot copy too. Observational: a
+        // failure warns and never fails the task.
+        match auto_rollup(&nb_dir, chrono::Utc::now()) {
+            Ok(Some(report)) if report.promoted > 0 => {
+                eprintln!(
+                    "[growth] notebook: promoted {} tail record(s) to the hot layer",
+                    report.promoted
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[growth] notebook rollup failed: {e}"),
+        }
+        // The hot layer is what the case library reads (M6b + M6e): the
+        // informative subset — dedupe survivors plus gate events of
+        // interest. This store is read-only by convention: the sink owns
+        // the cold store, and only the rollup writes hot.
+        let hot_path = nb_dir.join(HOT_FILE);
+        let hot_store: Arc<dyn amparo_tools::Memory> = Arc::new(
+            JsonlStore::open(&hot_path)
+                .map_err(|e| format!("cannot open the notebook hot layer: {e}"))?,
+        );
+        eprintln!("[growth] retrieval: prior cli cases (hot layer) inform self-verification");
         case_library = Some(Arc::new(CaseRetriever::new(
-            Arc::clone(&store),
+            Arc::clone(&hot_store),
             "cli",
         )));
-        // Gated skills (M6c): adopted skills register `use_skill` and the
-        // loop expands it step by step through the gate chain. No adopted
-        // skills → no registration and no line (byte-stable without growth).
-        let skill_set = SkillSet::load(
-            &PathPolicy::from_env()
-                .workspace_root
-                .join(".amparo/skills/adopted.jsonl"),
-            "cli",
-        );
+        // Gated skills (M6c + M6d): adopted skills register `use_skill`
+        // and the loop expands it step by step through the gate chain.
+        // Startup drift re-check (M6d): a skill whose step plan this
+        // task's policy/ceiling/registry would block retires before
+        // registration. Growth is observational — a write failure warns
+        // and continues, never failing the task. No adopted skills → no
+        // registration and no line (byte-stable without growth).
+        let skills_path = skills_dir(&workspace_root).join("adopted.jsonl");
+        let skill_set = SkillSet::load(&skills_path, "cli");
         let adopted_names = skill_set.names();
         if !adopted_names.is_empty() {
-            let library: Arc<dyn SkillLibrary> = Arc::new(skill_set);
-            registry.register(Arc::new(UseSkillTool::new(Arc::clone(&library))));
-            eprintln!(
-                "[growth] skills: {} adopted for tenant cli",
-                adopted_names.len()
-            );
-            skills = Some(library);
+            let now = chrono::Utc::now().to_rfc3339();
+            for name in &adopted_names {
+                let Some(spec) = skill_set.get(name) else { continue; };
+                if let Some(reason) =
+                    check_skill_drift(&spec, &registry, flags.trust_ceiling, policy.as_ref())
+                        .await
+                {
+                    if let Err(e) = append_event(
+                        &skills_path,
+                        &SkillLogEvent::retire("cli", name, &now, reason.clone()),
+                    ) {
+                        eprintln!("[growth] retire write failed: {e}");
+                    }
+                    eprintln!("[growth] skill {name} retired: {reason}");
+                }
+            }
+            let survivors = SkillSet::load(&skills_path, "cli");
+            let survivor_names = survivors.names();
+            if !survivor_names.is_empty() {
+                let library: Arc<dyn SkillLibrary> = Arc::new(survivors);
+                registry.register(Arc::new(UseSkillTool::new(Arc::clone(&library))));
+                eprintln!(
+                    "[growth] skills: {} adopted for tenant cli",
+                    survivor_names.len()
+                );
+                skills = Some(library);
+            }
         }
         Some(Arc::new(NotebookSink::new(store, "cli")))
     } else {

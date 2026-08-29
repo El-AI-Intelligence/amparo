@@ -25,7 +25,7 @@ use crate::driver::{ChatDriver, PolicySource, Tenants};
 use crate::router::ApprovalRouter;
 use crate::transport::ChatTransport;
 use amparo_inference::InferenceConfig;
-use amparo_notebook::JsonlStore;
+use amparo_notebook::{notebook_dir, HOT_FILE, JsonlStore};
 use amparo_policy::{AllowAllPolicyEngine, DenyAllPolicyEngine};
 use amparo_tools::{default_registry, ToolTrustTier};
 use std::collections::HashSet;
@@ -262,7 +262,9 @@ pub fn parse_chat_flags(args: impl Iterator<Item = String>) -> ParseChatResult {
 /// — comma-separated ids, trimmed, empties dropped; absent or empty means
 /// every message is refused, which is reported at startup. `transport` is
 /// the platform's outbound handle; the approval router is platform-neutral
-/// and built here.
+/// and built here. With `--growth`, the notebook's hot layer (M6e) is
+/// opened next to the cold archive and attached via
+/// [`ChatDriver::with_hot_layer`].
 pub async fn build_driver(
     flags: &ChatFlags,
     transport: Arc<dyn ChatTransport>,
@@ -323,11 +325,10 @@ pub async fn build_driver(
     let router = Arc::new(ApprovalRouter::new());
     let workspace_root =
         std::env::var("AMPARO_WORKSPACE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-    // The growth notebook's path is resolved before the root moves into the
-    // driver; without --growth nothing is opened and nothing is recorded.
-    let notebook_path = flags
-        .growth
-        .then(|| workspace_root.join(".amparo/notebook/records.jsonl"));
+    // The growth notebook's directory is resolved before the root moves
+    // into the driver; without --growth nothing is opened and nothing is
+    // recorded.
+    let nb_dir = flags.growth.then(|| notebook_dir(&workspace_root));
 
     let mut driver = ChatDriver::new(
         tenants,
@@ -340,14 +341,24 @@ pub async fn build_driver(
         flags.auto_approve,
     )
     .with_trust_ceiling(flags.trust_ceiling);
-    if let Some(path) = notebook_path {
+    if let Some(nb_dir) = nb_dir {
+        let path = nb_dir.join("records.jsonl");
         let store = JsonlStore::open(&path).map_err(|e| {
             ChatServeError::new(format!("cannot open the growth notebook: {e}"), 2)
         })?;
+        // The hot layer (M6e): the informative subset the case library
+        // reads — the tail promoted and the layer folded by the driver at
+        // every task start. Read-only by convention: the sink owns the
+        // cold store, and only the rollup writes hot.
+        let hot_store = JsonlStore::open(nb_dir.join(HOT_FILE)).map_err(|e| {
+            ChatServeError::new(format!("cannot open the notebook hot layer: {e}"), 2)
+        })?;
         eprintln!("[growth] recording PII-stripped run records to {}", path.display());
-        eprintln!("[growth] retrieval: prior per-user cases inform self-verification");
+        eprintln!("[growth] retrieval: prior per-user cases (hot layer) inform self-verification");
         eprintln!("[growth] skills: per-tenant adopted skills are available to the loop");
-        driver = driver.with_growth(Arc::new(store));
+        driver = driver
+            .with_growth(Arc::new(store))
+            .with_hot_layer(Arc::new(hot_store), nb_dir);
     }
     Ok(Arc::new(driver))
 }

@@ -875,6 +875,67 @@ async fn chat_telegram_growth_retrieves_prior_cases_into_verification() {
     );
 }
 
+#[tokio::test]
+async fn chat_telegram_growth_promotes_records_into_the_hot_layer() {
+    let _guard = LOCK.lock().await;
+
+    // Two text-only tasks from the same user in different chats. Task 1
+    // writes the cold record; task 2's start promotes the tail into the
+    // hot layer, whose row must carry the cold id.
+    let llm = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(901, 111, 111, "first task"));
+
+    let ws = fresh_workspace("hot-layer").display().to_string();
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_ALLOWLIST", "111"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_WORKSPACE", ws.as_str()),
+        ],
+        &[],
+    );
+
+    let mut child = spawn_serve(&["chat", "telegram", "--allow-all", "--growth"]);
+
+    // Task 1's cold record must land before task 2 starts — the promotion
+    // happens at task 2's start.
+    let records_path = PathBuf::from(&ws).join(".amparo/notebook/records.jsonl");
+    let first = wait_until(|| record_landed(&records_path, "telegram:111")).await;
+    assert!(first, "task 1 record never landed");
+
+    telegram.push_update(message_update(902, 111, 222, "second task"));
+    let hot_path = PathBuf::from(&ws).join(".amparo/notebook/hot.jsonl");
+    let promoted = wait_until(|| record_landed(&hot_path, "telegram:111")).await;
+
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(promoted, "no hot row within 30s; child stderr: {err}");
+
+    // The hot row keeps the cold row's id (id stability across layers).
+    let id_of = |path: &std::path::Path| -> String {
+        let raw = std::fs::read_to_string(path).expect("store file");
+        let outer: Value =
+            serde_json::from_str(raw.lines().next().expect("one row")).expect("entry JSON");
+        outer["id"].as_str().expect("entry id").to_string()
+    };
+    let hot_raw = std::fs::read_to_string(&hot_path).expect("hot layer");
+    assert_eq!(hot_raw.lines().count(), 1, "one hot row: {hot_raw}");
+    assert_eq!(
+        id_of(&hot_path),
+        id_of(&records_path),
+        "the hot row keeps the cold id"
+    );
+}
+
 // ── Chat config (M5 tenant directory) ───────────────────────────────────────
 
 /// Spawn `amparo chat telegram` as a serve process (closed stdin, piped

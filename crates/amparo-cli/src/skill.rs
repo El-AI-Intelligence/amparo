@@ -16,12 +16,18 @@
 //! exit 1.
 
 use amparo_agent::{ApprovalGate, ApprovalRequest, AutoApprove, AutoDeny};
-use amparo_notebook::{append_adopt, append_proposals, read_adoptions, skills_dir, AdoptRecord, Proposer, SkillSet};
+use amparo_notebook::{
+    append_event, append_proposals, append_recheck, check_skill_drift, notebook_dir, read_log,
+    read_rechecks, read_uses, retirement_reason, skills_dir, summarize, CheckKind, CheckOutcome,
+    CheckRecord, Proposer, RetirementThreshold, SkillLogEvent, SkillSet, RECHECKS_FILE,
+};
 use amparo_policy::{
     AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, PolicyVerdict,
     wire::WirePolicyEngine,
 };
-use amparo_tools::{PathPolicy, SkillLibrary, SkillSpec, USE_SKILL, default_registry};
+use amparo_tools::{
+    PathPolicy, SkillLibrary, SkillSpec, ToolTrustTier, USE_SKILL, default_registry,
+};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -39,6 +45,11 @@ USAGE:
   amparo skill adopt <name> [--workspace DIR] [--tenant T]
              [--policy-url URL | --allow-all]
              [--auto-approve | --auto-deny]
+  amparo skill check [--workspace DIR] [--tenant T]
+             [--policy-url URL | --allow-all]
+             [--min-verified-rate P] [--window N] [--dry-run]
+             [--trust-ceiling T]
+  amparo skill retire <name> [--reason ...] [--workspace DIR] [--tenant T]
 
 COMMANDS:
   add       parse a candidate TOML, validate it against the tool registry,
@@ -56,6 +67,15 @@ COMMANDS:
             policy engine judges use_skill <name>, and a human approves the
             full rendered step plan. Approved adoptions append to
             adopted.jsonl (the audit log — last event per name wins).
+  check     re-check every adopted skill (M6d): policy drift first (the
+            step plan dry-runs through the gate chain — nothing executes,
+            no approval), then performance (VERIFIED rate over the last
+            --window uses). Retirements append Retire events + re-check
+            rows; --dry-run reports only and writes nothing. Exit 0 even
+            when retirements fire (cron-able).
+  retire    retire an adopted skill for this tenant (the operator lever:
+            disable + notify, never delete — the audit log keeps every
+            row). Refuses when the skill is not currently adopted.
 
 FLAGS:
   --workspace DIR         workspace root (sets AMPARO_WORKSPACE); skills live
@@ -70,7 +90,17 @@ FLAGS:
   --min-runs N            propose: minimum VERIFIED runs per sequence
                           (default 3)
   --min-verified-rate P   propose: minimum verified fraction, 0-1
-                          (default 0.8)";
+                          (default 0.8); check: the retirement threshold,
+                          0-1 (default 0.5)
+  --window N              check: evaluate the last N uses (default 20)
+  --dry-run               check: report retirements without writing
+                          anything (no Retire events, no re-check rows)
+  --trust-ceiling T       check: observational | local_mutating |
+                          external_effector | system_control (default
+                          system_control) — mirror the deployment ceiling
+                          for the drift dry-run
+  --reason ...            retire: the retirement reason (default
+                          \"operator retired\")";
 
 // ─────────────────────────────────────────────── Parsing ─────────────────────
 
@@ -82,6 +112,8 @@ enum Command {
     List(SkillFlags),
     Show { name: String, flags: SkillFlags },
     Adopt { name: String, flags: SkillFlags },
+    Check(SkillFlags),
+    Retire { name: String, flags: SkillFlags },
 }
 
 /// Outcome of parsing: print usage (exit 0), a usage error (exit 2), or a
@@ -94,8 +126,10 @@ enum ParsedSkill {
 }
 
 /// Parsed `amparo skill` flags. `tenant` defaults to `\"cli\"` at use;
-/// `min_runs`/`min_verified_rate` default in the proposer.
-#[derive(Debug, Default)]
+/// `min_runs`/`min_verified_rate` default in the proposer (0.8) and the
+/// checker (0.5); `window`/`trust_ceiling` default in the checker (20 /
+/// system_control).
+#[derive(Debug)]
 struct SkillFlags {
     workspace: Option<String>,
     tenant: Option<String>,
@@ -105,6 +139,29 @@ struct SkillFlags {
     auto_deny: bool,
     min_runs: Option<usize>,
     min_verified_rate: Option<f64>,
+    window: Option<usize>,
+    dry_run: bool,
+    trust_ceiling: ToolTrustTier,
+    reason: Option<String>,
+}
+
+impl Default for SkillFlags {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            tenant: None,
+            policy_url: None,
+            allow_all: false,
+            auto_approve: false,
+            auto_deny: false,
+            min_runs: None,
+            min_verified_rate: None,
+            window: None,
+            dry_run: false,
+            trust_ceiling: ToolTrustTier::SystemControl,
+            reason: None,
+        }
+    }
 }
 
 impl SkillFlags {
@@ -113,11 +170,24 @@ impl SkillFlags {
     }
 }
 
-/// Parse the flags every skill subcommand shares (`propose_extras` enables
-/// the proposer-only flags). `--help`/`-h` are handled before this runs.
+/// Which subcommand-only flags [`parse_flags`] accepts.
+#[derive(Clone, Copy, PartialEq)]
+enum FlagExtras {
+    /// No subcommand-only flags.
+    None,
+    /// `--min-runs`, `--min-verified-rate`.
+    Propose,
+    /// `--min-verified-rate`, `--window`, `--dry-run`, `--trust-ceiling`.
+    Check,
+    /// `--reason`.
+    Retire,
+}
+
+/// Parse the flags every skill subcommand shares (`extras` enables the
+/// subcommand-only flags). `--help`/`-h` are handled before this runs.
 fn parse_flags(
     args: Vec<String>,
-    propose_extras: bool,
+    extras: FlagExtras,
 ) -> Result<(SkillFlags, Vec<String>), String> {
     let mut flags = SkillFlags::default();
     let mut positional = Vec::new();
@@ -139,7 +209,7 @@ fn parse_flags(
             "--allow-all" => flags.allow_all = true,
             "--auto-approve" => flags.auto_approve = true,
             "--auto-deny" => flags.auto_deny = true,
-            "--min-runs" if propose_extras => match iter.next() {
+            "--min-runs" if extras == FlagExtras::Propose => match iter.next() {
                 Some(n) => match n.parse::<usize>() {
                     Ok(runs) if runs > 0 => flags.min_runs = Some(runs),
                     _ => {
@@ -150,18 +220,56 @@ fn parse_flags(
                 },
                 None => return Err("--min-runs requires a number".into()),
             },
-            "--min-verified-rate" if propose_extras => match iter.next() {
-                Some(p) => match p.parse::<f64>() {
-                    Ok(rate) if (0.0..=1.0).contains(&rate) => {
-                        flags.min_verified_rate = Some(rate)
+            "--min-verified-rate"
+                if extras == FlagExtras::Propose || extras == FlagExtras::Check =>
+            {
+                match iter.next() {
+                    Some(p) => match p.parse::<f64>() {
+                        Ok(rate) if (0.0..=1.0).contains(&rate) => {
+                            flags.min_verified_rate = Some(rate)
+                        }
+                        _ => {
+                            return Err(format!(
+                                "--min-verified-rate must be between 0 and 1, got '{p}'"
+                            ))
+                        }
+                    },
+                    None => {
+                        return Err("--min-verified-rate requires a fraction".into())
                     }
+                }
+            }
+            "--window" if extras == FlagExtras::Check => match iter.next() {
+                Some(n) => match n.parse::<usize>() {
+                    Ok(window) if window > 0 => flags.window = Some(window),
                     _ => {
                         return Err(format!(
-                            "--min-verified-rate must be between 0 and 1, got '{p}'"
+                            "--window must be a positive integer, got '{n}'"
                         ))
                     }
                 },
-                None => return Err("--min-verified-rate requires a fraction".into()),
+                None => return Err("--window requires a number".into()),
+            },
+            "--dry-run" if extras == FlagExtras::Check => flags.dry_run = true,
+            "--trust-ceiling" if extras == FlagExtras::Check => match iter.next() {
+                Some(tier) => match tier.as_str() {
+                    "observational" => flags.trust_ceiling = ToolTrustTier::Observational,
+                    "local_mutating" => {
+                        flags.trust_ceiling = ToolTrustTier::LocalMutating
+                    }
+                    "external_effector" => {
+                        flags.trust_ceiling = ToolTrustTier::ExternalEffector
+                    }
+                    "system_control" => {
+                        flags.trust_ceiling = ToolTrustTier::SystemControl
+                    }
+                    other => return Err(format!("unknown trust tier {other}")),
+                },
+                None => return Err("--trust-ceiling requires a tier".into()),
+            },
+            "--reason" if extras == FlagExtras::Retire => match iter.next() {
+                Some(reason) => flags.reason = Some(reason),
+                None => return Err("--reason requires a value".into()),
             },
             other if other.starts_with('-') => {
                 return Err(format!(
@@ -192,7 +300,7 @@ fn parse(args: Vec<String>) -> ParsedSkill {
     let command = iter.next().expect("checked non-empty");
     let rest: Vec<String> = iter.collect();
     let result = match command.as_str() {
-        "add" => parse_flags(rest, false).and_then(|(flags, positional)| {
+        "add" => parse_flags(rest, FlagExtras::None).and_then(|(flags, positional)| {
             match positional.len() {
                 1 => Ok(Command::Add {
                     file: positional.into_iter().next().expect("one positional"),
@@ -201,21 +309,23 @@ fn parse(args: Vec<String>) -> ParsedSkill {
                 _ => Err("amparo skill add requires exactly one candidate file".into()),
             }
         }),
-        "propose" => parse_flags(rest, true).and_then(|(flags, positional)| {
-            if positional.is_empty() {
-                Ok(Command::Propose(flags))
-            } else {
-                Err("amparo skill propose takes no positional arguments".into())
-            }
-        }),
-        "list" => parse_flags(rest, false).and_then(|(flags, positional)| {
+        "propose" => {
+            parse_flags(rest, FlagExtras::Propose).and_then(|(flags, positional)| {
+                if positional.is_empty() {
+                    Ok(Command::Propose(flags))
+                } else {
+                    Err("amparo skill propose takes no positional arguments".into())
+                }
+            })
+        }
+        "list" => parse_flags(rest, FlagExtras::None).and_then(|(flags, positional)| {
             if positional.is_empty() {
                 Ok(Command::List(flags))
             } else {
                 Err("amparo skill list takes no positional arguments".into())
             }
         }),
-        "show" => parse_flags(rest, false).and_then(|(flags, positional)| {
+        "show" => parse_flags(rest, FlagExtras::None).and_then(|(flags, positional)| {
             match positional.len() {
                 1 => Ok(Command::Show {
                     name: positional.into_iter().next().expect("one positional"),
@@ -224,13 +334,31 @@ fn parse(args: Vec<String>) -> ParsedSkill {
                 _ => Err("amparo skill show requires a skill name".into()),
             }
         }),
-        "adopt" => parse_flags(rest, false).and_then(|(flags, positional)| {
+        "adopt" => {
+            parse_flags(rest, FlagExtras::None).and_then(|(flags, positional)| {
+                match positional.len() {
+                    1 => Ok(Command::Adopt {
+                        name: positional.into_iter().next().expect("one positional"),
+                        flags,
+                    }),
+                    _ => Err("amparo skill adopt requires a skill name".into()),
+                }
+            })
+        }
+        "check" => parse_flags(rest, FlagExtras::Check).and_then(|(flags, positional)| {
+            if positional.is_empty() {
+                Ok(Command::Check(flags))
+            } else {
+                Err("amparo skill check takes no positional arguments".into())
+            }
+        }),
+        "retire" => parse_flags(rest, FlagExtras::Retire).and_then(|(flags, positional)| {
             match positional.len() {
-                1 => Ok(Command::Adopt {
+                1 => Ok(Command::Retire {
                     name: positional.into_iter().next().expect("one positional"),
                     flags,
                 }),
-                _ => Err("amparo skill adopt requires a skill name".into()),
+                _ => Err("amparo skill retire requires a skill name".into()),
             }
         }),
         other => Err(format!(
@@ -270,6 +398,8 @@ async fn execute(command: Command) -> Result<(), String> {
         Command::List(flags) => list(&flags),
         Command::Show { name, flags } => show(&name, &flags),
         Command::Adopt { name, flags } => adopt(&name, &flags).await,
+        Command::Check(flags) => check(&flags).await,
+        Command::Retire { name, flags } => retire(&name, &flags),
     }
 }
 
@@ -311,7 +441,7 @@ fn add(file: &str, flags: &SkillFlags) -> Result<(), String> {
 /// `proposals.jsonl` and print the findings plus a TOML template.
 fn propose(flags: &SkillFlags) -> Result<(), String> {
     let workspace = setup_workspace(flags);
-    let records = workspace.join(".amparo/notebook/records.jsonl");
+    let records = notebook_dir(&workspace).join("records.jsonl");
     if !records.exists() {
         eprintln!(
             "[skills] no notebook records at {} — nothing to propose \
@@ -385,18 +515,32 @@ fn template(tool_names: &[String], suggested_name: &str, examples: &[String]) ->
     out
 }
 
-/// `skill list` — this tenant's adopted skills, name and description each.
+/// `skill list` — this tenant's adopted skills, name and description each,
+/// with a compact metrics tail (M6d) when the notebook has uses.
 fn list(flags: &SkillFlags) -> Result<(), String> {
     setup_workspace(flags);
     let tenant = flags.tenant();
-    let set = load_adopted(&PathPolicy::from_env().workspace_root, tenant);
+    let workspace_root = PathPolicy::from_env().workspace_root;
+    let set = load_adopted(&workspace_root, tenant);
     if set.names().is_empty() {
         println!("no adopted skills for tenant {tenant}");
         return Ok(());
     }
+    let records = notebook_dir(&workspace_root).join("records.jsonl");
     for name in set.names() {
         let spec = set.get(&name).expect("names come from the set");
-        println!("{name} — {}", spec.description);
+        let uses = read_uses(&records, tenant, &name).unwrap_or_default();
+        if uses.is_empty() {
+            println!("{name} — {}", spec.description);
+        } else {
+            let metrics = summarize(&uses);
+            println!(
+                "{name} — {} — uses: {}, VERIFIED: {:.0}%",
+                spec.description,
+                metrics.uses,
+                metrics.verified_rate * 100.0
+            );
+        }
     }
     Ok(())
 }
@@ -407,12 +551,22 @@ fn show(name: &str, flags: &SkillFlags) -> Result<(), String> {
     setup_workspace(flags);
     let tenant = flags.tenant();
     let log = skills_dir(&PathPolicy::from_env().workspace_root).join("adopted.jsonl");
-    let record = read_adoptions(&log)
+    let record = read_log(&log)
         .into_iter()
         .rev()
-        .find(|r| r.event == "adopt" && r.tenant_id == tenant && r.name == name)
+        .find(|r| {
+            matches!(r, SkillLogEvent::Adopt { .. })
+                && r.tenant_id() == tenant
+                && r.name() == name
+        })
         .ok_or_else(|| format!("no adopted skill {name:?} for tenant {tenant}"))?;
-    let spec = &record.spec;
+    let SkillLogEvent::Adopt {
+        spec, adopted_at, ..
+    } = record
+    else {
+        unreachable!("the find predicate matches only Adopt variants")
+    };
+    let spec = &spec;
     println!("name: {}", spec.name);
     println!("description: {}", spec.description);
     println!(
@@ -442,8 +596,101 @@ fn show(name: &str, flags: &SkillFlags) -> Result<(), String> {
     if !spec.source_run_ids.is_empty() {
         println!("source runs: {}", spec.source_run_ids.join(", "));
     }
-    println!("adopted: {}", record.adopted_at);
+    println!("adopted: {}", adopted_at);
+    // M6d: status, metrics and re-check history. Existence keys on the
+    // last Adopt event above, so retired skills stay inspectable.
+    let latest_retire = read_log(&log)
+        .into_iter()
+        .rev()
+        .find(|r| {
+            matches!(r, SkillLogEvent::Retire { .. })
+                && r.tenant_id() == tenant
+                && r.name() == name
+        });
+    match latest_retire {
+        Some(SkillLogEvent::Retire {
+            retired_at, reason, ..
+        }) => println!("status: retired ({reason}, {retired_at})"),
+        _ => println!("status: adopted"),
+    }
+    let records = notebook_dir(&PathPolicy::from_env().workspace_root).join("records.jsonl");
+    let metrics = summarize(&read_uses(&records, tenant, name)?);
+    println!("uses: {}", metrics.uses);
+    if metrics.uses > 0 {
+        println!(
+            "VERIFIED rate: {:.0}% ({}/{})",
+            metrics.verified_rate * 100.0,
+            metrics.verified_uses,
+            metrics.uses
+        );
+        println!("mean steps: {:.2}", metrics.mean_steps);
+        if metrics.denials.is_empty() {
+            println!("denials: none");
+        } else {
+            for (decision, count) in &metrics.denials {
+                println!("denials: {decision} x{count}");
+            }
+        }
+        if let Some(last) = &metrics.last_use {
+            println!("last use: {last}");
+        }
+    }
+    let rechecks: Vec<CheckRecord> = read_rechecks(&skills_dir(&PathPolicy::from_env().workspace_root).join(RECHECKS_FILE))
+        .into_iter()
+        .filter(|r| r.tenant_id == tenant && r.name == name)
+        .collect();
+    match rechecks.last() {
+        Some(row) => {
+            let kind = match row.kind {
+                CheckKind::Drift => "drift",
+                CheckKind::Performance => "performance",
+            };
+            let outcome = match row.outcome {
+                CheckOutcome::Ok => "ok",
+                CheckOutcome::Retired => "retired",
+            };
+            println!("last policy re-check: {} ({kind}, {outcome})", row.checked_at);
+        }
+        None => println!("last policy re-check: never"),
+    }
+    let retirements: Vec<SkillLogEvent> = read_log(&log)
+        .into_iter()
+        .filter(|r| {
+            matches!(r, SkillLogEvent::Retire { .. })
+                && r.tenant_id() == tenant
+                && r.name() == name
+        })
+        .collect();
+    if retirements.is_empty() {
+        println!("retirement history: none");
+    } else {
+        for event in retirements {
+            let SkillLogEvent::Retire {
+                retired_at, reason, ..
+            } = event
+            else {
+                unreachable!("the filter predicate matches only Retire variants")
+            };
+            println!("retirement history: {retired_at} — {reason}");
+        }
+    }
     Ok(())
+}
+
+/// The policy engine for a gated skill command — the run.rs match
+/// (Wire / AllowAll / DenyAll).
+fn policy_engine(flags: &SkillFlags) -> Arc<dyn PolicyEngine> {
+    match (&flags.policy_url, flags.allow_all) {
+        (Some(url), false) => {
+            let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
+            Arc::new(WirePolicyEngine::new(url.clone(), api_key))
+        }
+        (None, true) => Arc::new(AllowAllPolicyEngine),
+        (None, false) => Arc::new(DenyAllPolicyEngine::new(
+            "no policy configured (--policy-url or --allow-all)",
+        )),
+        (Some(_), true) => unreachable!("rejected by parse_flags"),
+    }
 }
 
 /// `skill adopt <name>` — the gated adoption: validate, policy-check
@@ -466,17 +713,7 @@ async fn adopt(name: &str, flags: &SkillFlags) -> Result<(), String> {
     })?;
     spec.validate(&default_registry())?;
 
-    let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
-        (Some(url), false) => {
-            let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
-            Arc::new(WirePolicyEngine::new(url.clone(), api_key))
-        }
-        (None, true) => Arc::new(AllowAllPolicyEngine),
-        (None, false) => Arc::new(DenyAllPolicyEngine::new(
-            "no policy configured (--policy-url or --allow-all)",
-        )),
-        (Some(_), true) => unreachable!("rejected by parse_flags"),
-    };
+    let policy = policy_engine(flags);
     let decision = policy
         .judge_tool(USE_SKILL, name, &[("tenant", &tenant)])
         .await;
@@ -508,15 +745,117 @@ async fn adopt(name: &str, flags: &SkillFlags) -> Result<(), String> {
 
     let adopted_at = chrono::Utc::now().to_rfc3339();
     spec.adopted_at = Some(adopted_at.clone());
-    let record = AdoptRecord {
-        event: "adopt".to_string(),
-        tenant_id: tenant.clone(),
-        name: name.to_string(),
-        spec,
-        adopted_at,
-    };
-    append_adopt(&skills_dir(&workspace).join("adopted.jsonl"), &record)?;
+    let event = SkillLogEvent::adopt(tenant.clone(), name.to_string(), spec, adopted_at);
+    append_event(&skills_dir(&workspace).join("adopted.jsonl"), &event)?;
     eprintln!("[skills] adopted {name} for tenant {tenant}");
+    Ok(())
+}
+
+/// `skill check` — the M6d re-check of every adopted skill: policy drift
+/// first (the step plan dry-runs through the gate chain with this task's
+/// policy engine + ceiling — nothing executes, no approval), then
+/// performance (VERIFIED rate over the last `window` uses). Drift wins
+/// over performance; a retirement appends a Retire event + a re-check row
+/// (a pass appends only the row). `--dry-run` reports and writes nothing.
+/// Exit 0 even when retirements fire (cron-able).
+async fn check(flags: &SkillFlags) -> Result<(), String> {
+    let workspace = setup_workspace(flags);
+    let tenant = flags.tenant();
+    let skills_path = skills_dir(&workspace).join("adopted.jsonl");
+    let set = SkillSet::load(&skills_path, tenant);
+    let names = set.names();
+    let total = names.len();
+    if names.is_empty() {
+        eprintln!("[skills] no adopted skills for tenant {tenant} — nothing to check");
+        return Ok(());
+    }
+    let policy = policy_engine(flags);
+    let registry = default_registry();
+    let threshold = RetirementThreshold {
+        min_verified_rate: flags.min_verified_rate.unwrap_or(0.5),
+        window: flags.window.unwrap_or(20),
+        ..RetirementThreshold::default()
+    };
+    let records = notebook_dir(&workspace).join("records.jsonl");
+    let rechecks_path = skills_dir(&workspace).join(RECHECKS_FILE);
+    let checked_at = chrono::Utc::now().to_rfc3339();
+    let mut retired = 0usize;
+    for name in names {
+        let spec = set.get(&name).expect("names come from the set");
+        let (kind, outcome, finding) = if let Some(reason) = check_skill_drift(
+            &spec,
+            &registry,
+            flags.trust_ceiling,
+            policy.as_ref(),
+        )
+        .await
+        {
+            (CheckKind::Drift, CheckOutcome::Retired, Some(reason))
+        } else {
+            let uses = read_uses(&records, tenant, &name)?;
+            match retirement_reason(&uses, &threshold) {
+                Some(reason) => (CheckKind::Performance, CheckOutcome::Retired, Some(reason)),
+                None => (CheckKind::Performance, CheckOutcome::Ok, None),
+            }
+        };
+        match &finding {
+            Some(reason) => {
+                eprintln!("[skills] retired {name} for tenant {tenant}: {reason}");
+                retired += 1;
+            }
+            None => eprintln!(
+                "[skills] {name}: ok — no policy drift, performance within the threshold"
+            ),
+        }
+        if flags.dry_run {
+            // Reports only — no Retire events, no re-check rows.
+            continue;
+        }
+        append_recheck(
+            &rechecks_path,
+            &CheckRecord {
+                checked_at: checked_at.clone(),
+                tenant_id: tenant.to_string(),
+                name: name.clone(),
+                kind,
+                outcome,
+                reason: finding.clone(),
+            },
+        )?;
+        if let Some(reason) = finding {
+            append_event(
+                &skills_path,
+                &SkillLogEvent::retire(tenant, &name, checked_at.clone(), reason),
+            )?;
+        }
+    }
+    eprintln!(
+        "[skills] checked {total} skill(s) for tenant {tenant}, {retired} retired{}",
+        if flags.dry_run { " (dry-run — nothing written)" } else { "" }
+    );
+    Ok(())
+}
+
+/// `skill retire <name>` — the I4 operator lever: append a Retire event
+/// (disable + notify, never delete — the audit log keeps every row).
+/// Refuses when the folded set lacks the name.
+fn retire(name: &str, flags: &SkillFlags) -> Result<(), String> {
+    let workspace = setup_workspace(flags);
+    let tenant = flags.tenant();
+    let skills_path = skills_dir(&workspace).join("adopted.jsonl");
+    let set = SkillSet::load(&skills_path, tenant);
+    if set.get(name).is_none() {
+        return Err(format!(
+            "{name:?} is not currently adopted for tenant {tenant} — nothing to retire"
+        ));
+    }
+    let retired_at = chrono::Utc::now().to_rfc3339();
+    let reason = flags.reason.as_deref().unwrap_or("operator retired");
+    append_event(
+        &skills_path,
+        &SkillLogEvent::retire(tenant, name, retired_at, reason),
+    )?;
+    eprintln!("[skills] retired {name} for tenant {tenant}: {reason}");
     Ok(())
 }
 
@@ -662,6 +1001,66 @@ mod tests {
             Command::List(_)
         ));
         assert!(parse_error(&["list", "x"]).contains("no positional"));
+    }
+
+    #[test]
+    fn check_parses_metrics_flags_with_defaults() {
+        match parse_ok(&["check"]) {
+            Command::Check(flags) => {
+                assert!(flags.min_verified_rate.is_none());
+                assert!(flags.window.is_none());
+                assert!(!flags.dry_run);
+                assert_eq!(flags.trust_ceiling, ToolTrustTier::SystemControl);
+            }
+            other => panic!("expected Check, got {other:?}"),
+        }
+        match parse_ok(&[
+            "check",
+            "--min-verified-rate",
+            "0.5",
+            "--window",
+            "10",
+            "--dry-run",
+            "--trust-ceiling",
+            "external_effector",
+        ]) {
+            Command::Check(flags) => {
+                assert_eq!(flags.min_verified_rate, Some(0.5));
+                assert_eq!(flags.window, Some(10));
+                assert!(flags.dry_run);
+                assert_eq!(flags.trust_ceiling, ToolTrustTier::ExternalEffector);
+            }
+            other => panic!("expected Check, got {other:?}"),
+        }
+        assert!(parse_error(&["check", "--window", "0"]).contains("positive integer"));
+        assert!(parse_error(&["check", "--window", "nope"]).contains("positive integer"));
+        assert!(parse_error(&["check", "--min-verified-rate", "2"])
+            .contains("between 0 and 1"));
+        assert!(parse_error(&["check", "--trust-ceiling", "nonsense"])
+            .contains("unknown trust tier"));
+        assert!(parse_error(&["check", "--trust-ceiling"]).contains("requires a tier"));
+        assert!(parse_error(&["check", "extra"]).contains("no positional"));
+        // The check-only flags are rejected for other subcommands.
+        assert!(parse_error(&["list", "--window", "5"]).contains("unknown flag --window"));
+        assert!(parse_error(&["list", "--dry-run"]).contains("unknown flag --dry-run"));
+        assert!(parse_error(&["adopt", "x", "--trust-ceiling", "system_control"])
+            .contains("unknown flag --trust-ceiling"));
+    }
+
+    #[test]
+    fn retire_requires_a_name_and_parses_reason() {
+        match parse_ok(&["retire", "greet", "--reason", "operator retired"]) {
+            Command::Retire { name, flags } => {
+                assert_eq!(name, "greet");
+                assert_eq!(flags.reason.as_deref(), Some("operator retired"));
+            }
+            other => panic!("expected Retire, got {other:?}"),
+        }
+        assert!(parse_error(&["retire"]).contains("requires a skill name"));
+        assert!(parse_error(&["retire", "a", "b"]).contains("requires a skill name"));
+        assert!(parse_error(&["retire", "greet", "--reason"]).contains("--reason requires a value"));
+        // The retire-only flag is rejected for other subcommands.
+        assert!(parse_error(&["list", "--reason", "x"]).contains("unknown flag --reason"));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use amparo_agent::{extract_target, AgentEvent, EventSink};
-use amparo_tools::Memory;
+use amparo_tools::{Memory, USE_SKILL};
 use tokio::task::JoinHandle;
 
 use crate::record::{
@@ -157,7 +157,17 @@ impl EventSink for NotebookSink {
             }
             AgentEvent::ToolCallRequested { call } => {
                 if let Some(state) = slot.as_mut() {
-                    let (target, _) = extract_target(call);
+                    // `use_skill` records the skill name as its target —
+                    // the engine judges the skill name, mirroring the gate
+                    // chain; every other call extracts its target.
+                    let (target, _) = if call.name == USE_SKILL {
+                        (
+                            call.arg_str("skill_name").unwrap_or_default().to_string(),
+                            Vec::new(),
+                        )
+                    } else {
+                        extract_target(call)
+                    };
                     state.order.push(call.id.clone());
                     let entry = state.calls.entry(call.id.clone()).or_default();
                     entry.tool_name = call.name.clone();
@@ -538,5 +548,25 @@ mod tests {
         });
         sink.flush().await;
         // Reached here: the failure did not panic; the task itself is done.
+    }
+
+    #[tokio::test]
+    async fn use_skill_records_the_skill_name_as_target() {
+        let (sink, store) = sink("cli");
+        start(&sink, "use the skill");
+        request(
+            &sink,
+            "call_1",
+            USE_SKILL,
+            json!({"skill_name": "demo-skill"}),
+        );
+        sink.emit(&AgentEvent::TaskFailed {
+            message: "stopped".into(),
+        });
+        sink.flush().await;
+
+        let records = stored_records(&store).await;
+        assert_eq!(records[0].tool_calls[0].tool_name, USE_SKILL);
+        assert_eq!(records[0].tool_calls[0].target, "demo-skill");
     }
 }

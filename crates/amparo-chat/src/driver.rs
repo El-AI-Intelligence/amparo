@@ -12,7 +12,10 @@ use crate::sink::ChatEventSink;
 use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport, PressOutcome};
 use amparo_agent::{Agent, AgentConfig, CaseLibrary, EventSink, FanoutSink};
 use amparo_inference::InferenceProvider;
-use amparo_notebook::{CaseRetriever, NotebookSink, SkillSet};
+use amparo_notebook::{
+    CaseRetriever, NotebookSink, SkillLogEvent, SkillSet, append_event, auto_rollup,
+    check_skill_drift,
+};
 use amparo_policy::wire::WirePolicyEngine;
 use amparo_policy::PolicyEngine;
 use amparo_privacy::PrivacyPolicy;
@@ -106,6 +109,15 @@ pub struct ChatDriver {
     /// same store feeds the case library (M6b) — prior same-tenant records
     /// are retrieved into each task's self-verification prompt.
     notebook: Option<Arc<dyn Memory>>,
+    /// The hot layer (M6e): when the [`ChatDriver::with_hot_layer`] seam is
+    /// attached, the case library reads this store — the informative
+    /// subset of the cold archive, promoted at every task start and folded
+    /// daily — instead of the full notebook. Optional; without it the M6b
+    /// path stands.
+    hot: Option<Arc<dyn Memory>>,
+    /// Where the hot layer and its rollup sidecars live; drives the
+    /// promote + fold at each task start. Present only together with `hot`.
+    notebook_dir: Option<PathBuf>,
     /// The legacy shared tool registry, cloned per task — ignored in
     /// directory mode, where each task gets a fresh registry rooted at its
     /// own workspace (tools are Send+Sync).
@@ -169,6 +181,8 @@ impl ChatDriver {
             policy_source,
             privacy: None,
             notebook: None,
+            hot: None,
+            notebook_dir: None,
             registry,
             workspace_root,
             transport,
@@ -207,6 +221,22 @@ impl ChatDriver {
     /// nothing.
     pub fn with_growth(mut self, store: Arc<dyn Memory>) -> Self {
         self.notebook = Some(store);
+        self
+    }
+
+    /// Attach the hot layer (M6e) — the informative subset of the lab
+    /// notebook.
+    ///
+    /// With this seam attached, every task start promotes the cold tail
+    /// into the hot store — folding it when the last fold is at least 24
+    /// hours old (promoted cases exempt) — and the per-task case library
+    /// reads hot instead of the full notebook. Without it the M6b path
+    /// stands: retrieval over the [`ChatDriver::with_growth`] store, no
+    /// rollup. The hot store is read-only by convention — only the rollup
+    /// writes it.
+    pub fn with_hot_layer(mut self, hot: Arc<dyn Memory>, notebook_dir: PathBuf) -> Self {
+        self.hot = Some(hot);
+        self.notebook_dir = Some(notebook_dir);
         self
     }
 
@@ -360,6 +390,8 @@ impl ChatDriver {
         // same `platform:user_id` key tenancy uses.
         let tenant_key = format!("{}:{}", chat.platform, chat.user_id);
         let notebook = self.notebook.clone();
+        let hot = self.hot.clone();
+        let notebook_dir = self.notebook_dir.clone();
         let workspace_root = self.workspace_root.clone();
 
         tokio::spawn(async move {
@@ -372,35 +404,96 @@ impl ChatDriver {
             // events also fan out to it (growth is observational — a record
             // write can never fail or block the task).
             let (chat_sink, rx) = ChatEventSink::channel();
-            let sink: Arc<dyn EventSink> = match &notebook {
-                Some(store) => Arc::new(FanoutSink::new(vec![
+            // The notebook sink is named so the success branch can await
+            // its final write before the answer goes out — that closes
+            // the back-to-back task window where the next task's
+            // promotion could miss this task's record (M6e).
+            let notebook_sink: Option<Arc<NotebookSink>> = notebook.as_ref().map(|store| {
+                Arc::new(NotebookSink::new(Arc::clone(store), tenant_key.clone()))
+            });
+            let sink: Arc<dyn EventSink> = match &notebook_sink {
+                Some(nb) => Arc::new(FanoutSink::new(vec![
                     chat_sink,
-                    Arc::new(NotebookSink::new(Arc::clone(store), tenant_key.clone())),
+                    Arc::clone(nb) as Arc<dyn EventSink>,
                 ])),
                 None => chat_sink,
             };
-            // The same store feeds the case library (M6b): prior runs by
-            // this tenant are retrieved into the self-verification prompt —
-            // never into the action loop.
-            // Gated skills (M6c): with a notebook attached (--growth), this
-            // tenant's adopted skills register `use_skill` on the task's own
-            // registry copy. The load is tenant-filtered exactly like M6b
-            // retrieval, so another tenant's skills are invisible (I2).
+            // The same store feeds the case library (M6b); with the hot
+            // layer attached (M6e) the hot store feeds it instead. Prior
+            // runs by this tenant are retrieved into the self-verification
+            // prompt — never into the action loop.
+            // Gated skills (M6c + M6d): with a notebook attached
+            // (--growth), this tenant's adopted skills register `use_skill`
+            // on the task's own registry copy. The load is tenant-filtered
+            // exactly like M6b retrieval, so another tenant's skills are
+            // invisible (I2). Startup drift re-check (M6d, drift only — no
+            // records parse per task): a skill whose step plan this task's
+            // policy/ceiling/registry would block retires before
+            // registration. Growth is observational — a write failure
+            // warns and continues, never failing the task.
             let mut skills: Option<Arc<dyn SkillLibrary>> = None;
             if notebook.is_some() {
-                let skill_set = SkillSet::load(
-                    &workspace_root.join(".amparo/skills/adopted.jsonl"),
-                    &tenant_key,
-                );
-                if !skill_set.names().is_empty() {
-                    let library: Arc<dyn SkillLibrary> = Arc::new(skill_set);
-                    registry.register(Arc::new(UseSkillTool::new(Arc::clone(&library))));
-                    skills = Some(library);
+                let skills_path = workspace_root.join(".amparo/skills/adopted.jsonl");
+                let skill_set = SkillSet::load(&skills_path, &tenant_key);
+                let adopted_names = skill_set.names();
+                if !adopted_names.is_empty() {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    for name in &adopted_names {
+                        let Some(spec) = skill_set.get(name) else { continue; };
+                        if let Some(reason) =
+                            check_skill_drift(&spec, &registry, trust_ceiling, policy.as_ref())
+                                .await
+                        {
+                            if let Err(e) = append_event(
+                                &skills_path,
+                                &SkillLogEvent::retire(&tenant_key, name, &now, reason.clone()),
+                            ) {
+                                eprintln!("[growth] retire write failed: {e}");
+                            }
+                            eprintln!("[growth] skill {name} retired: {reason}");
+                        }
+                    }
+                    let survivors = SkillSet::load(&skills_path, &tenant_key);
+                    if !survivors.names().is_empty() {
+                        let library: Arc<dyn SkillLibrary> = Arc::new(survivors);
+                        registry.register(Arc::new(UseSkillTool::new(Arc::clone(&library))));
+                        skills = Some(library);
+                    }
                 }
             }
-            let case_library: Option<Arc<dyn CaseLibrary>> = notebook.as_ref().map(|store| {
-                Arc::new(CaseRetriever::new(Arc::clone(store), tenant_key)) as Arc<dyn CaseLibrary>
-            });
+            // Rollup and archival (M6e): with the hot layer attached,
+            // promote the cold tail into hot — folding it daily — before
+            // retrieval, so the case library reads this workspace's hot
+            // copy too. Observational: a failure warns and never fails
+            // the task.
+            if let Some(nb_dir) = &notebook_dir {
+                match auto_rollup(nb_dir, chrono::Utc::now()) {
+                    Ok(Some(report)) if report.promoted > 0 => {
+                        eprintln!(
+                            "[growth] notebook: promoted {} tail record(s) to the hot layer",
+                            report.promoted
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[growth] notebook rollup failed: {e}"),
+                }
+            }
+            // The case library reads the hot layer when it is attached
+            // (M6e); otherwise the full notebook does (M6b). Either way,
+            // prior runs by this tenant inform self-verification — never
+            // the action loop.
+            let case_library: Option<Arc<dyn CaseLibrary>> = hot
+                .as_ref()
+                .map(|store| {
+                    Arc::new(CaseRetriever::new(Arc::clone(store), tenant_key.clone()))
+                        as Arc<dyn CaseLibrary>
+                })
+                .or_else(|| {
+                    notebook.as_ref().map(|store| {
+                        Arc::new(CaseRetriever::new(Arc::clone(store), tenant_key))
+                            as Arc<dyn CaseLibrary>
+                    })
+                });
             let drain_transport = Arc::clone(&transport);
             let drain_chat = chat.clone();
             tokio::spawn(async move {
@@ -436,6 +529,12 @@ impl ChatDriver {
             let run = tokio::spawn(async move { agent.run(text).await });
             match run.await {
                 Ok(report) => {
+                    // Flush the pending record before the answer lands, so
+                    // the next task in this chat always promotes this one
+                    // (M6e — the back-to-back soft-miss window).
+                    if let Some(nb) = &notebook_sink {
+                        nb.flush().await;
+                    }
                     let answer = match report.final_answer {
                         Some(answer) => answer,
                         None => "The task failed — no final answer was produced.".to_string(),
@@ -479,7 +578,7 @@ mod tests {
     }
 
     use super::*;
-    use amparo_notebook::{AdoptRecord, append_adopt};
+    use amparo_notebook::{HOT_FILE, JsonlStore, SkillLogEvent, append_event};
     use amparo_policy::AllowAllPolicyEngine;
     use amparo_tools::{InMemoryStore, SkillOrigin, SkillSpec, SkillStep, ToolTrustTier};
     use common::{
@@ -754,6 +853,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn growth_hot_layer_promotes_tail_and_retrieves_from_hot() {
+        // The M6e seam: a temp root's cold archive plus its hot layer.
+        // Task 1 writes the cold record (flushed before its answer);
+        // task 2's start promotes the tail into hot and its verification
+        // reads the promoted case from hot.
+        let root =
+            std::env::temp_dir().join(format!("amparo-chat-hot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![turn_text("Done.")]);
+        let nb_dir = root.join(".amparo/notebook");
+        let cold = Arc::new(JsonlStore::open(nb_dir.join("records.jsonl")).expect("cold store"));
+        let hot = Arc::new(JsonlStore::open(nb_dir.join(HOT_FILE)).expect("hot store"));
+        let driver = driver(transport.clone(), provider.clone(), true)
+            .with_growth(cold)
+            .with_hot_layer(hot, nb_dir);
+
+        // Task 1 seeds the cold archive.
+        driver.on_message(chat(), "deploy the staging site".into()).await;
+        wait_for_text(&transport, "Done.").await;
+        let cold_path = root.join(".amparo/notebook/records.jsonl");
+        wait_until(|| {
+            std::fs::read_to_string(&cold_path)
+                .map(|t| t.lines().count() == 1)
+                .unwrap_or(false)
+        })
+        .await;
+
+        // Task 2: the startup rollup promotes task 1's tail into hot, and
+        // the second verification carries the case from the hot layer.
+        driver.on_message(chat_for("user_1"), "deploy the staging site".into()).await;
+        wait_until(|| provider.recorded_complete_prompts().len() == 2).await;
+
+        let hot_path = root.join(".amparo/notebook/hot.jsonl");
+        let hot_rows = std::fs::read_to_string(&hot_path).expect("hot layer written");
+        assert_eq!(hot_rows.lines().count(), 1, "one hot row: {hot_rows}");
+        let id_of = |text: &str| -> String {
+            serde_json::from_str::<serde_json::Value>(text.lines().next().expect("one row"))
+                .expect("entry JSON")["id"]
+                .as_str()
+                .expect("entry id")
+                .to_string()
+        };
+        let cold_rows = std::fs::read_to_string(&cold_path).expect("cold archive");
+        assert_eq!(id_of(&hot_rows), id_of(&cold_rows), "the hot row keeps the cold id");
+
+        let prompts = provider.recorded_complete_prompts();
+        assert!(
+            !prompts[0].contains("Prior cases"),
+            "an empty hot layer leaves the first verification unchanged: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].contains("Prior cases in this tenant resembling the current task:"),
+            "the second verification reads the promoted case from hot: {}",
+            prompts[1]
+        );
+        assert!(
+            prompts[1].contains("deploy the staging site"),
+            "the evidence names the prior task: {}",
+            prompts[1]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A fresh workspace root per test (skills land under `<root>/.amparo`).
     fn temp_skills_root(tag: &str) -> PathBuf {
         let root =
@@ -785,15 +950,14 @@ mod tests {
             source_run_ids: vec![],
             adopted_at: None,
         };
-        append_adopt(
+        append_event(
             &root.join(".amparo/skills/adopted.jsonl"),
-            &AdoptRecord {
-                event: "adopt".into(),
-                tenant_id: "mock:user_1".into(),
-                name: "demo-skill".into(),
+            &SkillLogEvent::adopt(
+                "mock:user_1",
+                "demo-skill",
                 spec,
-                adopted_at: "2026-08-29T00:00:00Z".into(),
-            },
+                "2026-08-29T00:00:00Z",
+            ),
         )
         .expect("the seed adoption writes");
         let store = Arc::new(InMemoryStore::new());
@@ -865,6 +1029,74 @@ mod tests {
         assert!(
             !record.contains(r#""tool_name":"run_command""#),
             "no step expansion for the other tenant: {record}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn growth_skill_drift_retires_before_registration() {
+        let root = temp_skills_root("drift");
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![
+            turn_tool_call("call_1", "use_skill", r#"{"skill_name":"demo-skill"}"#),
+            turn_text("Done."),
+        ]);
+        // The step tool `echo` is not in the directory-mode task registry
+        // (default_registry_with_policy), so the startup drift check
+        // retires the skill before use_skill is ever registered.
+        let mut users = BTreeMap::new();
+        users.insert("mock:user_1".to_string(), profile());
+        let spec = SkillSpec {
+            name: "demo-skill".into(),
+            description: "one echo step".into(),
+            preconditions: vec![],
+            steps: vec![SkillStep {
+                tool: "echo".into(),
+                arguments: serde_json::json!({"message": "from-skill"}),
+            }],
+            expected_outcome: "the echo runs".into(),
+            origin: SkillOrigin::Operator,
+            source_run_ids: vec![],
+            adopted_at: None,
+        };
+        append_event(
+            &root.join(".amparo/skills/adopted.jsonl"),
+            &SkillLogEvent::adopt(
+                "mock:user_1",
+                "demo-skill",
+                spec,
+                "2026-08-29T00:00:00Z",
+            ),
+        )
+        .expect("the seed adoption writes");
+        let store = Arc::new(InMemoryStore::new());
+        let driver = driver_directory(users, transport.clone(), provider, true, root.clone())
+            .with_growth(store.clone());
+
+        driver.on_message(chat(), "use the demo skill".into()).await;
+        wait_for_text(&transport, "Done.").await;
+
+        // The scripted use_skill hit an empty registry: unknown_tool.
+        let record = tenant_record(&store, "mock:user_1", "use_skill").await;
+        assert!(
+            record.contains(r#""decision":"unknown_tool""#),
+            "the drifted skill never registered: {record}"
+        );
+
+        // The startup check wrote the retire event with an honest reason.
+        let log = std::fs::read_to_string(root.join(".amparo/skills/adopted.jsonl"))
+            .expect("the audit log exists");
+        let row: serde_json::Value = serde_json::from_str(
+            log.lines().last().expect("the retire row"),
+        )
+        .expect("the retire row is JSON");
+        assert_eq!(row["event"], "retire");
+        assert!(
+            row["reason"]
+                .as_str()
+                .expect("the reason is a string")
+                .contains("policy drift"),
+            "the reason names drift: {row}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

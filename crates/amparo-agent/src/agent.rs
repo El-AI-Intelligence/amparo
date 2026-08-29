@@ -146,6 +146,202 @@ enum GateOutcome {
     Blocked { result: ToolResult, decision: String, reasons: Vec<String> },
 }
 
+/// The dry-run core of [`Agent::gate_call`], shared with [`dry_run_gate`]:
+/// the same lookup → ceiling → policy chain, minus the approval gate.
+struct GateCheck {
+    /// What the policy engine judged — the skill name for a `use_skill`
+    /// call, the extracted tool target otherwise.
+    target: String,
+    /// The core verdict.
+    outcome: GateOutcomeCore,
+}
+
+/// The verdict of [`gate_check`], before the human-approval gate runs.
+enum GateOutcomeCore {
+    /// A gate blocked the call; `result` is the fully built failed
+    /// [`ToolResult`] the caller records (the error strings live here —
+    /// callers must not reconstruct them).
+    Blocked { result: ToolResult, decision: String, reasons: Vec<String> },
+    /// The call may execute once the approval gate (tool tier ≥
+    /// [`ToolTrustTier::ExternalEffector`] or a policy Escalate) has run.
+    Ready { reasons: Vec<String>, escalate_pending: bool, tier: ToolTrustTier },
+}
+
+/// The shared gate core: registry lookup → trust ceiling → policy engine.
+/// Returns either a fully built failed [`ToolResult`] (model calls record
+/// it via [`Agent::block_call`], skill steps into the expansion record) or
+/// the reasons/escalation/tier the approval gate needs. [`Agent::gate_call`]
+/// runs this then the approval block; [`dry_run_gate`] runs this alone.
+async fn gate_check(
+    registry: &ToolRegistry,
+    ceiling: ToolTrustTier,
+    policy: &dyn PolicyEngine,
+    call: &ToolCall,
+) -> GateCheck {
+    let make_result = |success: bool, output: serde_json::Value, summary: &str| ToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        success,
+        output,
+        display_summary: summary.to_string(),
+        duration_ms: 0,
+    };
+
+    // Registry lookup first — unknown tools get an honest error naming
+    // what is available, not a trust verdict.
+    if registry.get_executor(&call.name).is_none() {
+        let available: Vec<String> = registry
+            .list_schemas()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let error = format!(
+            "Unknown tool: {}. Available: {}",
+            call.name,
+            available.join(", ")
+        );
+        return GateCheck {
+            target: String::new(),
+            outcome: GateOutcomeCore::Blocked {
+                result: make_result(false, serde_json::json!({"error": error}), "Unknown tool"),
+                decision: "unknown_tool".to_string(),
+                reasons: Vec::new(),
+            },
+        };
+    }
+
+    // Trust ceiling
+    let tier_ok = registry
+        .get_tier(&call.name)
+        .map(|t| t <= ceiling)
+        .unwrap_or(false);
+    if !tier_ok {
+        return GateCheck {
+            target: String::new(),
+            outcome: GateOutcomeCore::Blocked {
+                result: make_result(
+                    false,
+                    serde_json::json!({"error": "tool blocked by trust ceiling"}),
+                    "Blocked",
+                ),
+                decision: "trust_blocked".to_string(),
+                reasons: vec!["tool tier exceeds the trust ceiling".to_string()],
+            },
+        };
+    }
+
+    // Policy gate — the deny-by-default seam. For `use_skill` the engine
+    // judges the skill name, matching the adoption check; its steps get
+    // their own checks with their own targets when they expand.
+    let (target, params) = if call.name == USE_SKILL {
+        (
+            call.arg_str("skill_name").unwrap_or("").to_string(),
+            Vec::new(),
+        )
+    } else {
+        extract_target(call)
+    };
+    let param_refs: Vec<(&str, &str)> =
+        params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let decision = policy.judge_tool(&call.name, &target, &param_refs).await;
+    let mut escalate_pending = false;
+    let reasons: Vec<String> = match decision.verdict {
+        PolicyVerdict::Deny => {
+            let error = format!("Policy denied {}: {}", call.name, decision.fired.join("; "));
+            return GateCheck {
+                target,
+                outcome: GateOutcomeCore::Blocked {
+                    result: make_result(
+                        false,
+                        serde_json::json!({"error": error}),
+                        "Blocked by policy",
+                    ),
+                    decision: "policy_denied".to_string(),
+                    reasons: decision.fired,
+                },
+            };
+        }
+        PolicyVerdict::Escalate => {
+            // Escalate means ask — never execute silently.
+            escalate_pending = true;
+            let reasons = decision.fired;
+            tracing::warn!(
+                "[amparo-agent] policy escalate on {} (asking for approval): {}",
+                call.name,
+                reasons.join("; ")
+            );
+            reasons
+        }
+        PolicyVerdict::Allow => {
+            // Audit-mode allows carry the engine's real verdict in
+            // `fired` — keep it visible.
+            decision.fired
+        }
+    };
+
+    // The approval gate needs the tier; the core reports it so
+    // `dry_run_gate` can compute `approval_required` without a second
+    // registry lookup.
+    let tier = registry
+        .get_tier(&call.name)
+        .unwrap_or(ToolTrustTier::Observational);
+    GateCheck {
+        target,
+        outcome: GateOutcomeCore::Ready { reasons, escalate_pending, tier },
+    }
+}
+
+/// The verdict of a dry-run gate check: what [`dry_run_gate`] reports
+/// without executing anything, emitting any event, or asking for approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DryRunVerdict {
+    /// `allowed` | `unknown_tool` | `trust_blocked` | `policy_denied`
+    pub decision: String,
+    /// The gate reasons (policy-fired rules, ceiling complaint, …).
+    pub reasons: Vec<String>,
+    /// True when the same call through the live gate chain would be
+    /// blocked without human intervention.
+    pub would_block: bool,
+    /// True when the live chain would route the call to human approval:
+    /// a policy Escalate or a tool tier ≥ [`ToolTrustTier::ExternalEffector`].
+    /// Escalation is not drift — an escalated step is still allowed.
+    pub approval_required: bool,
+    /// What the policy engine judged: the `use_skill` skill name, or the
+    /// extracted tool target.
+    pub target: String,
+}
+
+/// Dry-run one call through the gate chain (registry lookup → trust
+/// ceiling → policy engine) without executing it, emitting events, or
+/// asking for approval. Used by the skill re-checker to detect
+/// **policy drift**: a skill step the current policy would deny must
+/// retire. A policy Escalate reports `approval_required: true` with
+/// `would_block: false` — escalate is not drift.
+pub async fn dry_run_gate(
+    registry: &ToolRegistry,
+    ceiling: ToolTrustTier,
+    policy: &dyn PolicyEngine,
+    call: &ToolCall,
+) -> DryRunVerdict {
+    let check = gate_check(registry, ceiling, policy, call).await;
+    match check.outcome {
+        GateOutcomeCore::Blocked { decision, reasons, .. } => DryRunVerdict {
+            decision,
+            reasons,
+            would_block: true,
+            approval_required: false,
+            target: check.target,
+        },
+        GateOutcomeCore::Ready { reasons, escalate_pending, tier } => DryRunVerdict {
+            decision: "allowed".to_string(),
+            reasons,
+            would_block: false,
+            approval_required: escalate_pending || tier >= ToolTrustTier::ExternalEffector,
+            target: check.target,
+        },
+    }
+}
+
 /// One batch item, in model order: either a direct call still to execute,
 /// or an already-expanded skill result.
 enum ExecItem {
@@ -819,107 +1015,25 @@ impl Agent {
     /// expansion record). Emits `ApprovalRequested`/`ApprovalResolved` when
     /// the approval gate runs; never emits `ToolGate` — the caller decides.
     async fn gate_call(&self, call: &ToolCall) -> GateOutcome {
-        let make_result = |success: bool, output: serde_json::Value, summary: &str| ToolResult {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            success,
-            output,
-            display_summary: summary.to_string(),
-            duration_ms: 0,
-        };
-
-        // Registry lookup first — unknown tools get an honest error naming
-        // what is available, not a trust verdict.
-        if self.registry.get_executor(&call.name).is_none() {
-            let available: Vec<String> = self
-                .registry
-                .list_schemas()
-                .iter()
-                .map(|s| s.name.clone())
-                .collect();
-            let error = format!(
-                "Unknown tool: {}. Available: {}",
-                call.name,
-                available.join(", ")
-            );
-            return GateOutcome::Blocked {
-                result: make_result(false, serde_json::json!({"error": error}), "Unknown tool"),
-                decision: "unknown_tool".to_string(),
-                reasons: Vec::new(),
-            };
-        }
-
-        // Trust ceiling
-        let tier_ok = self
-            .registry
-            .get_tier(&call.name)
-            .map(|t| t <= self.config.trust_ceiling)
-            .unwrap_or(false);
-        if !tier_ok {
-            return GateOutcome::Blocked {
-                result: make_result(
-                    false,
-                    serde_json::json!({"error": "tool blocked by trust ceiling"}),
-                    "Blocked",
-                ),
-                decision: "trust_blocked".to_string(),
-                reasons: vec!["tool tier exceeds the trust ceiling".to_string()],
-            };
-        }
-
-        // Policy gate — the deny-by-default seam. For `use_skill` the engine
-        // judges the skill name, matching the adoption check; its steps get
-        // their own checks with their own targets when they expand.
-        let (target, params) = if call.name == USE_SKILL {
-            (
-                call.arg_str("skill_name").unwrap_or("").to_string(),
-                Vec::new(),
-            )
-        } else {
-            extract_target(call)
-        };
-        let param_refs: Vec<(&str, &str)> =
-            params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let decision = self.policy.judge_tool(&call.name, &target, &param_refs).await;
-        let mut escalate_pending = false;
-        let reasons: Vec<String> = match decision.verdict {
-            PolicyVerdict::Deny => {
-                let error = format!("Policy denied {}: {}", call.name, decision.fired.join("; "));
-                return GateOutcome::Blocked {
-                    result: make_result(
-                        false,
-                        serde_json::json!({"error": error}),
-                        "Blocked by policy",
-                    ),
-                    decision: "policy_denied".to_string(),
-                    reasons: decision.fired,
-                };
+        let check = gate_check(
+            &self.registry,
+            self.config.trust_ceiling,
+            self.policy.as_ref(),
+            call,
+        )
+        .await;
+        let (reasons, escalate_pending, tier) = match check.outcome {
+            GateOutcomeCore::Blocked { result, decision, reasons } => {
+                return GateOutcome::Blocked { result, decision, reasons };
             }
-            PolicyVerdict::Escalate => {
-                // Escalate means ask — never execute silently.
-                escalate_pending = true;
-                let reasons = decision.fired;
-                tracing::warn!(
-                    "[amparo-agent] policy escalate on {} (asking for approval): {}",
-                    call.name,
-                    reasons.join("; ")
-                );
-                reasons
-            }
-            PolicyVerdict::Allow => {
-                // Audit-mode allows carry the engine's real verdict in
-                // `fired` — keep it visible.
-                decision.fired
+            GateOutcomeCore::Ready { reasons, escalate_pending, tier } => {
+                (reasons, escalate_pending, tier)
             }
         };
 
         // Human-approval gate — tier ≥ ExternalEffector or a policy
         // Escalate. The gate decides how a human is asked and when to
         // auto-deny; Amparo's built-ins auto-deny.
-        let tier = self
-            .registry
-            .get_tier(&call.name)
-            .unwrap_or(ToolTrustTier::Observational);
         if escalate_pending || tier >= ToolTrustTier::ExternalEffector {
             let mut ask_reasons = reasons.clone();
             if escalate_pending {
@@ -946,11 +1060,14 @@ impl Agent {
             });
             if !approved {
                 return GateOutcome::Blocked {
-                    result: make_result(
-                        false,
-                        serde_json::json!({"error": "User denied the action or approval timed out"}),
-                        "Denied by user",
-                    ),
+                    result: ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: false,
+                        output: serde_json::json!({"error": "User denied the action or approval timed out"}),
+                        display_summary: "Denied by user".to_string(),
+                        duration_ms: 0,
+                    },
                     decision: "approval_denied".to_string(),
                     reasons: vec!["human approval denied".to_string()],
                 };
@@ -2444,5 +2561,171 @@ mod tests {
         };
         let (target, _) = extract_target(&call);
         assert_eq!(target, "rm -rf /");
+    }
+
+    // ── Dry-run gate (M6d) tests ─────────────────────────────────────────────
+
+    fn call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall { id: id.to_string(), name: name.to_string(), arguments }
+    }
+
+    /// An empty skill library — a `use_skill` call can still be gated.
+    struct EmptySkills;
+    impl SkillLibrary for EmptySkills {
+        fn get(&self, _name: &str) -> Option<SkillSpec> {
+            None
+        }
+        fn names(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_unknown_tool_blocks() {
+        let (registry, _) = echo_registry();
+        let verdict = dry_run_gate(
+            &registry,
+            ToolTrustTier::SystemControl,
+            &AllowAllPolicy,
+            &call("c1", "nope", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "unknown_tool");
+        assert!(verdict.would_block);
+        assert!(!verdict.approval_required);
+    }
+
+    #[tokio::test]
+    async fn dry_run_ceiling_block() {
+        let (echo, _) = EchoTool::new(ToolTrustTier::ExternalEffector);
+        let registry = registry_with(Arc::new(echo));
+        let verdict = dry_run_gate(
+            &registry,
+            ToolTrustTier::Observational,
+            &AllowAllPolicy,
+            &call("c1", "echo", serde_json::json!({"message": "hi"})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "trust_blocked");
+        assert!(verdict.would_block);
+        assert!(!verdict.approval_required);
+    }
+
+    #[tokio::test]
+    async fn dry_run_policy_deny() {
+        let (registry, _) = echo_registry();
+        let policy = RecordingPolicy::new(&[("echo", PolicyVerdict::Deny)]);
+        let verdict = dry_run_gate(
+            &registry,
+            ToolTrustTier::SystemControl,
+            policy.as_ref(),
+            &call("c1", "echo", serde_json::json!({"message": "hi"})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "policy_denied");
+        assert!(verdict.would_block);
+        assert!(!verdict.approval_required);
+        assert_eq!(verdict.reasons, vec!["test deny echo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dry_run_allow_observational() {
+        let (registry, _) = echo_registry();
+        let verdict = dry_run_gate(
+            &registry,
+            ToolTrustTier::SystemControl,
+            &AllowAllPolicy,
+            &call("c1", "echo", serde_json::json!({"message": "hi"})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allowed");
+        assert!(!verdict.would_block);
+        assert!(!verdict.approval_required);
+        // No primary key → extract_target falls back to the compact-JSON form.
+        assert_eq!(verdict.target, r#"{"message":"hi"}"#);
+    }
+
+    #[tokio::test]
+    async fn dry_run_escalate_is_not_drift() {
+        let (registry, _) = echo_registry();
+        let policy = RecordingPolicy::new(&[("echo", PolicyVerdict::Escalate)]);
+        let verdict = dry_run_gate(
+            &registry,
+            ToolTrustTier::SystemControl,
+            policy.as_ref(),
+            &call("c1", "echo", serde_json::json!({"message": "hi"})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allowed");
+        assert!(!verdict.would_block, "escalation is not drift");
+        assert!(verdict.approval_required);
+        assert_eq!(verdict.reasons, vec!["test escalate echo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dry_run_external_effector_requires_approval() {
+        let (echo, _) = EchoTool::new(ToolTrustTier::ExternalEffector);
+        let registry = registry_with(Arc::new(echo));
+        let verdict = dry_run_gate(
+            &registry,
+            ToolTrustTier::ExternalEffector,
+            &AllowAllPolicy,
+            &call("c1", "echo", serde_json::json!({"message": "hi"})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allowed");
+        assert!(!verdict.would_block);
+        assert!(verdict.approval_required);
+    }
+
+    #[tokio::test]
+    async fn dry_run_use_skill_judges_the_skill_name() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(UseSkillTool::new(Arc::new(EmptySkills))));
+        let policy = RecordingPolicy::new(&[("use_skill", PolicyVerdict::Allow)]);
+        let verdict = dry_run_gate(
+            &registry,
+            ToolTrustTier::SystemControl,
+            policy.as_ref(),
+            &call("c1", USE_SKILL, serde_json::json!({"skill_name": "greet"})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allowed");
+        assert_eq!(verdict.target, "greet");
+        assert_eq!(
+            policy.seen(),
+            vec![("use_skill".to_string(), "greet".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_never_emits_events_or_asks_approval() {
+        let (echo, _) = EchoTool::new(ToolTrustTier::ExternalEffector);
+        let registry = registry_with(Arc::new(echo));
+        let gate = RecordingGate::new(false);
+        let sink = Arc::new(InMemoryEventSink::new());
+        let _agent = Agent::new(
+            ScriptedProvider::new(),
+            registry.clone(),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(gate.clone())
+        .with_events(sink.clone());
+
+        let verdict = dry_run_gate(
+            &registry,
+            ToolTrustTier::ExternalEffector,
+            &AllowAllPolicy,
+            &call("c1", "echo", serde_json::json!({"message": "hi"})),
+        )
+        .await;
+        assert!(verdict.approval_required, "the live chain would ask");
+        assert!(gate.requests().is_empty(), "the dry run never asks approval");
+        assert!(
+            sink.snapshot()
+                .iter()
+                .all(|e| !matches!(e, AgentEvent::ApprovalRequested { .. })),
+            "the dry run never emits approval events"
+        );
     }
 }

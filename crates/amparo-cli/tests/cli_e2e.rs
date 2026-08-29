@@ -976,3 +976,652 @@ async fn skill_propose_distills_recurring_verified_sequences() {
 
     restore_workspace_env(prior);
 }
+
+// ── Skills (M6d): metrics and retirement ─────────────────────────────────────
+
+/// One `use_skill` call in a hand-seeded record.
+fn seed_use(call_id: &str, target: &str, decision: &str) -> Value {
+    json!({
+        "call_id": call_id,
+        "tool_name": "use_skill",
+        "target": target,
+        "decision": decision,
+        "reasons": [],
+        "escalated": false,
+        "approved": null,
+        "success": true,
+        "summary": null,
+        "duration_ms": 1
+    })
+}
+
+/// One expanded skill step attributed to the use call.
+fn seed_step(call_id: &str, tool: &str) -> Value {
+    json!({
+        "call_id": call_id,
+        "tool_name": tool,
+        "target": "",
+        "decision": "allowed",
+        "reasons": [],
+        "escalated": false,
+        "approved": null,
+        "success": true,
+        "summary": null,
+        "duration_ms": 1
+    })
+}
+
+/// Hand-write `records.jsonl` (MemoryEntry wrappers, the `read_uses`
+/// double-parse shape): three `e2e-greet` uses — one VERIFIED, two not —
+/// one with the legacy compact-JSON target. Callers hold `LOCK` and have
+/// adopted the skill.
+fn seed_use_records() {
+    let record = |started_at: &str,
+                  calls: Vec<Value>,
+                  status: &str,
+                  verification: Option<&str>| -> Value {
+        json!({
+            "version": 1,
+            "tenant_id": "cli",
+            "started_at": started_at,
+            "duration_ms": 10,
+            "task_text": "use the e2e skill",
+            "tool_sequence_hash": "seeded",
+            "tool_calls": calls,
+            "verification": verification.map(|d| json!({"decision": d, "feedback": null})),
+            "status": status,
+            "final_answer": null,
+            "token_cost_estimate": 1
+        })
+    };
+    let rows = [
+        record(
+            "2026-08-29T00:00:01Z",
+            vec![
+                seed_use("call_1", "e2e-greet", "allowed"),
+                seed_step("call_1-step-0", "write_file"),
+                seed_step("call_1-step-1", "read_file"),
+            ],
+            "complete",
+            Some("complete"),
+        ),
+        // The legacy compact-JSON target is still attributed to the skill.
+        record(
+            "2026-08-29T00:00:02Z",
+            vec![
+                seed_use(
+                    "call_2",
+                    &json!({"skill_name": "e2e-greet"}).to_string(),
+                    "allowed",
+                ),
+                seed_step("call_2-step-0", "write_file"),
+            ],
+            "complete",
+            Some("incomplete"),
+        ),
+        record(
+            "2026-08-29T00:00:03Z",
+            vec![seed_use("call_3", "e2e-greet", "allowed")],
+            "failed",
+            None,
+        ),
+    ];
+    let path = workspace().join(".amparo/notebook/records.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut text = String::new();
+    for row in rows {
+        text.push_str(
+            &serde_json::to_string(&json!({"content": row.to_string()})).expect("wrap record"),
+        );
+        text.push('\n');
+    }
+    std::fs::write(path, text).expect("write records");
+}
+
+#[tokio::test]
+async fn skill_retire_refuses_unknown() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    let out = run_with(&["skill", "retire", "no-such-skill"]).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("is not currently adopted"),
+        "{}",
+        stderr(&out)
+    );
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_retire_writes_event_list_hides_show_keeps_history() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    let out = run_with(&["skill", "retire", "e2e-greet"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains("[skills] retired e2e-greet for tenant cli: operator retired"),
+        "{err}"
+    );
+
+    // The audit log keeps both events; the last one retires.
+    let log = workspace().join(".amparo/skills/adopted.jsonl");
+    let text = std::fs::read_to_string(&log).expect("audit log exists");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "adopt + retire: {text}");
+    let row: Value = serde_json::from_str(lines[1]).expect("retire row is JSON");
+    assert_eq!(row["event"], "retire");
+    assert_eq!(row["name"], "e2e-greet");
+    assert_eq!(row["reason"], "operator retired");
+
+    // list hides the retired skill…
+    let out = run_with(&["skill", "list"]).await;
+    let out_stdout = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        !out_stdout.contains("e2e-greet"),
+        "retired skills leave the list: {out_stdout}"
+    );
+
+    // …but show keeps the full history (retirement never deletes).
+    let out = run_with(&["skill", "show", "e2e-greet"]).await;
+    let out_stdout = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        out_stdout.contains("status: retired (operator retired,"),
+        "{out_stdout}"
+    );
+    assert!(out_stdout.contains("retirement history:"), "{out_stdout}");
+    assert!(out_stdout.contains("operator retired"), "{out_stdout}");
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_check_dry_run_writes_nothing() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    // No policy flags → DenyAll: drift fires, but --dry-run reports only.
+    let out = run_with(&["skill", "check", "--dry-run"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("retired e2e-greet for tenant cli"), "{err}");
+    assert!(err.contains("(dry-run — nothing written)"), "{err}");
+
+    let log = workspace().join(".amparo/skills/adopted.jsonl");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().lines().count(),
+        1,
+        "no retire event was written"
+    );
+    assert!(
+        !workspace().join(".amparo/skills/rechecks.jsonl").exists(),
+        "no recheck row was written"
+    );
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_check_retires_on_performance() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    seed_use_records();
+
+    // 1 VERIFIED of 3 uses → 33% < 0.5, over the window with the 3-use
+    // floor met → retires.
+    let out = run_with(&["skill", "check", "--allow-all"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains(
+            "[skills] retired e2e-greet for tenant cli: performance: VERIFIED rate 33% (1/3) over the last 3 uses"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("[skills] checked 1 skill(s) for tenant cli, 1 retired"),
+        "{err}"
+    );
+
+    // A Retired recheck row and a retire event both landed.
+    let rechecks = std::fs::read_to_string(workspace().join(".amparo/skills/rechecks.jsonl"))
+        .expect("recheck row written");
+    let row: Value = serde_json::from_str(rechecks.lines().next().unwrap()).unwrap();
+    assert_eq!(row["kind"], "performance");
+    assert_eq!(row["outcome"], "retired");
+    let log = std::fs::read_to_string(workspace().join(".amparo/skills/adopted.jsonl")).unwrap();
+    let row: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(row["event"], "retire");
+
+    // list hides; show carries the metrics and re-check history.
+    let out = run_with(&["skill", "list"]).await;
+    assert!(!stdout(&out).contains("e2e-greet"), "{}", stdout(&out));
+    let out = run_with(&["skill", "show", "e2e-greet"]).await;
+    let out_stdout = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(out_stdout.contains("uses: 3"), "{out_stdout}");
+    assert!(out_stdout.contains("VERIFIED rate: 33% (1/3)"), "{out_stdout}");
+    assert!(out_stdout.contains("mean steps: 1.00"), "{out_stdout}");
+    assert!(
+        out_stdout.contains("last policy re-check: "),
+        "{out_stdout}"
+    );
+    assert!(out_stdout.contains("(performance, retired)"), "{out_stdout}");
+    assert!(out_stdout.contains("retirement history:"), "{out_stdout}");
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_check_allow_all_with_no_records_is_ok() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    // No records → no uses → below the 3-use floor: nothing retires.
+    let out = run_with(&["skill", "check", "--allow-all"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains("[skills] e2e-greet: ok — no policy drift, performance within the threshold"),
+        "{err}"
+    );
+    assert!(
+        err.contains("[skills] checked 1 skill(s) for tenant cli, 0 retired"),
+        "{err}"
+    );
+
+    let rechecks = std::fs::read_to_string(workspace().join(".amparo/skills/rechecks.jsonl"))
+        .expect("recheck row written");
+    let row: Value = serde_json::from_str(rechecks.lines().next().unwrap()).unwrap();
+    assert_eq!(row["kind"], "performance");
+    assert_eq!(row["outcome"], "ok");
+    // The adoption stands: the log still ends with the adopt event.
+    let log = std::fs::read_to_string(workspace().join(".amparo/skills/adopted.jsonl")).unwrap();
+    let row: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    assert_eq!(row["event"], "adopt");
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_check_drift_retires_under_deny_all() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    // No policy flags → DenyAll: the step plan would no longer pass.
+    let out = run_with(&["skill", "check"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains(
+            "[skills] retired e2e-greet for tenant cli: policy drift: step 1 (write_file) would be blocked"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("no policy configured"),
+        "the reason names the config gap: {err}"
+    );
+
+    let log = std::fs::read_to_string(workspace().join(".amparo/skills/adopted.jsonl")).unwrap();
+    let row: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(row["event"], "retire");
+    let rechecks = std::fs::read_to_string(workspace().join(".amparo/skills/rechecks.jsonl"))
+        .expect("recheck row written");
+    let row: Value = serde_json::from_str(rechecks.lines().next().unwrap()).unwrap();
+    assert_eq!(row["kind"], "drift");
+    assert_eq!(row["outcome"], "retired");
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn run_growth_retires_a_drifted_skill_before_registration() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    // The task runs without --allow-all: DenyAll policy → the startup
+    // drift check retires the skill before use_skill is ever registered.
+    let mock = MockLlm::start(vec![vec![content_frame("Nothing to do.")]]).await;
+    let (env, _p1) = mock_env(&mock).await;
+    let out = run_with(&["run", "--growth", "do something"]).await;
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains(
+            "[growth] skill e2e-greet retired: policy drift: step 1 (write_file) would be blocked"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("[growth] skills:"), "no survivors registered: {err}");
+
+    // The retire event landed…
+    let log = std::fs::read_to_string(workspace().join(".amparo/skills/adopted.jsonl")).unwrap();
+    let row: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(row["event"], "retire");
+
+    // …and a later --allow-all task registers nothing: retirement holds.
+    let mock = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let (env, _p2) = mock_env(&mock).await;
+    let out = run_with(&["run", "--growth", "--allow-all", "do something"]).await;
+    drop(env);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        !err.contains("[growth] skills:"),
+        "the retired skill stays retired: {err}"
+    );
+    restore_workspace_env(prior);
+}
+
+// ── Notebook rollup (M6e) ────────────────────────────────────────────────────
+
+/// Seed one cold-archive row: a memory entry whose content is a run
+/// record. Callers hold `LOCK` and have cleared `.amparo`. `started_at`
+/// drives fold age and list order; `hash` is the tool-sequence hash
+/// (dedupe identity).
+fn seed_cold_row(id: &str, started_at: &str, hash: &str, task: &str) {
+    let record = json!({
+        "version": 1,
+        "tenant_id": "cli",
+        "started_at": started_at,
+        "duration_ms": 100,
+        "task_text": task,
+        "tool_sequence_hash": hash,
+        "tool_calls": [],
+        "verification": {"decision": "complete", "feedback": null},
+        "status": "complete",
+        "final_answer": "Done.",
+        "token_cost_estimate": 1,
+    });
+    let entry = json!({ "id": id, "content": record.to_string(), "created_at": started_at });
+    let path = workspace().join(".amparo/notebook/records.jsonl");
+    std::fs::create_dir_all(path.parent().expect("notebook dir")).expect("notebook dir");
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("open cold archive");
+    writeln!(file, "{entry}").expect("append cold row");
+}
+
+#[tokio::test]
+async fn notebook_help_exits_0() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["notebook", "--help"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(stdout(&out).contains("amparo notebook"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("rollup"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("--dry-run"), "{}", stdout(&out));
+}
+
+#[tokio::test]
+async fn notebook_surface_usage_errors_exit_2() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["notebook"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("missing subcommand"), "{}", stderr(&out));
+    let out = run_with(&["notebook", "bogus"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown notebook subcommand bogus"),
+        "{}",
+        stderr(&out)
+    );
+    let out = run_with(&["notebook", "promote"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("requires a record id"), "{}", stderr(&out));
+}
+
+#[tokio::test]
+async fn growth_promotes_the_cold_tail_into_hot() {
+    let _guard = LOCK.lock().await;
+    let marker = format!("amparo-cli-e2e-{}", std::process::id());
+    let mock = MockLlm::start(vec![
+        tool_call_script(&format!("echo {marker}")),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    let out = run_with(&["run", "--allow-all", "--auto-approve", "--growth", "run the echo"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+
+    let cold_path = workspace().join(".amparo/notebook/records.jsonl");
+    let cold_text = std::fs::read_to_string(&cold_path).expect("cold archive");
+    let cold_lines: Vec<&str> = cold_text.lines().collect();
+    assert_eq!(cold_lines.len(), 1, "exactly one cold record: {cold_text}");
+    let cold_entry: Value = serde_json::from_str(cold_lines[0]).expect("cold row is JSON");
+    let cold_id = cold_entry["id"].as_str().expect("cold id").to_string();
+
+    // The forced rollup promotes the tail into hot with the same id.
+    let rollup = run_with(&["notebook", "rollup"]).await;
+    let rollup_err = stderr(&rollup);
+    assert_eq!(rollup.status.code(), Some(0), "stderr: {rollup_err}");
+    assert!(
+        rollup_err.contains("[notebook] rollup: promoted 1, folded 0, kept 0 record(s) in the hot layer"),
+        "{rollup_err}"
+    );
+
+    let hot_text = std::fs::read_to_string(workspace().join(".amparo/notebook/hot.jsonl"))
+        .expect("hot layer written");
+    let hot_lines: Vec<&str> = hot_text.lines().collect();
+    assert_eq!(hot_lines.len(), 1, "exactly one hot row: {hot_text}");
+    let hot_entry: Value = serde_json::from_str(hot_lines[0]).expect("hot row is JSON");
+    assert_eq!(
+        hot_entry["id"].as_str().expect("hot id"),
+        cold_id,
+        "the hot row keeps the cold id"
+    );
+    let hot_record: Value =
+        serde_json::from_str(hot_entry["content"].as_str().expect("content")).expect("record JSON");
+    assert_eq!(hot_record["tenant_id"], "cli");
+
+    let hashes = std::fs::read_to_string(workspace().join(".amparo/notebook/hot-hashes.jsonl"))
+        .expect("hash sidecar written");
+    assert_eq!(hashes.lines().count(), 1, "one hash row: {hashes}");
+    assert!(
+        workspace().join(".amparo/notebook/rollup.json").exists(),
+        "rollup state saved"
+    );
+    // The cold archive is the record: the rollup never touches it.
+    let cold_after = std::fs::read_to_string(&cold_path).expect("cold archive still there");
+    assert_eq!(cold_after.lines().count(), 1, "cold unchanged: {cold_after}");
+
+    restore_workspace_env(prior);
+    drop(env);
+}
+
+#[tokio::test]
+async fn growth_promotion_dedupes_by_sequence_hash() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // Two different text-only tasks share the empty tool-sequence hash:
+    // the second is a dedupe duplicate of the first.
+    let out_a =
+        run_with(&["run", "--allow-all", "--auto-approve", "--growth", "first task"]).await;
+    assert_eq!(out_a.status.code(), Some(0), "stderr: {}", stderr(&out_a));
+    let out_b =
+        run_with(&["run", "--allow-all", "--auto-approve", "--growth", "second task"]).await;
+    let err_b = stderr(&out_b);
+    assert_eq!(out_b.status.code(), Some(0), "stderr: {err_b}");
+    // Run B's start promoted run A's record from the cold tail.
+    assert!(
+        err_b.contains("[growth] notebook: promoted 1 tail record(s) to the hot layer"),
+        "{err_b}"
+    );
+
+    // The forced rollup finds B a duplicate of A: one hot row for two cold.
+    let rollup = run_with(&["notebook", "rollup"]).await;
+    let rollup_err = stderr(&rollup);
+    assert_eq!(rollup.status.code(), Some(0), "stderr: {rollup_err}");
+    assert!(rollup_err.contains("promoted 0, folded 0, kept 1"), "{rollup_err}");
+    let cold = std::fs::read_to_string(workspace().join(".amparo/notebook/records.jsonl"))
+        .expect("cold archive");
+    assert_eq!(cold.lines().count(), 2, "two cold records: {cold}");
+    let hot = std::fs::read_to_string(workspace().join(".amparo/notebook/hot.jsonl"))
+        .expect("hot layer");
+    assert_eq!(hot.lines().count(), 1, "one deduped hot row: {hot}");
+    let hashes = std::fs::read_to_string(workspace().join(".amparo/notebook/hot-hashes.jsonl"))
+        .expect("hash sidecar");
+    assert_eq!(hashes.lines().count(), 1, "one hash row: {hashes}");
+
+    restore_workspace_env(prior);
+    drop(env);
+}
+
+#[tokio::test]
+async fn notebook_promote_keeps_a_case_through_fold() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // Two old records with the same (empty) tool-sequence hash — different
+    // text-only tasks of the same shape. Old enough that the 90-day fold
+    // would drop them (today is 2026-08-29).
+    seed_cold_row("rec-a", "2026-01-01T00:00:00Z", "empty", "first old task");
+    seed_cold_row("rec-b", "2026-01-02T00:00:00Z", "empty", "second old task");
+
+    let out = run_with(&["notebook", "promote", "rec-a"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[notebook] promoted rec-a to the hot layer"), "{err}");
+
+    // The forced rollup folds old rows — the promoted one is exempt, and
+    // its hash row already represents the duplicate, so hot keeps only the
+    // promoted row.
+    let rollup = run_with(&["notebook", "rollup"]).await;
+    let rollup_err = stderr(&rollup);
+    assert_eq!(rollup.status.code(), Some(0), "stderr: {rollup_err}");
+    assert!(rollup_err.contains("promoted 0, folded 0, kept 1"), "{rollup_err}");
+    let hot = std::fs::read_to_string(workspace().join(".amparo/notebook/hot.jsonl"))
+        .expect("hot layer");
+    let rows: Vec<&str> = hot.lines().collect();
+    assert_eq!(rows.len(), 1, "only the promoted row survives: {hot}");
+    let entry: Value = serde_json::from_str(rows[0]).expect("hot row is JSON");
+    assert_eq!(entry["id"], "rec-a", "the fold-exempt promoted row: {hot}");
+
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn notebook_promote_already_promoted_exits_0() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+    seed_cold_row("rec-a", "2026-08-01T00:00:00Z", "hash-a", "a task");
+
+    let out = run_with(&["notebook", "promote", "rec-a"]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let out = run_with(&["notebook", "promote", "rec-a"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "idempotent promotion exits 0: {err}");
+    assert!(
+        err.contains("[notebook] rec-a is already promoted to the hot layer"),
+        "{err}"
+    );
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn notebook_promote_unknown_id_exits_1() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+    seed_cold_row("rec-a", "2026-08-01T00:00:00Z", "hash-a", "a task");
+
+    let out = run_with(&["notebook", "promote", "rec-404"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "unknown id is a runtime failure: {err}");
+    assert!(err.contains("unknown record id rec-404"), "{err}");
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn notebook_rollup_dry_run_writes_nothing() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+    seed_cold_row("rec-a", "2026-08-01T00:00:00Z", "hash-a", "a task");
+
+    let out = run_with(&["notebook", "rollup", "--dry-run"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains(
+            "[notebook] rollup: promoted 1, folded 0, kept 0 record(s) in the hot layer \
+             (dry-run — nothing written)"
+        ),
+        "{err}"
+    );
+    assert!(
+        !workspace().join(".amparo/notebook/hot.jsonl").exists(),
+        "dry-run writes no hot rows"
+    );
+    assert!(
+        !workspace().join(".amparo/notebook/hot-hashes.jsonl").exists(),
+        "dry-run writes no hash rows"
+    );
+    assert!(
+        !workspace().join(".amparo/notebook/rollup.json").exists(),
+        "dry-run writes no state"
+    );
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn notebook_list_shows_records_with_promotion_state() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+    seed_cold_row("rec-old", "2026-08-01T00:00:00Z", "hash-old", "older task");
+    seed_cold_row("rec-new", "2026-08-02T00:00:00Z", "hash-new", "newer task");
+
+    let out = run_with(&["notebook", "promote", "rec-new"]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+
+    let out = run_with(&["notebook", "list"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let out_stdout = stdout(&out);
+    let lines: Vec<&str> = out_stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "two listed records: {out_stdout}");
+    assert!(
+        lines[0].starts_with("rec-new") && lines[0].contains("  [promoted]"),
+        "newest first, promoted flagged: {out_stdout}"
+    );
+    assert!(lines[0].contains("complete/complete"), "{}", out_stdout);
+    assert!(lines[0].contains("newer task"), "{}", out_stdout);
+    assert!(lines[1].starts_with("rec-old"), "{out_stdout}");
+    assert!(!lines[1].contains("[promoted]"), "{out_stdout}");
+
+    // An unknown tenant lists nothing, quietly.
+    let out = run_with(&["notebook", "list", "--tenant", "nobody"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    assert!(err.contains("no records for tenant nobody"), "{err}");
+    restore_workspace_env(prior);
+}

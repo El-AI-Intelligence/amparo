@@ -20,7 +20,7 @@ use amparo_chat::telegram::TelegramTransport;
 use amparo_chat::transport::{
     ApprovalButtonPress, ChatError, ChatRef, ChatTransport, PressOutcome,
 };
-use amparo_notebook::{AdoptRecord, JsonlStore, append_adopt};
+use amparo_notebook::{JsonlStore, SkillLogEvent, append_event};
 use amparo_policy::AllowAllPolicyEngine;
 use amparo_tools::{MemoryEntry, SkillOrigin, SkillSpec, SkillStep, ToolTrustTier};
 use serde_json::{json, Value};
@@ -467,15 +467,14 @@ async fn growth_executes_an_adopted_skill_for_the_telegram_tenant() {
         source_run_ids: vec![],
         adopted_at: None,
     };
-    append_adopt(
+    append_event(
         &root.join(".amparo/skills/adopted.jsonl"),
-        &AdoptRecord {
-            event: "adopt".into(),
-            tenant_id: "telegram:111".into(),
-            name: "demo-skill".into(),
+        &SkillLogEvent::adopt(
+            "telegram:111",
+            "demo-skill",
             spec,
-            adopted_at: "2026-08-29T00:00:00Z".into(),
-        },
+            "2026-08-29T00:00:00Z",
+        ),
     )
     .expect("the seed adoption writes");
     std::fs::create_dir_all(root.join(".amparo/notebook")).unwrap();

@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M6 in progress — M6a (lab notebook) + M6b (case library) + M6c (gated skills) landed
+## Status: pre-alpha, M6 in progress — M6a (lab notebook) + M6b (case library) + M6c (gated skills) + M6d (metrics and retirement) + M6e (rollup and archival) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -207,6 +207,40 @@ never grant its steps an exemption. Skills live under
 not registered at all. Growth is write + read + act — still one opt-in,
 still off by default.
 
+Adopted skills are falsifiable instruments (M6d): every use, VERIFIED
+rate, mean steps and per-step denial is derived from the run records, and
+a skill that no longer holds retires — disabled with notification, never
+deleted. Two automatic events retire: **policy drift** (a dry-run of the
+step plan through the gate chain — no execution, no approval — would now
+deny a step it previously allowed), re-checked at every `--growth` task
+start with the task's own policy, ceiling and registry; and
+**performance** (VERIFIED rate below 50% over the last 20 uses, with a
+3-use floor so a young skill is never retired early). `amparo skill
+check` runs both on demand (cron-able — exit 0 even when retirements
+fire; `--dry-run` reports without writing; `--min-verified-rate` /
+`--window` / `--trust-ceiling` override the defaults), `amparo skill
+retire <name> [--reason ...]` is the operator lever, `list` shows a
+metrics tail and `show` keeps the full metrics, re-check and retirement
+history — retired skills stay inspectable forever.
+
+The lab notebook has a hot layer over the cold archive (M6e). The cold
+archive (`records.jsonl`) keeps the full record of every `--growth`
+task, untouched. The hot layer — the informative subset the case
+library actually reads — lives beside it under
+`<workspace>/.amparo/notebook/`: `hot.jsonl` (same record ids and
+timestamps as the cold archive, content capped at `--max-bytes`,
+default 4096), `hot-hashes.jsonl` (the dedupe index), `rollup.json`
+(the promotion offset and last-fold stamp), `promoted.jsonl`
+(operator promotions) and `rollup.lock`. Every `--growth` task start
+promotes the cold tail into the hot layer — records with a gate event
+of interest (approval, denial, escalation) or a tool sequence not seen
+before — and folds it daily (rows older than 90 days fold into the
+cold archive; operator-promoted rows are exempt). The operator's
+levers: `amparo notebook list|promote|rollup` — `promote` pins one
+record into the hot layer, `rollup` forces promote + fold on demand
+(cron-able, exit 0; `--dry-run` writes nothing). The cold archive is
+never modified by any of this — it is the record, not a cache.
+
 ## What Amparo is meant to be
 
 An agent that runs a real tool-use loop — shell, files, git, web, tests — where
@@ -244,7 +278,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 3 | Install path + release — the `amparo` CLI drives the loop end-to-end (headless: no screen/desktop tools in the registry) | ✅ done |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | ✅ done — all three behind one transport seam, inline-button approval |
 | 5 | Multi-tenant identity and per-user policy | ✅ done — TOML tenant directory, per-user ceilings/workspaces, attributed approvals |
-| 6 | Controlled self-improvement | 🚧 in progress — M6a + M6b + M6c landed: the lab notebook (`--growth`, PII-stripped run records), the verification case library (same-tenant evidence in the verification prompt only), and gated skills (adopted procedures executed step-by-step through the gate chain) |
+| 6 | Controlled self-improvement | 🚧 in progress — M6a + M6b + M6c + M6d + M6e landed: the lab notebook (`--growth`, PII-stripped run records), the verification case library (same-tenant evidence in the verification prompt only), gated skills (adopted procedures executed step-by-step through the gate chain), metrics + retirement (running per-skill records, startup drift re-checks, `amparo skill check|retire`), and rollup + archival (the hot layer over the cold archive, `amparo notebook list|promote|rollup`) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant

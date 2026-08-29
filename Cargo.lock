@@ -40,6 +40,7 @@ dependencies = [
  "amparo-tools",
  "async-trait",
  "bytes",
+ "chrono",
  "futures-util",
  "reqwest",
  "serde",
@@ -114,6 +115,7 @@ name = "amparo-notebook"
 version = "0.3.0"
 dependencies = [
  "amparo-agent",
+ "amparo-policy",
  "amparo-privacy",
  "amparo-tools",
  "async-trait",

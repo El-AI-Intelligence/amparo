@@ -66,7 +66,8 @@ pub mod events;
 mod sse;
 
 pub use agent::{
-    extract_target, Agent, AgentConfig, AgentReport, AgentStep, TaskStatus, Verification,
+    dry_run_gate, extract_target, Agent, AgentConfig, AgentReport, AgentStep, DryRunVerdict,
+    TaskStatus, Verification,
 };
 pub use approval::{ApprovalGate, ApprovalRequest, AutoApprove, AutoDeny};
 pub use cases::{evidence_section, CaseLibrary, EvidenceCase};

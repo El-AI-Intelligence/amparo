@@ -1,12 +1,14 @@
 //! Skills storage — the adopted-skill log and the distillation proposer
-//! (M6c).
+//! (M6c + M6d).
 //!
 //! [`SkillSet`] is the notebook's implementation of
 //! [`amparo_tools::SkillLibrary`]: it loads a tenant's adopted skills from
-//! the append-only `adopted.jsonl` log (last event per name wins, I4-style
-//! audit semantics). [`Proposer`] distills *candidate* skills from the run
-//! records — recurring, high-VERIFIED tool sequences, written as **inert**
-//! proposals that never become executable on their own.
+//! the append-only `adopted.jsonl` log (last event per (tenant, name) wins
+//! across `adopt`/`retire` kinds, I4-style audit semantics — retirement
+//! disables, it never deletes history). [`Proposer`] distills *candidate*
+//! skills from the run records — recurring, high-VERIFIED tool sequences,
+//! written as **inert** proposals that never become executable on their
+//! own.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -29,29 +31,38 @@ const NAME_CAP: usize = 40;
 
 /// A tenant's adopted skills, loaded from the adoption log.
 ///
-/// Loading folds the append-only log: the last `adopt` event per (tenant,
-/// name) wins, unparseable lines are skipped, and a missing file yields an
-/// empty set — the same tolerance as [`crate::JsonlStore`]. Loading is
-/// O(file); fine at M6c scale (M6e adds the index layer).
+/// Loading folds the append-only log: the last event per (tenant, name)
+/// wins across kinds — an `adopt` inserts its spec, a `retire` removes the
+/// skill. Unparseable lines are skipped, and a missing file yields an empty
+/// set — the same tolerance as [`crate::JsonlStore`]. Loading is O(file);
+/// fine at M6d scale (M6e adds the index layer).
 #[derive(Clone, Default)]
 pub struct SkillSet {
     skills: HashMap<String, SkillSpec>,
 }
 
 impl SkillSet {
-    /// Load `tenant_id`'s adopted skills from `path` (an `AdoptRecord` JSONL
-    /// file). A missing file is an empty set, not an error.
+    /// Load `tenant_id`'s adopted skills from `path` (a [`SkillLogEvent`]
+    /// JSONL file). A missing file is an empty set, not an error.
     pub fn load(path: &Path, tenant_id: &str) -> Self {
         let mut set = Self::default();
         let Ok(text) = std::fs::read_to_string(path) else {
             return set;
         };
         for line in text.lines() {
-            let Ok(record) = serde_json::from_str::<AdoptRecord>(line) else {
+            let Ok(event) = serde_json::from_str::<SkillLogEvent>(line) else {
                 continue;
             };
-            if record.event == "adopt" && record.tenant_id == tenant_id {
-                set.skills.insert(record.spec.name.clone(), record.spec);
+            if event.tenant_id() != tenant_id {
+                continue;
+            }
+            match event {
+                SkillLogEvent::Adopt { spec, .. } => {
+                    set.skills.insert(spec.name.clone(), spec);
+                }
+                SkillLogEvent::Retire { name, .. } => {
+                    set.skills.remove(&name);
+                }
             }
         }
         set
@@ -79,34 +90,97 @@ impl SkillLibrary for SkillSet {
 
 // ─────────────────────────────────────────────── Adoption log ────────────────
 
-/// One adoption-log event. `event` is `"adopt"` today; `"retire"` is
-/// reserved for M6d. The log is append-only — adopting a skill again with a
-/// new spec is a new event, and the last one wins (the audit trail keeps
-/// every row).
+/// One skill-log event. The log is append-only — adopting a skill again
+/// with a new spec is a new event, and the last event per (tenant, name)
+/// wins **across kinds** (the audit trail keeps every row, I4). The serde
+/// tag is `event`: `adopt` | `retire`.
+///
+/// The `Adopt` variant declares its fields in the M6c `AdoptRecord` order,
+/// so rows written before M6d stay byte-identical.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct AdoptRecord {
-    /// The event kind — `"adopt"`.
-    pub event: String,
-    /// The tenant the skill was adopted for (I2).
-    pub tenant_id: String,
-    /// The skill's name (redundant with `spec.name`; the log key).
-    pub name: String,
-    /// The full adopted spec, including the step plan as approved.
-    pub spec: SkillSpec,
-    /// RFC 3339 adoption timestamp.
-    pub adopted_at: String,
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum SkillLogEvent {
+    /// A skill was adopted.
+    Adopt {
+        /// The tenant the skill was adopted for (I2).
+        tenant_id: String,
+        /// The skill's name (redundant with `spec.name`; the log key).
+        name: String,
+        /// The full adopted spec, including the step plan as approved.
+        spec: SkillSpec,
+        /// RFC 3339 adoption timestamp.
+        adopted_at: String,
+    },
+    /// A skill was retired (M6d) — disabled, never deleted.
+    Retire {
+        /// The tenant the skill was retired for (I2).
+        tenant_id: String,
+        /// The skill's name.
+        name: String,
+        /// RFC 3339 retirement timestamp.
+        retired_at: String,
+        /// Why it retired: a policy-drift or performance reason, or the
+        /// operator's own.
+        reason: String,
+    },
 }
 
-/// Append one adoption event to the log, creating parent directories as
-/// needed and flushing before returning (the adoption record is the audit
-/// row, I4 — it must survive process exit).
-pub fn append_adopt(path: &Path, record: &AdoptRecord) -> Result<(), String> {
-    append_line(path, record)
+impl SkillLogEvent {
+    /// Build an [`SkillLogEvent::Adopt`] event.
+    pub fn adopt(
+        tenant_id: impl Into<String>,
+        name: impl Into<String>,
+        spec: SkillSpec,
+        adopted_at: impl Into<String>,
+    ) -> Self {
+        Self::Adopt {
+            tenant_id: tenant_id.into(),
+            name: name.into(),
+            spec,
+            adopted_at: adopted_at.into(),
+        }
+    }
+
+    /// Build a [`SkillLogEvent::Retire`] event.
+    pub fn retire(
+        tenant_id: impl Into<String>,
+        name: impl Into<String>,
+        retired_at: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::Retire {
+            tenant_id: tenant_id.into(),
+            name: name.into(),
+            retired_at: retired_at.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// The event's tenant id (I2).
+    pub fn tenant_id(&self) -> &str {
+        match self {
+            Self::Adopt { tenant_id, .. } | Self::Retire { tenant_id, .. } => tenant_id,
+        }
+    }
+
+    /// The event's skill name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Adopt { name, .. } | Self::Retire { name, .. } => name,
+        }
+    }
 }
 
-/// Read every adoption event from the log (unparseable lines skipped) — for
-/// the CLI's `list`/`show`. Callers fold to get the effective set.
-pub fn read_adoptions(path: &Path) -> Vec<AdoptRecord> {
+/// Append one skill-log event to the log, creating parent directories as
+/// needed and flushing before returning (every row is an audit row, I4 —
+/// it must survive process exit).
+pub fn append_event(path: &Path, event: &SkillLogEvent) -> Result<(), String> {
+    append_line(path, event)
+}
+
+/// Read every skill-log event from the log (unparseable lines skipped) —
+/// for the CLI's `list`/`show`. Callers fold to get the effective set.
+pub fn read_log(path: &Path) -> Vec<SkillLogEvent> {
     read_lines(path, |line| serde_json::from_str(line).ok())
 }
 
@@ -300,12 +374,12 @@ pub fn append_proposals(path: &Path, proposals: &[ProposalRecord]) -> Result<usi
 // ─────────────────────────────────────────────── File helpers ────────────────
 
 /// Append one JSON line to `path`, creating parent directories and
-/// flushing. Shared by the adoption and proposal logs (both are audit
-/// rows).
-fn append_line<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+/// flushing. Shared by the skill, proposal and re-check logs (all are
+/// audit rows) and the notebook rollup sidecars.
+pub(crate) fn append_line<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
-        .map_err(|e| format!("cannot create skills directory {}: {e}", parent.display()))?;
+        .map_err(|e| format!("cannot create directory {}: {e}", parent.display()))?;
     let line = serde_json::to_string(value).map_err(|e| e.to_string())?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -319,7 +393,7 @@ fn append_line<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 
 /// Parse every line of a JSONL file with `parse`, skipping unparseable
 /// lines; a missing file yields an empty vector.
-fn read_lines<T>(path: &Path, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
+pub(crate) fn read_lines<T>(path: &Path, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -338,6 +412,7 @@ mod tests {
     use super::*;
     use crate::{ToolStep, VerificationRecord};
     use amparo_tools::{SkillOrigin, SkillStep};
+    use std::io::Write;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("amparo-skills-{}-{name}", std::process::id()))
@@ -359,30 +434,54 @@ mod tests {
         }
     }
 
-    fn adopt_record(tenant: &str, name: &str) -> AdoptRecord {
-        AdoptRecord {
-            event: "adopt".to_string(),
-            tenant_id: tenant.to_string(),
-            name: name.to_string(),
-            spec: spec(name),
-            adopted_at: "2026-08-29T00:00:00Z".to_string(),
-        }
+    fn adopt_record(tenant: &str, name: &str) -> SkillLogEvent {
+        SkillLogEvent::adopt(tenant, name, spec(name), "2026-08-29T00:00:00Z")
+    }
+
+    #[test]
+    fn adopt_rows_keep_the_m6c_wire_shape() {
+        // The internally-tagged enum must serialize the M6c `AdoptRecord`
+        // shape exactly — rows written before M6d parse with no change.
+        let spec = spec("alpha");
+        let event =
+            SkillLogEvent::adopt("cli", "alpha", spec.clone(), "2026-08-29T00:00:00Z");
+        let line = serde_json::to_string(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["event"], "adopt");
+        assert_eq!(value["tenant_id"], "cli");
+        assert_eq!(value["name"], "alpha");
+        assert_eq!(value["adopted_at"], "2026-08-29T00:00:00Z");
+        assert_eq!(value["spec"], serde_json::to_value(&spec).unwrap());
+        // And the same bytes deserialize back into the event.
+        assert_eq!(serde_json::from_str::<SkillLogEvent>(&line).unwrap(), event);
     }
 
     #[test]
     fn load_folds_last_event_wins_and_skips_garbage() {
         let path = temp_path("fold.jsonl");
         std::fs::write(&path, "").unwrap();
-        append_adopt(&path, &adopt_record("cli", "alpha")).unwrap();
+        append_event(&path, &adopt_record("cli", "alpha")).unwrap();
         // Garbage line — skipped, not fatal.
         std::fs::OpenOptions::new().append(true).open(&path).unwrap()
             .write_all(b"not json\n").unwrap();
         // A second adoption of alpha (new spec) — the last one wins.
-        let mut updated = adopt_record("cli", "alpha");
-        updated.spec.description = "revised".to_string();
-        append_adopt(&path, &updated).unwrap();
+        let SkillLogEvent::Adopt {
+            mut spec,
+            tenant_id,
+            name,
+            adopted_at,
+        } = adopt_record("cli", "alpha")
+        else {
+            unreachable!()
+        };
+        spec.description = "revised".to_string();
+        append_event(
+            &path,
+            &SkillLogEvent::Adopt { tenant_id, name, spec, adopted_at },
+        )
+        .unwrap();
         // Another tenant's adoption is invisible to cli.
-        append_adopt(&path, &adopt_record("telegram:111", "beta")).unwrap();
+        append_event(&path, &adopt_record("telegram:111", "beta")).unwrap();
 
         let set = SkillSet::load(&path, "cli");
         assert_eq!(set.names(), vec!["alpha".to_string()]);
@@ -400,15 +499,53 @@ mod tests {
     }
 
     #[test]
-    fn read_adoptions_returns_the_full_log_in_order() {
+    fn fold_retires_remove_and_readoption_wins_again() {
+        let path = temp_path("retire.jsonl");
+        std::fs::write(&path, "").unwrap();
+        append_event(&path, &adopt_record("cli", "alpha")).unwrap();
+        append_event(&path, &adopt_record("cli", "beta")).unwrap();
+        append_event(
+            &path,
+            &SkillLogEvent::retire("cli", "alpha", "2026-08-29T01:00:00Z", "performance"),
+        )
+        .unwrap();
+        // Another tenant's retirement is invisible to cli.
+        append_event(
+            &path,
+            &SkillLogEvent::retire("telegram:111", "beta", "2026-08-29T01:00:00Z", "drift"),
+        )
+        .unwrap();
+
+        let set = SkillSet::load(&path, "cli");
+        assert_eq!(set.names(), vec!["beta".to_string()]);
+
+        // Re-adoption after retirement wins again (last event per name).
+        append_event(&path, &adopt_record("cli", "alpha")).unwrap();
+        let set = SkillSet::load(&path, "cli");
+        let mut names = set.names();
+        names.sort();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_log_returns_events_in_order() {
         let path = temp_path("read.jsonl");
         std::fs::write(&path, "").unwrap();
-        append_adopt(&path, &adopt_record("cli", "alpha")).unwrap();
-        append_adopt(&path, &adopt_record("cli", "beta")).unwrap();
-        let records = read_adoptions(&path);
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].name, "alpha");
-        assert_eq!(records[1].name, "beta");
+        append_event(&path, &adopt_record("cli", "alpha")).unwrap();
+        append_event(&path, &adopt_record("cli", "beta")).unwrap();
+        append_event(
+            &path,
+            &SkillLogEvent::retire("cli", "alpha", "2026-08-29T01:00:00Z", "operator retired"),
+        )
+        .unwrap();
+        let events = read_log(&path);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], SkillLogEvent::Adopt { .. }));
+        assert_eq!(events[0].name(), "alpha");
+        assert_eq!(events[1].name(), "beta");
+        assert!(matches!(&events[2], SkillLogEvent::Retire { .. }));
+        assert_eq!(events[2].name(), "alpha");
         let _ = std::fs::remove_file(&path);
     }
 

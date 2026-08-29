@@ -44,6 +44,55 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   requires `--growth` on `amparo run` / `amparo chat` (write + read +
   act — still off by default); without it, `use_skill` is never
   registered.
+- Skill metrics and retirement (M6d): per-skill running records derived
+  at read time from the run records — uses, VERIFIED rate, mean steps,
+  per-step gate denials, last use — with no new write path. A public
+  `dry_run_gate` in `amparo-agent` dry-runs a call through the gate
+  chain without executing or asking approval (Escalate is not drift);
+  the adoption log is now `SkillLogEvent` (`adopt`/`retire` events,
+  adopt rows byte-identical to M6c, last event per skill wins the
+  fold). Startup drift re-check at every `--growth` task start (`run` +
+  `chat`, the task's own policy engine, trust ceiling and registry) —
+  a skill whose step plan would now be denied retires before
+  registration, with a retire event and a `[growth]` notice (a write
+  failure warns, never fails the task). New `amparo skill check|retire`:
+  `check` re-runs drift then performance (VERIFIED rate below
+  `--min-verified-rate` 0.5 over the last `--window` 20 uses, 3-use
+  floor) against every adopted skill, retires by default (`--dry-run`
+  reports only), writes `rechecks.jsonl`, and exits 0 even when
+  retirements fire (cron-able); `retire <name> [--reason ...]` is the
+  operator lever and refuses unknown names. `amparo skill list` shows a
+  compact metrics tail; `show` keeps retired skills inspectable with
+  status, metrics, the last policy re-check and the full retirement
+  history. Retirement is always disable + notify, never deletion.
+- Rollup and archival (M6e): a **hot layer** over the cold archive.
+  Under `<workspace>/.amparo/notebook/`, beside the untouched
+  `records.jsonl`: `hot.jsonl` (same `MemoryEntry` shape, **same id and
+  `created_at` as the cold entry**, content = the record capped by the
+  ladder — final answer → 300 chars, per-step reasons/summaries → 120,
+  first 12 tool calls, task text → 120, then skeleton rungs — so
+  `--max-bytes` (default 4096, floor 1024) is a guarantee),
+  `hot-hashes.jsonl` (the `(tenant_id, tool_sequence_hash)` dedupe
+  index), `rollup.json` (`RollupState` — promotion offset and last-fold
+  stamp, atomic saves), `promoted.jsonl` (operator promotions) and
+  `rollup.lock` (cross-process; task-start rollups skip silently when
+  held, operator commands report busy, stale >10 min reclaimed). Every
+  `--growth` task start (`amparo run` and `amparo chat`) promotes the
+  cold tail into the hot layer — byte-offset tracked, each record
+  scanned once; the predicate: a gate event of interest (approval,
+  denial, escalation) or a tool sequence not yet represented — and
+  folds daily (24 h since the last fold; rows older than `--days`,
+  default 90, fold into the cold archive; operator-promoted rows are
+  exempt). `CaseRetriever` now reads the hot layer under `--growth`;
+  the cold archive is never modified. New `amparo notebook
+  list|promote|rollup` CLI: `list` shows the cold archive newest-first
+  with promotion state, `promote <id>` pins one record (idempotent,
+  exit 0; unknown ids exit 1), `rollup` forces promote + fold
+  (cron-able, exit 0; `--dry-run` reports the same numbers and writes
+  nothing). Sync-relay guidance documented in
+  `docs/m6-controlled-growth.md` §4.1: the relay moves the hot layer
+  and `.amparo/skills/*`; `records.jsonl` stays local and
+  authoritative.
 
 ## [0.3.0] — 2026-08-28
 

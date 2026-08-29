@@ -34,17 +34,30 @@
 
 #![warn(missing_docs)]
 
+mod metrics;
 mod record;
 mod retrieve;
+mod rollup;
 mod sink;
 mod skills;
 mod store;
 
+pub use metrics::{
+    append_recheck, check_skill_drift, read_rechecks, read_uses, retirement_reason, summarize,
+    CheckKind, CheckOutcome, CheckRecord, RetirementThreshold, SkillMetrics, SkillUse, StepOutcome,
+    RECHECKS_FILE,
+};
 pub use record::{RunRecord, ToolStep, VerificationRecord};
 pub use retrieve::CaseRetriever;
+pub use rollup::{
+    auto_rollup, hot_record, list_records, notebook_dir, promote_record, rollup, rollup_dry_run,
+    AutoReport, FoldReport, HashRow, PromoteOutcome, PromoteReport, PromotedRecord, RecordSummary,
+    RollupReport, RollupState, DEFAULT_MAX_BYTES, DEFAULT_ROLLUP_DAYS, HOT_FILE, HOT_HASHES_FILE,
+    MAX_BYTES_FLOOR, PROMOTED_FILE, ROLLUP_STATE_FILE,
+};
 pub use sink::NotebookSink;
 pub use skills::{
-    append_adopt, append_proposals, read_adoptions, skills_dir, AdoptRecord, ProposalRecord,
-    Proposer, SkillSet, ADOPTED_FILE, PROPOSALS_FILE,
+    append_event, append_proposals, read_log, skills_dir, ProposalRecord, Proposer, SkillLogEvent,
+    SkillSet, ADOPTED_FILE, PROPOSALS_FILE,
 };
 pub use store::JsonlStore;

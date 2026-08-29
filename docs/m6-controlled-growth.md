@@ -130,7 +130,12 @@ unchanged.
 > `amparo_notebook::CaseRetriever`, which enforces the same-tenant filter
 > at retrieval time over the store. The CLI and chat driver attach it
 > only under `--growth` — growth is write + read, and off by default.
-> The operator-promotion path from §3.2 remains M6e work.
+> The operator-promotion path from §3.2 is landed (M6e): `amparo
+> notebook list` shows the cold archive with promotion state, and
+> `amparo notebook promote <id>` pins one record into the hot layer —
+> the review any promoted case implies, made an explicit operator
+> action. Promoted rows are exempt from the 90-day fold, and retrieval
+> reads the hot layer (§4).
 
 ### 3.3 Gated skills — procedures as hypotheses
 
@@ -207,6 +212,23 @@ Retirement is always *disabling with notification*, never silent
 deletion. The audit log does not forget; the skill merely stops being
 available.
 
+**Landed (M6d).** Metrics are derived at read time from the run records
+— no new per-task write path: a use is a `use_skill` call in the record
+(step records attributed by synthetic call id), VERIFIED uses are runs
+whose verification completed, denials count attributed step gate
+decisions. Policy-drift re-check runs at every `--growth` task start
+(`amparo run` and `amparo chat`, using the task's own policy engine,
+trust ceiling and registry — no notebook parse) and on demand via
+`amparo skill check` (drift + performance, cron-able; `--dry-run`
+reports without writing; exit 0 even when retirements fire so a cron job
+stays green). Performance defaults: `--min-verified-rate 0.5` over
+`--window 20` uses with a 3-use floor — never retire with fewer —
+flags override on `amparo skill check`. `amparo skill retire <name>
+[--reason ...]` is the operator lever. `amparo skill list` shows a
+compact metrics tail, `amparo skill show` the full metrics and re-check
+history — and keeps showing retired skills (retirement disables; it
+never deletes). Re-check records land in `rechecks.jsonl`.
+
 ### 3.5 Namespaces
 
 Skills and cases are keyed by tenant scope, and the scope is enforced at
@@ -256,6 +278,77 @@ and teams. Everything in this design is shaped so the relay carries
 deduplicated evidence, not raw noise; a user with defaults burns roughly
 two orders of magnitude less relay traffic than the no-levers baseline,
 at no cost to completeness.
+
+**Landed (M6e).** The hot layer is implemented as files under
+`<workspace>/.amparo/notebook/`:
+
+- `hot.jsonl` — the hot layer: same `MemoryEntry` line shape as the
+  cold archive, **same id and `created_at` as the cold entry** (ids are
+  stable across layers, so promotion references work), content = the
+  record capped by the ladder below. This is what case retrieval reads;
+  the sink keeps writing the cold archive.
+- `hot-hashes.jsonl` — the dedupe sidecar: one
+  `(tenant_id, tool_sequence_hash)` row per promotion, rewritten by
+  fold to match the kept rows.
+- `rollup.json` — `RollupState { last_offset, last_fold_at,
+  updated_at }`, saved atomically (temp + rename).
+- `promoted.jsonl` — operator promotions
+  (`promoted_at, tenant_id, record_id`).
+- `rollup.lock` — a cross-process lock (CLI and chat share a
+  workspace). A task-start rollup that finds it held skips silently;
+  the operator `rollup`/`promote` commands report busy (exit 1); locks
+  stale more than 10 minutes are reclaimed (crash safety).
+
+The tail of the cold archive is promoted at every `--growth` task start
+(`amparo run` and `amparo chat`) — byte-offset tracked in `rollup.json`,
+so each record is scanned once, and the same-hash dedupe index means a
+repeated tool sequence promotes once. The promotion predicate: any
+record with a gate event of interest (an approval, a denial, an
+escalation) or whose tool-sequence hash is not yet represented. A daily
+fold (24 h since the last fold, also at task start) rewrites the hot
+layer, dropping rows older than `--days` (default 90) — except
+operator-promoted rows, which are fold-exempt. The cap ladder shrinks a
+hot copy until it fits `--max-bytes` (default 4096, floor 1024):
+final answer → 300 chars, per-step reasons/summaries → 120, first 12
+tool calls, task text → 120, then skeleton rungs (clear reasons, drop
+summaries, 6 calls, drop tool calls, drop the final answer, task text
+→ 40) — so the cap is a guarantee, not a target. The cold archive is
+never modified by any of this; `amparo notebook rollup` forces promote
++ fold on demand (cron-able, exit 0), `--dry-run` reports the same
+numbers and writes nothing.
+
+The documented lever on the defaults: a deployment that approves almost
+everything promotes nearly every record — "gate events of interest"
+fires on every approval, and dedupe never gets to skip. That is the
+spec's own rule working as written; the lever is the policy, and the
+cost is visible in the same rollup numbers.
+
+### 4.1 Sync-relay guidance
+
+For multi-device users and teams, the relay moves the **hot layer,
+never the cold archive**. The record itself stays where it was written
+— local and authoritative; the relay carries only the informative
+subset:
+
+| Move with the relay | Keep local |
+|---|---|
+| `hot.jsonl`, `hot-hashes.jsonl`, `rollup.json`, `promoted.jsonl` | `records.jsonl` — the record: authoritative, append-only |
+| `.amparo/skills/*` (adopted skills, their log, `rechecks.jsonl`) | `rollup.lock` — transient |
+
+Concretely: sync the notebook directory's four hot-layer files and
+everything under `.amparo/skills/`; leave `records.jsonl` out of the
+sync set. A device that joins mid-history gets a retrieval store at the
+next sync; a device restored from backup re-promotes its own cold tail
+into the hot layer (promotion is idempotent — hot rows keep the cold
+ids). Because promotion and fold run under `rollup.lock`, and
+`rollup.json` travels with the sync set, the worst case of a sync race
+is a redundant promotion or fold on the next task start — never a lost
+record.
+
+At defaults the relay carries ~5–7 MB/month/user (the sizing table
+above, the "with defaults" row) — about two orders of magnitude less
+than the no-levers baseline, at no cost to completeness: the cold
+archive still holds every record.
 
 ---
 
@@ -384,12 +477,29 @@ while the built-in default store stays cheap).
   `amparo run` and `amparo chat` under `--growth`. Candidate proposals
   are explicit and opt-in (`amparo skill propose`), and remain inert
   until adopted.
-- **M6d — metrics and retirement.** Per-skill counters; policy-drift
-  dry-run re-check; performance-retirement thresholds; retire = disable +
-  notify, audit record intact.
-- **M6e — rollup and archival.** Defaults from §4 (selective persistence,
-  4 KB caps, 90-day rollup to cold archive); operator promotion of
-  cases; sync-relay guidance for teams.
+- **M6d — metrics and retirement.** ✅ landed — per-skill metrics
+  derived from run records (uses, VERIFIED rate, mean steps, per-step
+  denials, last use); `dry_run_gate` in `amparo-agent` (never emits
+  events, never asks approval; Escalate is not drift); the adopt log
+  became `SkillLogEvent` (adopt/retire events, internally tagged,
+  adopt rows byte-identical to M6c); startup drift re-check at every
+  `--growth` task start (`run` + `chat`, task's own policy/ceiling/
+  registry); `amparo skill check|retire`, `--dry-run`, `--min-verified-
+  rate` / `--window` / `--trust-ceiling` flags; metrics column in
+  `list`, full metrics + re-check + retirement history in `show`;
+  `rechecks.jsonl`; retire = disable + notify, audit record intact.
+- **M6e — rollup and archival.** ✅ landed — the hot layer over the
+  cold archive: `hot.jsonl` (same id/`created_at` as the cold entry,
+  content capped), the `hot-hashes.jsonl` dedupe sidecar,
+  `rollup.json` state, `promoted.jsonl` operator promotions, and
+  `rollup.lock` guarding mutations; tail promotion at every `--growth`
+  task start (`run` + `chat`, byte-offset tracked); the auto-daily fold
+  (24 h gate, 90-day default, promoted rows exempt); `CaseRetriever`
+  switches to the hot layer under `--growth`; the cap ladder (default
+  4096 B, floor 1024, cold untouched); `amparo notebook
+  list|promote|rollup` with `--days` / `--max-bytes` / `--dry-run`;
+  sync-relay guidance (§4.1) — the relay moves the hot layer and the
+  skills, `records.jsonl` stays local and authoritative.
 
 ---
 
@@ -405,16 +515,25 @@ while the built-in default store stays cheap).
   must display the full step plan, and the per-step gate remains the
   backstop. The trust ceiling of `use_skill` itself is a config decision
   (its expansion runs at the ceiling of its steps).
-- **Storage drift.** Defaults keep the hot layer at ~5–7 MB/month/user;
-  operators can raise levers and the relay will tell them the cost.
-  Documented, not hidden.
+- **Storage drift.** **Closed (M6e):** landed as specified — defaults
+  keep the hot layer at ~5–7 MB/month/user; the levers (`--days`,
+  `--max-bytes`) are explicit and documented, the relay carries only
+  the hot layer (§4.1), and the cold archive is never modified, so
+  raising a lever moves the cost line, never the record.
 - **Verification-prompt identity.** The verification step must remain a
   standalone completion (as today); the evidence section is injected
   text, not a change to how the round runs.
-- **Open:** none for M6c. The default VERIFIED-rate *retirement*
-  threshold remains an M6d decision (it governs adoption *retirement*,
-  not candidate proposal — the proposal thresholds are the `amparo skill
-  propose` flags).
+- **Closed (M6d):** performance retirement defaults to a VERIFIED rate
+  below 0.5 over the last 20 uses with a 3-use floor, overridable via
+  `amparo skill check --min-verified-rate/--window` (locked with the
+  user, 2026-08-29). Documented edge: a no-policy task (`run --growth`
+  without `--policy-url` or `--allow-all`) retires every adopted skill
+  at startup — the DenyAll engine would block the first step, so the
+  skill is falsified under the same policy the task itself runs under;
+  the retire reason names the config gap, and recovery is configure
+  policy + re-adopt (the new Adopt event wins the fold). Startup drift
+  checks append only Retire events (no quiet recheck rows); only
+  `amparo skill check` writes `rechecks.jsonl`.
 - **Closed (M6c):** candidate proposal is an explicit operator command
   (`amparo skill propose`, defaults `--min-runs 3` / `--min-verified-rate
   0.8`) — never on by default, never auto-adopted. `use_skill` sits at
