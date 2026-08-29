@@ -63,6 +63,13 @@ pub enum AgentEvent {
         /// Whether the call may execute.
         approved: bool,
     },
+    /// PII was stripped before inference — per-category counts, never the
+    /// values themselves. Emitted only when something was found.
+    PrivacyStripped {
+        /// `(category, count)` pairs in first-seen order (`email`, `phone`,
+        /// `ssn`, `credit_card`, `password`, `address`, `medical`).
+        categories: Vec<(String, usize)>,
+    },
     /// A tool call finished executing.
     ToolExecuted {
         /// The tool's result.
@@ -210,6 +217,15 @@ pub fn format_event(event: &AgentEvent) -> String {
         AgentEvent::ApprovalResolved { approved, .. } => {
             format!("[approval] {}", if *approved { "granted" } else { "denied" })
         }
+        AgentEvent::PrivacyStripped { categories } => {
+            if categories.is_empty() {
+                "[privacy] stripped: nothing".to_string()
+            } else {
+                let parts: Vec<String> =
+                    categories.iter().map(|(c, n)| format!("{c} x{n}")).collect();
+                format!("[privacy] stripped: {}", parts.join(", "))
+            }
+        }
         AgentEvent::ToolExecuted { result } => {
             format!("[exec] {} ({}ms)", result.tool_name, result.duration_ms)
         }
@@ -333,6 +349,12 @@ mod tests {
             (
                 "[approval] granted",
                 format_event(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: true }),
+            ),
+            (
+                "[privacy] stripped:",
+                format_event(&AgentEvent::PrivacyStripped {
+                    categories: vec![("email".into(), 2)],
+                }),
             ),
             ("[exec] run_command", format_event(&AgentEvent::ToolExecuted { result: make_result() })),
             ("[answer]", format_event(&AgentEvent::FinalAnswer { content: "a".into() })),

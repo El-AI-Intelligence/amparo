@@ -18,6 +18,9 @@
 //! - `amparo notebook list|promote|rollup [FLAGS]` works the rollup and
 //!   archival layer (M6e): list cold-archive records, pin one into the hot
 //!   layer, or force the promote + fold on demand (cron-able).
+//! - `amparo privacy [FLAGS]` reads the privacy ledger (M7): the summary
+//!   plus the most recent network-call and PII-strip rows — the reviewer's
+//!   front door to "who allowed this, and under what policy".
 //! - `amparo version` prints the version.
 //!
 //! stdout carries the final answer only (a scripting contract); progress,
@@ -26,6 +29,7 @@
 mod approve;
 mod events;
 mod notebook;
+mod privacy;
 mod run;
 mod skill;
 
@@ -40,6 +44,7 @@ USAGE:
   amparo chat telegram|discord|slack [FLAGS]
   amparo skill add|propose|list|show|adopt|check|retire [FLAGS]
   amparo notebook list|promote|rollup [FLAGS]
+  amparo privacy [FLAGS]
   amparo version
 
 SUBCOMMANDS:
@@ -50,10 +55,13 @@ SUBCOMMANDS:
              list/show adopted, adopt behind policy + approval
   notebook   roll up and inspect the lab notebook: list records, promote a
              case into the hot layer, force the promote + fold
+  privacy    read the privacy ledger: a summary plus the most recent
+             network-call and PII-strip rows
   version    print the version
 
 Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help`,
-`amparo skill --help` or `amparo notebook --help` for flags.";
+`amparo skill --help`, `amparo notebook --help` or `amparo privacy --help`
+for flags.";
 
 #[tokio::main]
 async fn main() {
@@ -68,6 +76,7 @@ async fn main() {
         "chat" => chat(args).await,
         "skill" => skill::dispatch(args).await,
         "notebook" => notebook::dispatch(args),
+        "privacy" => privacy::dispatch(args),
         "version" | "-V" | "--version" => println!("amparo {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{USAGE}"),
         other => {

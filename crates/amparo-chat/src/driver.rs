@@ -10,7 +10,7 @@ use crate::gate::ChatApprovalGate;
 use crate::router::{ApprovalRouter, TakeResult};
 use crate::sink::ChatEventSink;
 use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport, PressOutcome};
-use amparo_agent::{Agent, AgentConfig, CaseLibrary, EventSink, FanoutSink};
+use amparo_agent::{Agent, AgentConfig, CaseLibrary, EventSink, FanoutSink, LedgerSink};
 use amparo_inference::InferenceProvider;
 use amparo_notebook::{
     CaseRetriever, NotebookSink, SkillLogEvent, SkillSet, append_event, auto_rollup,
@@ -18,7 +18,7 @@ use amparo_notebook::{
 };
 use amparo_policy::wire::WirePolicyEngine;
 use amparo_policy::PolicyEngine;
-use amparo_privacy::PrivacyPolicy;
+use amparo_privacy::{privacy_dir, LedgerStore, PrivacyPolicy};
 use amparo_tools::registry::default_registry_with_policy;
 use amparo_tools::{
     Memory, PathPolicy, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool,
@@ -149,6 +149,10 @@ struct TaskParts {
     policy: Arc<dyn PolicyEngine>,
     registry: ToolRegistry,
     trust_ceiling: ToolTrustTier,
+    /// Where this task's privacy ledger lives: the per-user workspace in
+    /// directory mode (each tenant keeps its own ledger file), the shared
+    /// workspace root in allowlist mode.
+    ledger_root: PathBuf,
 }
 
 impl ChatDriver {
@@ -272,17 +276,19 @@ impl ChatDriver {
                 let key = format!("{}:{}", chat.platform, chat.user_id);
                 let profile = config.users.get(&key)?;
                 let workspace = self.workspace_for(chat, profile)?;
-                let path_policy = Arc::new(PathPolicy::from_root(workspace));
+                let path_policy = Arc::new(PathPolicy::from_root(workspace.clone()));
                 Some(TaskParts {
                     policy: self.task_policy(chat),
                     registry: default_registry_with_policy(path_policy),
                     trust_ceiling: profile.trust_ceiling.unwrap_or(self.trust_ceiling),
+                    ledger_root: workspace,
                 })
             }
             Tenants::LegacyAllowlist(_) => Some(TaskParts {
                 policy: self.task_policy(chat),
                 registry: self.registry.clone(),
                 trust_ceiling: self.trust_ceiling,
+                ledger_root: self.workspace_root.clone(),
             }),
         }
     }
@@ -379,7 +385,7 @@ impl ChatDriver {
             return;
         }
 
-        let TaskParts { policy, mut registry, trust_ceiling } = parts;
+        let TaskParts { policy, mut registry, trust_ceiling, ledger_root } = parts;
         let provider = Arc::clone(&self.provider);
         let privacy = self.privacy.clone();
         let transport = Arc::clone(&self.transport);
@@ -411,12 +417,33 @@ impl ChatDriver {
             let notebook_sink: Option<Arc<NotebookSink>> = notebook.as_ref().map(|store| {
                 Arc::new(NotebookSink::new(Arc::clone(store), tenant_key.clone()))
             });
-            let sink: Arc<dyn EventSink> = match &notebook_sink {
-                Some(nb) => Arc::new(FanoutSink::new(vec![
-                    chat_sink,
-                    Arc::clone(nb) as Arc<dyn EventSink>,
-                ])),
-                None => chat_sink,
+            // The privacy ledger (M7) is always-on in chat too — an I6
+            // instrument, not growth-gated. Rows are tagged with the
+            // tenant key and land in this task's ledger root (the
+            // per-user workspace in directory mode). An open failure
+            // warns and continues — the ledger is observational.
+            let ledger_sink: Option<Arc<LedgerSink>> =
+                match LedgerStore::open(privacy_dir(&ledger_root).join("ledger.jsonl")) {
+                    Ok(store) => Some(Arc::new(LedgerSink::new(store, tenant_key.clone()))),
+                    Err(e) => {
+                        eprintln!(
+                            "[ledger] unavailable — the task continues without the privacy \
+                             ledger: {e}"
+                        );
+                        None
+                    }
+                };
+            let mut sinks: Vec<Arc<dyn EventSink>> = vec![chat_sink];
+            if let Some(nb) = &notebook_sink {
+                sinks.push(Arc::clone(nb) as Arc<dyn EventSink>);
+            }
+            if let Some(ledger) = &ledger_sink {
+                sinks.push(Arc::clone(ledger) as Arc<dyn EventSink>);
+            }
+            let sink: Arc<dyn EventSink> = if sinks.len() == 1 {
+                sinks.pop().expect("at least one sink")
+            } else {
+                Arc::new(FanoutSink::new(sinks))
             };
             // The same store feeds the case library (M6b); with the hot
             // layer attached (M6e) the hot store feeds it instead. Prior
@@ -1256,6 +1283,75 @@ mod tests {
         assert!(
             !root.join("team-b/notes.txt").exists(),
             "user_b's root never saw user_a's file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ledger_writes_per_tenant_rows_in_per_user_workspaces() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-chat-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        // The messages are driven sequentially (each task to its final
+        // answer first), so the shared script queue cannot interleave:
+        // user_a pops scripts 1-2, user_b pops 3-4. The fetch targets are
+        // refused-connection ports — deterministic, fully offline.
+        let provider = StubProvider::new(vec![
+            vec![
+                tool_call_frame("call_1", "fetch_url", r#"{"url":"http://127.0.0.1:1/from-a"}"#),
+                done_frame(),
+            ],
+            turn_text("A done."),
+            vec![
+                tool_call_frame("call_2", "fetch_url", r#"{"url":"http://127.0.0.1:2/from-b"}"#),
+                done_frame(),
+            ],
+            turn_text("B done."),
+        ]);
+        let mut users = BTreeMap::new();
+        users.insert("mock:user_a".to_string(), profile());
+        users.insert("mock:user_b".to_string(), profile());
+        let driver = driver_directory(users, transport.clone(), provider, true, root.clone());
+
+        driver.on_message(chat_for("user_a"), "fetch a page".into()).await;
+        wait_for_text(&transport, "A done.").await;
+        driver.on_message(chat_for("user_b"), "fetch a page".into()).await;
+        wait_for_text(&transport, "B done.").await;
+
+        // Each tenant's row lands in its own workspace ledger (the write
+        // is synchronous at ToolExecuted — before the final answer).
+        let ledger_a = std::fs::read_to_string(
+            root.join("users/mock-user_a/.amparo/privacy/ledger.jsonl"),
+        )
+        .expect("user_a's ledger exists");
+        let ledger_b = std::fs::read_to_string(
+            root.join("users/mock-user_b/.amparo/privacy/ledger.jsonl"),
+        )
+        .expect("user_b's ledger exists");
+        assert!(
+            ledger_a.contains(r#""tenant":"mock:user_a""#),
+            "user_a's row is tenant-tagged: {ledger_a}"
+        );
+        assert!(
+            ledger_a.contains(r#""site":"http://127.0.0.1:1""#),
+            "the host is kept, never the path: {ledger_a}"
+        );
+        assert!(
+            !ledger_a.contains("mock:user_b"),
+            "no cross-tenant rows in user_a's ledger: {ledger_a}"
+        );
+        assert!(
+            ledger_b.contains(r#""tenant":"mock:user_b""#),
+            "user_b's row is tenant-tagged: {ledger_b}"
+        );
+        assert!(
+            ledger_b.contains(r#""site":"http://127.0.0.1:2""#),
+            "the host is kept, never the path: {ledger_b}"
+        );
+        assert!(
+            !ledger_b.contains("mock:user_a"),
+            "no cross-tenant rows in user_b's ledger: {ledger_b}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

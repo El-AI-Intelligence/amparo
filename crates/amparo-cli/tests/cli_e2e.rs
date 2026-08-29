@@ -1625,3 +1625,127 @@ async fn notebook_list_shows_records_with_promotion_state() {
     assert!(err.contains("no records for tenant nobody"), "{err}");
     restore_workspace_env(prior);
 }
+
+// ── Privacy ledger (M7) ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn privacy_help_exits_0() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["privacy", "--help"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(stdout(&out).contains("amparo privacy"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("--last"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("--tenant"), "{}", stdout(&out));
+}
+
+#[tokio::test]
+async fn privacy_surface_usage_errors_exit_2() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["privacy", "--nonsense"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("unknown flag --nonsense"), "{}", stderr(&out));
+    let out = run_with(&["privacy", "--last", "0"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("positive integer"), "{}", stderr(&out));
+    let out = run_with(&["privacy", "positional"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("takes no positional arguments"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[tokio::test]
+async fn privacy_without_a_ledger_reports_empty() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // Reading must never create the ledger: an empty workspace reports
+    // empty and exits 0.
+    let out = run_with(&["privacy"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[privacy] no ledger for tenant cli"), "{err}");
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    assert!(
+        !workspace().join(".amparo/privacy/ledger.jsonl").exists(),
+        "a read never creates the ledger"
+    );
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn privacy_subcommand_reports_ledger_after_run() {
+    let _guard = LOCK.lock().await;
+    // A refused localhost port fails instantly and deterministically —
+    // the ledger records the attempt either way, and the loop continues
+    // to the final answer.
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "fetch_url",
+            "{\"url\":\"http://127.0.0.1:1/path?q=supersecret\"}",
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // No --growth: the ledger is always-on and writes anyway.
+    let out = run_with(&["run", "--allow-all", "--auto-approve", "fetch the page"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+
+    let ledger = workspace().join(".amparo/privacy/ledger.jsonl");
+    assert!(ledger.exists(), "the always-on ledger exists without --growth");
+    let text = std::fs::read_to_string(&ledger).expect("ledger exists");
+    assert!(text.contains("fetch_url"), "tool recorded: {text}");
+    assert!(text.contains("http://127.0.0.1:1"), "host kept: {text}");
+    assert!(!text.contains("supersecret"), "query never reaches the ledger: {text}");
+    assert!(!text.contains("/path"), "path never reaches the ledger: {text}");
+
+    // The reviewer surface: summary + tail, host only — no query.
+    let out = run_with(&["privacy"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let out_stdout = stdout(&out);
+    assert!(out_stdout.contains("tenant cli"), "{out_stdout}");
+    assert!(out_stdout.contains("network calls: 1"), "{out_stdout}");
+    assert!(out_stdout.contains("tools: fetch_url x1"), "{out_stdout}");
+    assert!(
+        out_stdout.contains("http://127.0.0.1:1"),
+        "the row shows the host: {out_stdout}"
+    );
+    assert!(!out_stdout.contains("supersecret"), "query never shown: {out_stdout}");
+    assert!(!out_stdout.contains("/path"), "path never shown: {out_stdout}");
+
+    restore_workspace_env(prior);
+    drop(env);
+}
+
+#[tokio::test]
+async fn run_with_unwritable_ledger_warns_and_continues() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+    // A FILE named .amparo blocks the ledger directory — the run must
+    // warn and continue without the ledger, never fail.
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+    std::fs::write(workspace().join(".amparo"), "blocking file").unwrap();
+
+    let out = run_with(&["run", "--allow-all", "--auto-approve", "plain run"]).await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[ledger] unavailable"), "open failure warns: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // Clean up so later tests can create the directory.
+    std::fs::remove_file(workspace().join(".amparo")).unwrap();
+}

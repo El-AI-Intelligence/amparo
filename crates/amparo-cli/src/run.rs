@@ -17,7 +17,7 @@
 
 use amparo_agent::{
     Agent, AgentConfig, ApprovalGate, AutoApprove, AutoDeny, CaseLibrary, EventSink, FanoutSink,
-    TaskStatus,
+    LedgerSink, TaskStatus,
 };
 use amparo_inference::{InferenceConfig, MAX_TIMEOUT_SECS};
 use amparo_notebook::{
@@ -27,6 +27,7 @@ use amparo_notebook::{
 use amparo_policy::{
     AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, wire::WirePolicyEngine,
 };
+use amparo_privacy::{LedgerStore, privacy_dir};
 use amparo_tools::{PathPolicy, SkillLibrary, ToolTrustTier, UseSkillTool, default_registry};
 use std::sync::Arc;
 
@@ -279,10 +280,13 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     // The same store feeds the case library (M6b): prior `cli` records are
     // retrieved into the self-verification prompt — growth is write + read.
     let printing = Arc::new(PrintingSink);
+    // The workspace root anchors the privacy ledger (always-on) and the
+    // growth notebook (--growth only). The tools' path policy already
+    // read AMPARO_WORKSPACE above.
+    let workspace_root = PathPolicy::from_env().workspace_root;
     let mut case_library: Option<Arc<dyn CaseLibrary>> = None;
     let mut skills: Option<Arc<dyn SkillLibrary>> = None;
     let notebook: Option<Arc<NotebookSink>> = if flags.growth {
-        let workspace_root = PathPolicy::from_env().workspace_root;
         let nb_dir = notebook_dir(&workspace_root);
         let cold_path = nb_dir.join("records.jsonl");
         let store: Arc<dyn amparo_tools::Memory> = Arc::new(
@@ -361,12 +365,32 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     } else {
         None
     };
-    let sink: Arc<dyn EventSink> = match &notebook {
-        Some(nb) => Arc::new(FanoutSink::new(vec![
-            printing,
-            Arc::clone(nb) as Arc<dyn EventSink>,
-        ])),
-        None => printing,
+    // The privacy ledger (M7): always-on, independent of --growth — an I6
+    // instrument recording every network-tool execution attempt and PII
+    // strip, readable via `amparo privacy`. An open failure warns and the
+    // run continues without the ledger; a write failure warns once per
+    // task inside the sink itself.
+    let ledger: Option<Arc<LedgerSink>> =
+        match LedgerStore::open(privacy_dir(&workspace_root).join("ledger.jsonl")) {
+            Ok(store) => Some(Arc::new(LedgerSink::new(store, "cli"))),
+            Err(e) => {
+                eprintln!(
+                    "[ledger] unavailable — the run continues without the privacy ledger: {e}"
+                );
+                None
+            }
+        };
+    let mut sinks: Vec<Arc<dyn EventSink>> = vec![printing];
+    if let Some(nb) = &notebook {
+        sinks.push(Arc::clone(nb) as Arc<dyn EventSink>);
+    }
+    if let Some(ledger) = &ledger {
+        sinks.push(Arc::clone(ledger) as Arc<dyn EventSink>);
+    }
+    let sink: Arc<dyn EventSink> = if sinks.len() == 1 {
+        sinks.pop().expect("at least one sink")
+    } else {
+        Arc::new(FanoutSink::new(sinks))
     };
 
     let mut agent = Agent::new(provider, registry, policy)

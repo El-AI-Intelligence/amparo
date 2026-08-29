@@ -22,11 +22,11 @@ use amparo_chat::transport::{
 };
 use amparo_notebook::{JsonlStore, SkillLogEvent, append_event};
 use amparo_policy::AllowAllPolicyEngine;
-use amparo_tools::{MemoryEntry, SkillOrigin, SkillSpec, SkillStep, ToolTrustTier};
+use amparo_tools::registry::default_registry_with_policy;
+use amparo_tools::{MemoryEntry, PathPolicy, SkillOrigin, SkillSpec, SkillStep, ToolTrustTier};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
@@ -308,7 +308,10 @@ fn test_driver(
             provider,
             PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
             registry_with_echo(ToolTrustTier::ExternalEffector),
-            PathBuf::from("."),
+            // A temp root, not "." — the always-on privacy ledger (M7)
+            // creates `<root>/.amparo/privacy/` per task, and the tree
+            // must stay clean.
+            std::env::temp_dir().join(format!("amparo-telegram-test-{}", std::process::id())),
             transport,
             Arc::new(ApprovalRouter::new()),
             auto_approve,
@@ -635,4 +638,68 @@ async fn unauthorized_token_is_fatal_without_retry() {
     let updates = mock.log().iter().filter(|r| r.path.contains("/getUpdates")).count();
     assert_eq!(updates, 1, "the 401 must not be retried");
     mock.stop();
+}
+
+/// The privacy ledger (M7) is always-on in chat too: a scripted fetch_url
+/// through the real Telegram adapter writes a row tagged `telegram:111`
+/// into the workspace ledger — host only, never the query or path. The
+/// target port refuses connections, so the execution attempt is fully
+/// offline and deterministic.
+#[tokio::test]
+async fn web_tool_call_writes_ledger_row_for_tenant() {
+    let root = std::env::temp_dir()
+        .join(format!("amparo-telegram-ledger-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let mock = MockTelegram::start().await;
+    let transport: Arc<dyn ChatTransport> =
+        Arc::new(TelegramTransport::new(mock.url(), "TEST-TOKEN-7"));
+    let driver = Arc::new(ChatDriver::new(
+        Tenants::LegacyAllowlist(HashSet::from(["111".to_string()])),
+        StubProvider::new(vec![
+            turn_tool_call(
+                "call_1",
+                "fetch_url",
+                r#"{"url":"http://127.0.0.1:1/path?q=supersecret"}"#,
+            ),
+            turn_text("Done."),
+        ]),
+        PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
+        default_registry_with_policy(Arc::new(PathPolicy::from_root(root.clone()))),
+        root.clone(),
+        transport,
+        Arc::new(ApprovalRouter::new()),
+        true, // auto-approve — the call executes and fails offline
+    ));
+
+    driver
+        .on_message(
+            ChatRef { platform: "telegram", chat_id: "222".into(), user_id: "111".into() },
+            "fetch the page".into(),
+        )
+        .await;
+
+    // The row lands on the spawned task — poll the ledger file.
+    let ledger_path = root.join(".amparo/privacy/ledger.jsonl");
+    wait_until(|| {
+        std::fs::read_to_string(&ledger_path)
+            .map(|text| text.contains(r#""tenant":"telegram:111""#))
+            .unwrap_or(false)
+    })
+    .await;
+    let ledger = std::fs::read_to_string(&ledger_path).expect("the ledger exists");
+    assert!(
+        ledger.contains(r#""tool":"fetch_url""#),
+        "the network tool is recorded: {ledger}"
+    );
+    assert!(
+        ledger.contains(r#""site":"http://127.0.0.1:1""#),
+        "the host is kept, never the query or path: {ledger}"
+    );
+    assert!(
+        !ledger.contains("supersecret"),
+        "the secret never reaches the ledger: {ledger}"
+    );
+
+    mock.stop();
+    let _ = std::fs::remove_dir_all(&root);
 }

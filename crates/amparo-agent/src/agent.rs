@@ -454,6 +454,23 @@ impl Agent {
             .collect()
     }
 
+    /// Emit a [`AgentEvent::PrivacyStripped`] when a strip found anything —
+    /// per-category counts only, never the values. The strip sites call
+    /// this before discarding their placeholder maps (I6).
+    fn emit_privacy_stripped(&self, pii_map: &[PiiPlaceholder]) {
+        if pii_map.is_empty() {
+            return;
+        }
+        let mut categories: Vec<(String, usize)> = Vec::new();
+        for placeholder in pii_map {
+            match categories.iter_mut().find(|(category, _)| category == &placeholder.category) {
+                Some((_, count)) => *count += 1,
+                None => categories.push((placeholder.category.clone(), 1)),
+            }
+        }
+        self.events.emit(&AgentEvent::PrivacyStripped { categories });
+    }
+
     /// Run the loop to completion: every gate decision, tool execution and
     /// the final self-verification, all reported through [`AgentReport`] and
     /// the [`EventSink`].
@@ -465,7 +482,9 @@ impl Agent {
         // model — strip it once so the original never leaks there.
         let safe_prompt: String = match &self.privacy {
             Some(policy) if policy.auto_redact_pii => {
-                amparo_privacy::secure_minions_strip(&prompt).sanitised_text
+                let stripped = amparo_privacy::secure_minions_strip(&prompt);
+                self.emit_privacy_stripped(&stripped.pii_map);
+                stripped.sanitised_text
             }
             _ => prompt.clone(),
         };
@@ -520,7 +539,11 @@ impl Agent {
 
             // ── Secure Minions PII strip ────────────────────────────────────
             let (send_messages, pii_map) = match &self.privacy {
-                Some(policy) if policy.auto_redact_pii => strip_messages(&conversation),
+                Some(policy) if policy.auto_redact_pii => {
+                    let (messages, map) = strip_messages(&conversation);
+                    self.emit_privacy_stripped(&map);
+                    (messages, map)
+                }
                 _ => (conversation.clone(), Vec::new()),
             };
 
@@ -890,7 +913,9 @@ impl Agent {
             }
             let verify_prompt = match &self.privacy {
                 Some(policy) if policy.auto_redact_pii => {
-                    amparo_privacy::secure_minions_strip(&verify_prompt).sanitised_text
+                    let stripped = amparo_privacy::secure_minions_strip(&verify_prompt);
+                    self.emit_privacy_stripped(&stripped.pii_map);
+                    stripped.sanitised_text
                 }
                 _ => verify_prompt,
             };

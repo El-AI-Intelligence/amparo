@@ -11,7 +11,9 @@
 #![warn(missing_docs)]
 
 pub mod canary;
+pub mod ledger;
 pub use canary::{CanaryToken, CanaryTokenManager, CanaryTrigger};
+pub use ledger::{privacy_dir, site_host_only, LedgerKind, LedgerRow, LedgerStore, LedgerSummary};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

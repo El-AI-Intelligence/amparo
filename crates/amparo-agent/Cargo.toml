@@ -18,4 +18,5 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 tracing = "0.1"

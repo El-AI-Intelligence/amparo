@@ -231,8 +231,11 @@ impl EventSink for NotebookSink {
                 }
             }
             // AssistantTurn, FinalAnswer: rendered by the event formatter, not
-            // part of the record's shape.
-            AgentEvent::AssistantTurn { .. } | AgentEvent::FinalAnswer { .. } => {}
+            // part of the record's shape. PrivacyStripped is the privacy
+            // ledger's instrument (M7) — recorded there, not in the notebook.
+            AgentEvent::AssistantTurn { .. }
+            | AgentEvent::FinalAnswer { .. }
+            | AgentEvent::PrivacyStripped { .. } => {}
         }
     }
 }

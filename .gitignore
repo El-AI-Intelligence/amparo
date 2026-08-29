@@ -14,6 +14,7 @@ credentials.json
 # Local agent state
 /data/
 /state/
+.amparo/
 *.db
 *.db-shm
 *.db-wal
