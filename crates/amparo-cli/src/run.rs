@@ -15,12 +15,15 @@
 //!
 //! stdout carries the final answer only; the report goes to stderr.
 
-use amparo_agent::{Agent, AgentConfig, ApprovalGate, AutoApprove, AutoDeny, TaskStatus};
+use amparo_agent::{
+    Agent, AgentConfig, ApprovalGate, AutoApprove, AutoDeny, EventSink, FanoutSink, TaskStatus,
+};
 use amparo_inference::{InferenceConfig, MAX_TIMEOUT_SECS};
+use amparo_notebook::{JsonlStore, NotebookSink};
 use amparo_policy::{
     AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, wire::WirePolicyEngine,
 };
-use amparo_tools::{ToolTrustTier, default_registry};
+use amparo_tools::{PathPolicy, ToolTrustTier, default_registry};
 use std::sync::Arc;
 
 use crate::approve::InteractiveApprovalGate;
@@ -37,6 +40,8 @@ FLAGS:
   --allow-all         run without policy checks (explicit opt-in)
   --auto-approve      approve escalated/external-effector calls without a human
   --auto-deny         deny escalated/external-effector calls without asking
+  --growth            record PII-stripped run records (off by default)
+  --no-growth         never record (overrides an earlier --growth)
   --trust-ceiling T   observational | local_mutating |
                       external_effector | system_control (default)
   --max-steps N       maximum loop iterations (default 12)
@@ -51,7 +56,14 @@ only; progress, gate decisions and the report go to stderr.
 Deny-by-default: without --policy-url or --allow-all every tool call is
 refused, and escalated/external-effector calls ask for approval unless
 --auto-approve/--auto-deny overrides. The inference endpoint comes from the
-AMPARO_INFERENCE_* environment surface — see the README Quickstart.";
+AMPARO_INFERENCE_* environment surface — see the README Quickstart.
+
+--growth enables the lab notebook: every completed or failed task is
+recorded as a PII-stripped, tenant-tagged JSON line at
+<workspace>/.amparo/notebook/records.jsonl (task text, tool-sequence hash,
+per-call gate log, verification, truncated answer). Recording is off by
+default — growth never happens unless asked for — and the last
+--growth/--no-growth wins.";
 
 /// Parsed `amparo run` flags.
 #[derive(Debug, Clone)]
@@ -65,6 +77,8 @@ pub struct RunFlags {
     pub model: Option<String>,
     pub timeout_secs: Option<u64>,
     pub workspace: Option<String>,
+    /// Record PII-stripped run records to the workspace notebook.
+    pub growth: bool,
     /// The task — joined positional arguments.
     pub task: String,
 }
@@ -81,6 +95,7 @@ impl Default for RunFlags {
             model: None,
             timeout_secs: None,
             workspace: None,
+            growth: false,
             task: String::new(),
         }
     }
@@ -111,6 +126,8 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
             "--allow-all" => flags.allow_all = true,
             "--auto-approve" => flags.auto_approve = true,
             "--auto-deny" => flags.auto_deny = true,
+            "--growth" => flags.growth = true,
+            "--no-growth" => flags.growth = false,
             "--trust-ceiling" => match args.next() {
                 Some(tier) => match tier.as_str() {
                     "observational" => flags.trust_ceiling = ToolTrustTier::Observational,
@@ -252,13 +269,41 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     agent_config.trust_ceiling = flags.trust_ceiling;
     agent_config.model = flags.model.clone();
 
+    // The lab notebook: with --growth, records flow to a local append-only
+    // store next to the printing sink; without it, printing exactly as
+    // before. Kept outside the fanout so `flush` can await the final write.
+    let printing = Arc::new(PrintingSink);
+    let notebook: Option<Arc<NotebookSink>> = if flags.growth {
+        let path = PathPolicy::from_env()
+            .workspace_root
+            .join(".amparo/notebook/records.jsonl");
+        let store = JsonlStore::open(&path)
+            .map_err(|e| format!("cannot open the growth notebook: {e}"))?;
+        eprintln!("[growth] recording PII-stripped run records to {}", path.display());
+        Some(Arc::new(NotebookSink::new(Arc::new(store), "cli")))
+    } else {
+        None
+    };
+    let sink: Arc<dyn EventSink> = match &notebook {
+        Some(nb) => Arc::new(FanoutSink::new(vec![
+            printing,
+            Arc::clone(nb) as Arc<dyn EventSink>,
+        ])),
+        None => printing,
+    };
+
     let agent = Agent::new(provider, registry, policy)
         .with_approval(approval)
-        .with_events(Arc::new(PrintingSink))
+        .with_events(sink)
         .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
         .with_config(agent_config);
 
     let report = agent.run(flags.task).await;
+    // The CLI is a short-lived host: await the pending record write so it
+    // cannot lose the race with process exit. Failed tasks write records too.
+    if let Some(nb) = &notebook {
+        nb.flush().await;
+    }
     match report.status {
         TaskStatus::Complete => {
             // stdout = the final answer, nothing else (scripting contract).
@@ -322,6 +367,7 @@ mod tests {
             "--model", "qwen2.5:14b",
             "--timeout", "30",
             "--workspace", "/tmp/ws",
+            "--growth",
             "task",
         ]));
         assert_eq!(f.policy_url.as_deref(), Some("http://policy.test"));
@@ -333,6 +379,7 @@ mod tests {
         assert_eq!(f.model.as_deref(), Some("qwen2.5:14b"));
         assert_eq!(f.timeout_secs, Some(30));
         assert_eq!(f.workspace.as_deref(), Some("/tmp/ws"));
+        assert!(f.growth);
         assert_eq!(f.task, "task");
     }
 
@@ -388,6 +435,15 @@ mod tests {
         assert!(!f.allow_all);
         assert!(!f.auto_approve);
         assert!(!f.auto_deny);
+        assert!(!f.growth);
         assert_eq!(f.trust_ceiling, ToolTrustTier::SystemControl);
+    }
+
+    #[test]
+    fn growth_flag_last_wins_and_defaults_off() {
+        assert!(!flags(parse(&["task"])).growth);
+        assert!(flags(parse(&["--growth", "task"])).growth);
+        assert!(!flags(parse(&["--growth", "--no-growth", "task"])).growth);
+        assert!(flags(parse(&["--no-growth", "--growth", "task"])).growth);
     }
 }

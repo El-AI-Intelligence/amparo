@@ -16,6 +16,7 @@ amparo-agent = { path = "../amparo-agent" }
 amparo-chat = { path = "../amparo-chat" }
 amparo-inference = { path = "../amparo-inference" }
 amparo-mcp = { path = "../amparo-mcp" }
+amparo-notebook = { path = "../amparo-notebook" }
 amparo-policy = { path = "../amparo-policy" }
 amparo-privacy = { path = "../amparo-privacy" }
 amparo-tools = { path = "../amparo-tools" }

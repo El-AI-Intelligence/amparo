@@ -497,3 +497,78 @@ async fn run_auto_approve_skips_stdin_entirely() {
     assert!(!err.contains("approve? [y/N]"), "no prompt may be printed: {err}");
     assert_eq!(stdout(&out).trim(), "Done.");
 }
+
+#[tokio::test]
+async fn run_growth_writes_a_pii_stripped_run_record() {
+    let _guard = LOCK.lock().await;
+    let marker = format!("amparo-cli-e2e-{}", std::process::id());
+    let mock = MockLlm::start(vec![
+        tool_call_script(&format!("echo {marker}")),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    // A previous growth run in this test process may have left records.
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // The task carries an email address: the record must hold only the
+    // placeholder, never the raw address.
+    let task = format!("please email user@example.com about {marker}");
+    let out = run_with(&["run", "--allow-all", "--auto-approve", "--growth", &task]).await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[growth] recording PII-stripped run records"), "{err}");
+
+    let records = workspace().join(".amparo/notebook/records.jsonl");
+    let text = std::fs::read_to_string(&records).expect("records file exists");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "exactly one record: {text}");
+    assert!(!text.contains("user@example.com"), "raw email persisted: {text}");
+
+    // One MemoryEntry per line; the entry's content is the RunRecord JSON.
+    let entry: Value = serde_json::from_str(lines[0]).expect("line is JSON");
+    let record: Value = serde_json::from_str(entry["content"].as_str().expect("content"))
+        .expect("record JSON");
+    assert_eq!(record["tenant_id"], "cli");
+    assert!(
+        record["task_text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[EMAIL_1]"),
+        "task text carries the placeholder: {record}"
+    );
+    let call = &record["tool_calls"][0];
+    assert_eq!(call["tool_name"], "run_command");
+    assert_eq!(call["decision"], "allowed");
+    assert_eq!(call["approved"], true);
+    assert_eq!(record["status"], "complete");
+}
+
+#[tokio::test]
+async fn run_without_growth_creates_no_records_file() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![
+        tool_call_script("echo no-growth"),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    let out = run_with(&["run", "--allow-all", "--auto-approve", "no growth here"]).await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(!err.contains("[growth]"), "no growth line without the flag: {err}");
+    assert!(
+        !workspace().join(".amparo/notebook/records.jsonl").exists(),
+        "no flag means no records file"
+    );
+}
