@@ -73,8 +73,13 @@ Every completed task becomes a protocol entry:
 This is the substrate everything else reads from. It is written through
 the existing `EventSink` seam in `amparo-agent`, so a deployment that
 wants no growth writes nothing (see §6.1). Storage lives behind the
-`amparo-memory` trait: the built-in default store today, Engram as the
-recommended backend — never a dependency.
+`Memory` trait in `amparo-tools` (the `amparo-memory` crate is an unused
+context-assembly crate, not the storage seam): the built-in default
+store today, Engram as the recommended backend — never a dependency.
+**M6a is landed**: the `amparo-notebook` crate records every completed
+or failed task as a PII-stripped, tenant-tagged JSON line in
+`<workspace>/.amparo/notebook/records.jsonl` behind `--growth` /
+`--no-growth` on `amparo run` and `amparo chat` (off by default).
 
 The notebook's scientific function: it makes the agent's history
 *inspectable*. The agent can be asked evidence questions — "what did I
@@ -337,10 +342,11 @@ embedding-quality path exists only when the memory backend provides it
 (Engram does natively — the recommended-backend value proposition —
 while the built-in default store stays cheap).
 
-- **M6a — notebook substrate.** `EventSink` hook → record builder
-  (PII strip before persistence, tenant tag, dedupe hash); write path
-  through `amparo-memory`; `--growth` / `--no-growth` switch on the CLI
-  and chat driver; audit-log-style append only.
+- **M6a — notebook substrate.** ✅ landed — `EventSink` hook → record
+  builder (PII strip before persistence, tenant tag, dedupe hash); write
+  path through the `Memory` trait in `amparo-tools`; `--growth` /
+  `--no-growth` switch on the CLI and chat driver; audit-log-style
+  append only.
 - **M6b — case library.** Retrieval over the store with the same-tenant
   filter; evidence section appended to the verification prompt only;
   observation-format serialization; operator promotion of cases.

@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
+## [Unreleased]
+
+### Added
+
+- New `amparo-notebook` crate — the lab notebook (M6a): every completed
+  or failed task is recorded as a PII-stripped, tenant-tagged JSON run
+  record (task text, tool-sequence hash, per-call gate log, verification,
+  truncated answer, duration, token-cost estimate), written through the
+  `EventSink` seam into the `Memory` trait. Includes `NotebookSink` (the
+  event consumer) and `JsonlStore` (append-only local store).
+- `--growth` / `--no-growth` on `amparo run` and `amparo chat` — records
+  land in `<workspace>/.amparo/notebook/records.jsonl`, tagged `cli` or
+  `platform:user_id`. Off by default: without `--growth`, no record file
+  is ever created.
+- `FanoutSink` in `amparo-agent` — fans every event out to several sinks
+  (plus `truncate`/`TRUNCATE` re-exports).
+
 ## [0.3.0] — 2026-08-28
 
 Multi-tenant identity: the chat face moves from a single-operator

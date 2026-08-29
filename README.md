@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M5 in — multi-tenant identity
+## Status: pre-alpha, M6 in progress — M6a (lab notebook) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -17,10 +17,12 @@ BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
 the command line, and the workspace carries a versioned release with a
 documented API-stability policy), **Milestone 4 is in**: Telegram,
 Discord and Slack chat adapters behind one transport seam, with
-inline-button approval and a fail-closed operator allowlist, and
+inline-button approval and a fail-closed operator allowlist,
 **Milestone 5 is in**: a TOML tenant directory with per-user policy
 checks, per-user trust ceilings, per-user workspace directories, and
-requester-only approval presses.
+requester-only approval presses, and **Milestone 6a is in**: the lab
+notebook — with `--growth`, every completed or failed task is recorded
+as a PII-stripped, tenant-tagged run record (off by default).
 
 ### What exists today: the crate set
 
@@ -167,6 +169,23 @@ non-terminal stdin auto-denies), with `--auto-approve`/`--auto-deny`
 overrides. stdout carries the final answer only — progress, gate decisions
 and the report go to stderr — so `amparo run` scripts cleanly.
 
+## Controlled growth
+
+The lab notebook (M6a) records how the agent actually behaves, so growth
+is measurable and inspectable instead of silent. With `--growth` (on
+`amparo run` or `amparo chat`; the last `--growth`/`--no-growth` wins),
+every completed or failed task is appended as one JSON line to
+`<workspace>/.amparo/notebook/records.jsonl`: the PII-stripped task text
+(emails become `[EMAIL_1]`, nothing is recoverable — records are
+archival), a hash of the tool sequence, the per-call gate log (decision,
+reasons, escalation, approval, outcome), the verification outcome, a
+truncated final answer, duration and a token-cost estimate. Each record
+carries a tenant tag — `cli` for runs, `platform:user_id` for chat tasks
+— so one notebook can serve many users. Recording is **off by default**:
+without the flag, no record file is ever created. In chat mode the
+workspace root is `AMPARO_WORKSPACE`, or the current directory when it
+is unset (records land in `./.amparo/notebook/`).
+
 ## What Amparo is meant to be
 
 An agent that runs a real tool-use loop — shell, files, git, web, tests — where
@@ -204,6 +223,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 3 | Install path + release — the `amparo` CLI drives the loop end-to-end (headless: no screen/desktop tools in the registry) | ✅ done |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | ✅ done — all three behind one transport seam, inline-button approval |
 | 5 | Multi-tenant identity and per-user policy | ✅ done — TOML tenant directory, per-user ceilings/workspaces, attributed approvals |
+| 6 | Controlled self-improvement | 🚧 in progress — M6a landed: the lab notebook (`--growth`, PII-stripped run records) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant
