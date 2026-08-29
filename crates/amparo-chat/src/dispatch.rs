@@ -345,6 +345,8 @@ pub async fn build_driver(
             ChatServeError::new(format!("cannot open the growth notebook: {e}"), 2)
         })?;
         eprintln!("[growth] recording PII-stripped run records to {}", path.display());
+        eprintln!("[growth] retrieval: prior per-user cases inform self-verification");
+        eprintln!("[growth] skills: per-tenant adopted skills are available to the loop");
         driver = driver.with_growth(Arc::new(store));
     }
     Ok(Arc::new(driver))

@@ -10,14 +10,16 @@ use crate::gate::ChatApprovalGate;
 use crate::router::{ApprovalRouter, TakeResult};
 use crate::sink::ChatEventSink;
 use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport, PressOutcome};
-use amparo_agent::{Agent, AgentConfig, EventSink, FanoutSink};
+use amparo_agent::{Agent, AgentConfig, CaseLibrary, EventSink, FanoutSink};
 use amparo_inference::InferenceProvider;
-use amparo_notebook::NotebookSink;
+use amparo_notebook::{CaseRetriever, NotebookSink, SkillSet};
 use amparo_policy::wire::WirePolicyEngine;
 use amparo_policy::PolicyEngine;
 use amparo_privacy::PrivacyPolicy;
 use amparo_tools::registry::default_registry_with_policy;
-use amparo_tools::{Memory, PathPolicy, ToolRegistry, ToolTrustTier};
+use amparo_tools::{
+    Memory, PathPolicy, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool,
+};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -100,7 +102,9 @@ pub struct ChatDriver {
     /// Optional privacy policy, attached to every task's agent.
     privacy: Option<Arc<PrivacyPolicy>>,
     /// The optional lab notebook: with `--growth`, every completed or failed
-    /// task is recorded as a PII-stripped, tenant-tagged run record.
+    /// task is recorded as a PII-stripped, tenant-tagged run record, and the
+    /// same store feeds the case library (M6b) — prior same-tenant records
+    /// are retrieved into each task's self-verification prompt.
     notebook: Option<Arc<dyn Memory>>,
     /// The legacy shared tool registry, cloned per task — ignored in
     /// directory mode, where each task gets a fresh registry rooted at its
@@ -196,8 +200,11 @@ impl ChatDriver {
     ///
     /// Each task's events are fanned out to the notebook and recorded as a
     /// PII-stripped run record tagged `platform:user_id` (the same key
-    /// tenancy uses). This is the `--growth` knob of `amparo chat`; the
-    /// default (no notebook) records nothing.
+    /// tenancy uses), and the same store feeds the per-task case library:
+    /// prior same-tenant records are retrieved into the self-verification
+    /// prompt. This is the `--growth` knob of `amparo chat` — growth is
+    /// write + read; the default (no notebook) records and retrieves
+    /// nothing.
     pub fn with_growth(mut self, store: Arc<dyn Memory>) -> Self {
         self.notebook = Some(store);
         self
@@ -342,7 +349,7 @@ impl ChatDriver {
             return;
         }
 
-        let TaskParts { policy, registry, trust_ceiling } = parts;
+        let TaskParts { policy, mut registry, trust_ceiling } = parts;
         let provider = Arc::clone(&self.provider);
         let privacy = self.privacy.clone();
         let transport = Arc::clone(&self.transport);
@@ -353,6 +360,7 @@ impl ChatDriver {
         // same `platform:user_id` key tenancy uses.
         let tenant_key = format!("{}:{}", chat.platform, chat.user_id);
         let notebook = self.notebook.clone();
+        let workspace_root = self.workspace_root.clone();
 
         tokio::spawn(async move {
             // The claim is the busy-map entry; dropping it (however this
@@ -367,10 +375,32 @@ impl ChatDriver {
             let sink: Arc<dyn EventSink> = match &notebook {
                 Some(store) => Arc::new(FanoutSink::new(vec![
                     chat_sink,
-                    Arc::new(NotebookSink::new(Arc::clone(store), tenant_key)),
+                    Arc::new(NotebookSink::new(Arc::clone(store), tenant_key.clone())),
                 ])),
                 None => chat_sink,
             };
+            // The same store feeds the case library (M6b): prior runs by
+            // this tenant are retrieved into the self-verification prompt —
+            // never into the action loop.
+            // Gated skills (M6c): with a notebook attached (--growth), this
+            // tenant's adopted skills register `use_skill` on the task's own
+            // registry copy. The load is tenant-filtered exactly like M6b
+            // retrieval, so another tenant's skills are invisible (I2).
+            let mut skills: Option<Arc<dyn SkillLibrary>> = None;
+            if notebook.is_some() {
+                let skill_set = SkillSet::load(
+                    &workspace_root.join(".amparo/skills/adopted.jsonl"),
+                    &tenant_key,
+                );
+                if !skill_set.names().is_empty() {
+                    let library: Arc<dyn SkillLibrary> = Arc::new(skill_set);
+                    registry.register(Arc::new(UseSkillTool::new(Arc::clone(&library))));
+                    skills = Some(library);
+                }
+            }
+            let case_library: Option<Arc<dyn CaseLibrary>> = notebook.as_ref().map(|store| {
+                Arc::new(CaseRetriever::new(Arc::clone(store), tenant_key)) as Arc<dyn CaseLibrary>
+            });
             let drain_transport = Arc::clone(&transport);
             let drain_chat = chat.clone();
             tokio::spawn(async move {
@@ -390,6 +420,12 @@ impl ChatDriver {
                 .with_approval(gate);
             if let Some(privacy) = privacy {
                 agent = agent.with_privacy(privacy);
+            }
+            if let Some(library) = case_library {
+                agent = agent.with_case_library(library);
+            }
+            if let Some(library) = skills {
+                agent = agent.with_skills(library);
             }
             // The flags' trust ceiling reaches the per-task agent through
             // the shared agent config (the `amparo run` equivalent).
@@ -443,8 +479,9 @@ mod tests {
     }
 
     use super::*;
+    use amparo_notebook::{AdoptRecord, append_adopt};
     use amparo_policy::AllowAllPolicyEngine;
-    use amparo_tools::{InMemoryStore, ToolTrustTier};
+    use amparo_tools::{InMemoryStore, SkillOrigin, SkillSpec, SkillStep, ToolTrustTier};
     use common::{
         done_frame, registry_with_echo, tool_call_frame, turn_text, turn_tool_call,
         wait_for_text, wait_until, wait_until_async, MockTransport, StubProvider,
@@ -672,6 +709,164 @@ mod tests {
             .expect("a tenant-tagged record landed");
         assert!(!record.content.contains("user@example.com"), "raw email stripped");
         assert!(record.content.contains("[EMAIL_1]"), "stripped placeholder kept");
+    }
+
+    #[tokio::test]
+    async fn growth_retrieves_prior_same_user_cases_into_verification() {
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![turn_text("Done.")]);
+        let store = Arc::new(InMemoryStore::new());
+        let driver = driver(transport.clone(), provider.clone(), true).with_growth(store.clone());
+
+        // Task 1 seeds the notebook with a VERIFIED case for this user.
+        driver.on_message(chat(), "deploy the staging site".into()).await;
+        wait_for_text(&transport, "Done.").await;
+        wait_until_async(|| async {
+            store
+                .search("mock:user_1", 10)
+                .await
+                .iter()
+                .any(|e| e.content.contains(r#""tenant_id":"mock:user_1""#))
+        })
+        .await;
+
+        // Task 2: its verification prompt must carry the prior case — the
+        // same user, retrieved read-only.
+        driver.on_message(chat(), "deploy the staging site".into()).await;
+        wait_until(|| provider.recorded_complete_prompts().len() == 2).await;
+
+        let prompts = provider.recorded_complete_prompts();
+        assert_eq!(prompts.len(), 2, "one verification per task: {prompts:?}");
+        assert!(
+            !prompts[0].contains("Prior cases"),
+            "an empty notebook leaves the first verification unchanged: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].contains("Prior cases in this tenant resembling the current task:"),
+            "the second verification carries the evidence section: {}",
+            prompts[1]
+        );
+        assert!(
+            prompts[1].contains("deploy the staging site"),
+            "the evidence names the prior task: {}",
+            prompts[1]
+        );
+    }
+
+    /// A fresh workspace root per test (skills land under `<root>/.amparo`).
+    fn temp_skills_root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("amparo-chat-skills-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// Seeds `demo-skill` (one `run_command` step) adopted by `mock:user_1`
+    /// only, then builds a two-tenant directory-mode driver with growth.
+    fn seeded_skill_driver(
+        root: &Path,
+        transport: Arc<MockTransport>,
+        provider: Arc<StubProvider>,
+    ) -> (ChatDriver, Arc<InMemoryStore>) {
+        let mut users = BTreeMap::new();
+        users.insert("mock:user_1".to_string(), profile());
+        users.insert("mock:user_2".to_string(), profile());
+        let spec = SkillSpec {
+            name: "demo-skill".into(),
+            description: "one command step".into(),
+            preconditions: vec![],
+            steps: vec![SkillStep {
+                tool: "run_command".into(),
+                arguments: serde_json::json!({"command": "echo from-skill"}),
+            }],
+            expected_outcome: "the command runs".into(),
+            origin: SkillOrigin::Operator,
+            source_run_ids: vec![],
+            adopted_at: None,
+        };
+        append_adopt(
+            &root.join(".amparo/skills/adopted.jsonl"),
+            &AdoptRecord {
+                event: "adopt".into(),
+                tenant_id: "mock:user_1".into(),
+                name: "demo-skill".into(),
+                spec,
+                adopted_at: "2026-08-29T00:00:00Z".into(),
+            },
+        )
+        .expect("the seed adoption writes");
+        let store = Arc::new(InMemoryStore::new());
+        let driver =
+            driver_directory(users, transport, provider, true, root.to_path_buf())
+                .with_growth(store.clone());
+        (driver, store)
+    }
+
+    /// A tenant's run record whose tool_calls include `tool` (polled — the
+    /// record write lands on the spawned task).
+    async fn tenant_record(store: &InMemoryStore, tenant: &str, tool: &str) -> String {
+        wait_until_async(|| async {
+            store
+                .search(tenant, 10)
+                .await
+                .iter()
+                .any(|e| e.content.contains(&format!(r#""tool_name":"{tool}""#)))
+        })
+        .await;
+        store
+            .search(tenant, 10)
+            .await
+            .into_iter()
+            .map(|e| e.content)
+            .find(|c| c.contains(&format!(r#""tool_name":"{tool}""#)))
+            .expect("the record carries the call")
+    }
+
+    #[tokio::test]
+    async fn growth_skills_execute_for_the_adopting_tenant() {
+        let root = temp_skills_root("adopting");
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![
+            turn_tool_call("call_1", "use_skill", r#"{"skill_name":"demo-skill"}"#),
+            turn_text("Skill done."),
+        ]);
+        let (driver, store) = seeded_skill_driver(&root, transport.clone(), provider);
+        driver.on_message(chat(), "use the demo skill".into()).await;
+        wait_for_text(&transport, "Skill done.").await;
+        let record = tenant_record(&store, "mock:user_1", "use_skill").await;
+        assert!(
+            record.contains(r#""decision":"allowed""#),
+            "use_skill passed the gate: {record}"
+        );
+        assert!(
+            record.contains(r#""tool_name":"run_command""#),
+            "the step ran through its own gate: {record}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn growth_skills_are_invisible_to_other_tenants() {
+        let root = temp_skills_root("isolation");
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![
+            turn_tool_call("call_1", "use_skill", r#"{"skill_name":"demo-skill"}"#),
+            turn_text("Done."),
+        ]);
+        let (driver, store) = seeded_skill_driver(&root, transport.clone(), provider);
+        driver.on_message(chat_for("user_2"), "use the demo skill".into()).await;
+        wait_for_text(&transport, "Done.").await;
+        let record = tenant_record(&store, "mock:user_2", "use_skill").await;
+        assert!(
+            record.contains(r#""decision":"unknown_tool""#),
+            "use_skill is unknown without an adoption: {record}"
+        );
+        assert!(
+            !record.contains(r#""tool_name":"run_command""#),
+            "no step expansion for the other tenant: {record}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

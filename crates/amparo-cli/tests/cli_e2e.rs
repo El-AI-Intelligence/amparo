@@ -130,9 +130,12 @@ type Script = Vec<Value>;
 
 /// A hand-rolled HTTP server: every connection gets one scripted SSE
 /// response (consumed in order; the last script repeats) or the fixed
-/// non-stream `VERIFIED` completion.
+/// non-stream `VERIFIED` completion. Non-stream request bodies are recorded
+/// so tests can inspect what the verification prompt actually carried.
 struct MockLlm {
     addr: std::net::SocketAddr,
+    /// Every non-stream (`complete`) request body, in arrival order.
+    complete_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 impl MockLlm {
@@ -142,10 +145,14 @@ impl MockLlm {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
         let addr = listener.local_addr().unwrap();
         let scripts = Arc::new(tokio::sync::Mutex::new(scripts));
+        let complete_requests: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&complete_requests);
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { break };
                 let scripts = Arc::clone(&scripts);
+                let complete_requests = Arc::clone(&recorded);
                 tokio::spawn(async move {
                     // Read the request head, then the body by Content-Length.
                     let mut buf = Vec::new();
@@ -207,6 +214,11 @@ impl MockLlm {
                             out
                         )
                     } else {
+                        // The verification call: record the prompt so tests
+                        // can assert what evidence (if any) it carried.
+                        if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                            complete_requests.lock().await.push(value);
+                        }
                         let b = json!({
                             "choices": [{
                                 "index": 0,
@@ -227,12 +239,20 @@ impl MockLlm {
                 });
             }
         });
-        MockLlm { addr }
+        MockLlm {
+            addr,
+            complete_requests,
+        }
     }
 
     /// OpenAI-shaped base URL for `AMPARO_INFERENCE_URL`.
     fn url(&self) -> String {
         format!("http://{}/v1", self.addr)
+    }
+
+    /// Every recorded non-stream (`complete`) request body, in arrival order.
+    async fn complete_requests(&self) -> Vec<Value> {
+        self.complete_requests.lock().await.clone()
     }
 
     /// The env surface for the mock endpoint (openai provider is the default).
@@ -249,9 +269,9 @@ fn content_frame(text: &str) -> Value {
     json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]})
 }
 
-/// A scripted turn that requests `run_command <command>`: the tool-call
-/// frame plus the arguments fragment.
-fn tool_call_script(command: &str) -> Script {
+/// A scripted turn that requests `<tool> <arguments>`: the tool-call frame
+/// plus the arguments fragment.
+fn tool_script(tool: &str, arguments: &str) -> Script {
     vec![
         json!({
             "choices": [{
@@ -260,7 +280,7 @@ fn tool_call_script(command: &str) -> Script {
                     "index": 0,
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "run_command", "arguments": ""}
+                    "function": {"name": tool, "arguments": ""}
                 }]},
                 "finish_reason": null
             }]
@@ -270,12 +290,22 @@ fn tool_call_script(command: &str) -> Script {
                 "index": 0,
                 "delta": {"tool_calls": [{
                     "index": 0,
-                    "function": {"arguments": format!("{{\"command\":\"{command}\"}}")}
+                    "function": {"arguments": arguments}
                 }]},
                 "finish_reason": "tool_calls"
             }]
         }),
     ]
+}
+
+/// A scripted turn that requests `run_command <command>`.
+fn tool_call_script(command: &str) -> Script {
+    tool_script("run_command", &format!("{{\"command\":\"{command}\"}}"))
+}
+
+/// A scripted turn that invokes the adopted skill `name`.
+fn use_skill_script(name: &str) -> Script {
+    tool_script("use_skill", &format!("{{\"skill_name\":\"{name}\"}}"))
 }
 
 /// Sets the mock env and workspace for one test. Callers hold `LOCK`.
@@ -571,4 +601,378 @@ async fn run_without_growth_creates_no_records_file() {
         !workspace().join(".amparo/notebook/records.jsonl").exists(),
         "no flag means no records file"
     );
+}
+
+#[tokio::test]
+async fn run_growth_retrieves_prior_cases_into_verification() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![vec![content_frame("Deployed.")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // Run A seeds the notebook with a VERIFIED case; run B's verification
+    // prompt must carry it as read-only evidence (M6b).
+    let task = "deploy the staging site";
+    let out_a = run_with(&["run", "--allow-all", "--auto-approve", "--growth", task]).await;
+    let err_a = stderr(&out_a);
+    assert_eq!(out_a.status.code(), Some(0), "stderr: {err_a}");
+    let out_b = run_with(&["run", "--allow-all", "--auto-approve", "--growth", task]).await;
+    let err_b = stderr(&out_b);
+    assert_eq!(out_b.status.code(), Some(0), "stderr: {err_b}");
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let requests = mock.complete_requests().await;
+    assert_eq!(requests.len(), 2, "one verification call per run: {requests:?}");
+    let prompt = |request: &Value| {
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        !prompt(&requests[0]).contains("Prior cases"),
+        "an empty notebook must leave the verification prompt unchanged"
+    );
+    let prompt_b = prompt(&requests[1]);
+    assert!(
+        prompt_b.contains("Prior cases in this tenant resembling the current task:"),
+        "the second run's verification prompt carries the evidence section: {prompt_b}"
+    );
+    assert!(
+        prompt_b.contains("deploy the staging site"),
+        "the evidence names the prior task: {prompt_b}"
+    );
+}
+
+#[tokio::test]
+async fn run_without_growth_has_no_evidence_in_verification() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    let out = run_with(&["run", "--allow-all", "--auto-approve", "plain run"]).await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let requests = mock.complete_requests().await;
+    assert!(!requests.is_empty(), "the verification call still happens");
+    let prompt = requests[0]["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !prompt.contains("Prior cases"),
+        "without --growth the verification prompt must stay unchanged: {prompt}"
+    );
+}
+
+// ── Skills (M6c) ─────────────────────────────────────────────────────────────
+
+/// The e2e candidate: two workspace steps, adoptable behind the gates.
+const SKILL_CANDIDATE: &str = "name = \"e2e-greet\"\n\
+description = \"writes the e2e skill marker and reads it back\"\n\
+preconditions = []\n\
+origin = \"operator\"\n\
+expected_outcome = \"marker file written and read back\"\n\
+[[steps]]\n\
+tool = \"write_file\"\n\
+arguments = { path = \"skill-marker.txt\", content = \"from-skill\" }\n\
+[[steps]]\n\
+tool = \"read_file\"\n\
+arguments = { path = \"skill-marker.txt\" }\n";
+
+/// Seed the candidate (add) and adopt it under the given adopt flags.
+/// Callers hold `LOCK` and have set `AMPARO_WORKSPACE`.
+async fn seed_skill(adopt_args: &[&str]) -> (Output, Output) {
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+    let candidate = workspace().join("e2e-greet.toml");
+    std::fs::write(&candidate, SKILL_CANDIDATE).unwrap();
+    let added = run_with(&["skill", "add", candidate.to_str().unwrap()]).await;
+    let mut args = vec!["skill", "adopt", "e2e-greet"];
+    args.extend_from_slice(adopt_args);
+    let adopted = run_with(&args).await;
+    (added, adopted)
+}
+
+#[tokio::test]
+async fn skill_surface_usage_errors_exit_2() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["skill"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("missing subcommand"), "{}", stderr(&out));
+    let out = run_with(&["skill", "frobnicate"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let out = run_with(&["skill", "add"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("exactly one candidate file"), "{}", stderr(&out));
+}
+
+#[test]
+fn skill_help_exits_0() {
+    let out = std::process::Command::new(bin()).arg("skill").arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let stdout = stdout(&out);
+    assert!(stdout.contains("amparo skill"), "{}", stdout);
+    assert!(stdout.contains("adopt"), "{}", stdout);
+}
+
+#[tokio::test]
+async fn skill_add_validates_and_writes_the_candidate() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // A spec whose step calls an unknown tool must be refused, nothing written.
+    let bad = workspace().join("bad-skill.toml");
+    std::fs::write(&bad, SKILL_CANDIDATE.replace("write_file", "no_such_tool")).unwrap();
+    let out = run_with(&["skill", "add", bad.to_str().unwrap()]).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("no_such_tool"), "{}", stderr(&out));
+    assert!(!workspace().join(".amparo/skills/candidates/bad-skill.toml").exists());
+
+    // The valid candidate lands in candidates/ — not adopted.
+    let candidate = workspace().join("e2e-greet.toml");
+    std::fs::write(&candidate, SKILL_CANDIDATE).unwrap();
+    let out = run_with(&["skill", "add", candidate.to_str().unwrap()]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[skills] candidate"), "{err}");
+    let written = workspace().join(".amparo/skills/candidates/e2e-greet.toml");
+    assert!(written.exists(), "candidate file must exist");
+    assert!(
+        !workspace().join(".amparo/skills/adopted.jsonl").exists(),
+        "add never adopts"
+    );
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_adopt_deny_all_refuses_without_policy() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (added, adopted) = seed_skill(&[]).await;
+    assert_eq!(added.status.code(), Some(0), "stderr: {}", stderr(&added));
+    let err = stderr(&adopted);
+    assert_eq!(adopted.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("no policy configured"), "deny-all reason surfaces: {err}");
+    assert!(!workspace().join(".amparo/skills/adopted.jsonl").exists());
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_adopt_allow_all_auto_approve_writes_the_audit_log() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    let err = stderr(&adopted);
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[skills] adopted e2e-greet for tenant cli"), "{err}");
+    let log = workspace().join(".amparo/skills/adopted.jsonl");
+    let text = std::fs::read_to_string(&log).expect("audit log exists");
+    let record: Value = serde_json::from_str(text.lines().next().expect("one line"))
+        .expect("line is JSON");
+    assert_eq!(record["event"], "adopt");
+    assert_eq!(record["tenant_id"], "cli");
+    assert_eq!(record["name"], "e2e-greet");
+    assert_eq!(record["spec"]["steps"][0]["tool"], "write_file");
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_adopt_auto_deny_writes_nothing() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-deny"]).await;
+    let err = stderr(&adopted);
+    assert_eq!(adopted.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("not approved"), "{err}");
+    assert!(!workspace().join(".amparo/skills/adopted.jsonl").exists());
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn skill_list_and_show_render_the_adopted_skill() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    let out = run_with(&["skill", "list"]).await;
+    let out_stdout = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(out_stdout.contains("e2e-greet — writes the e2e skill marker"), "{out_stdout}");
+
+    let out = run_with(&["skill", "show", "e2e-greet"]).await;
+    let out_stdout = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(out_stdout.contains("step 1: write_file"), "{out_stdout}");
+    assert!(
+        out_stdout.contains("step 2: read_file {\"path\":\"skill-marker.txt\"}"),
+        "{out_stdout}"
+    );
+    assert!(out_stdout.contains("origin: operator"), "{out_stdout}");
+
+    // An unknown skill is a runtime failure, not a usage error.
+    let out = run_with(&["skill", "show", "no-such-skill"]).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn run_growth_executes_an_adopted_skill_with_step_records() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    let mock = MockLlm::start(vec![
+        use_skill_script("e2e-greet"),
+        vec![content_frame("Skill done.")],
+    ])
+    .await;
+    let (env, _prior2) = mock_env(&mock).await;
+
+    let out = run_with(&["run", "--allow-all", "--growth", "use the e2e skill"]).await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[growth] skills: 1 adopted for tenant cli"), "{err}");
+    assert!(
+        workspace().join("skill-marker.txt").exists(),
+        "the skill's write_file step ran in the workspace"
+    );
+    assert_eq!(stdout(&out).trim(), "Skill done.");
+
+    // The run record carries the use_skill call AND both expansion steps.
+    let text = std::fs::read_to_string(workspace().join(".amparo/notebook/records.jsonl"))
+        .expect("records exist");
+    let record: Value = serde_json::from_str(
+        serde_json::from_str::<Value>(text.lines().next().unwrap())
+            .unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let names: Vec<&str> = record["tool_calls"]
+        .as_array()
+        .expect("tool_calls array")
+        .iter()
+        .map(|call| call["tool_name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["use_skill", "write_file", "read_file"],
+        "one use_skill record plus one per step: {names:?}"
+    );
+    let ids: Vec<&str> = record["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| call["call_id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["call_1", "call_1-step-0", "call_1-step-1"],
+        "synthetic step ids are recorded: {ids:?}"
+    );
+    let steps_succeeded = record["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|call| call["success"] == true);
+    assert!(steps_succeeded, "every step succeeded: {record}");
+}
+
+#[tokio::test]
+async fn run_without_growth_never_registers_use_skill() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+    // The growth e2e may have left this marker in the shared workspace —
+    // this test proves no step runs, so the marker must not pre-exist.
+    std::fs::remove_file(workspace().join("skill-marker.txt")).ok();
+    let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
+    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+
+    let mock = MockLlm::start(vec![
+        use_skill_script("e2e-greet"),
+        vec![content_frame("Recovered.")],
+    ])
+    .await;
+    let (env, _prior2) = mock_env(&mock).await;
+
+    let out = run_with(&["run", "--allow-all", "use the e2e skill"]).await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains("[gate] use_skill: unknown_tool"),
+        "without --growth the tool is not registered: {err}"
+    );
+    assert!(
+        !workspace().join("skill-marker.txt").exists(),
+        "no step may run without growth"
+    );
+    assert!(
+        !workspace().join(".amparo/notebook/records.jsonl").exists(),
+        "no growth means no records"
+    );
+}
+
+#[tokio::test]
+async fn skill_propose_distills_recurring_verified_sequences() {
+    let _guard = LOCK.lock().await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // Three VERIFIED runs of the same single-tool sequence — a fresh mock
+    // per run, because the script queue is consumed by the first run.
+    for _ in 0..3 {
+        let mock = MockLlm::start(vec![
+            tool_script("list_dir", "{}"),
+            vec![content_frame("Listed.")],
+        ])
+        .await;
+        let (env, prior) = mock_env(&mock).await;
+        let out = run_with(&["run", "--allow-all", "--auto-approve", "--growth", "list the workspace"]).await;
+        restore_workspace_env(prior);
+        drop(env);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    }
+
+    let prior = set_workspace_env();
+    let out = run_with(&["skill", "propose"]).await;
+    let err = stderr(&out);
+    let out_stdout = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[skills] 1 proposal(s)"), "{err}");
+    assert!(out_stdout.contains("list-dir"), "suggested name: {out_stdout}");
+    assert!(out_stdout.contains("origin = \"distilled\""), "{out_stdout}");
+    assert!(out_stdout.contains("arguments = {}"), "inert skeleton: {out_stdout}");
+    assert!(out_stdout.contains("3 run(s), 3 VERIFIED"), "evidence: {out_stdout}");
+    let proposals = workspace().join(".amparo/skills/proposals.jsonl");
+    assert_eq!(
+        std::fs::read_to_string(&proposals).unwrap().lines().count(),
+        1,
+        "one proposal logged"
+    );
+
+    // Re-running dedupes: the same sequence is not proposed twice.
+    let out = run_with(&["skill", "propose"]).await;
+    assert!(
+        stderr(&out).contains("[skills] 0 proposal(s)"),
+        "{}",
+        stderr(&out)
+    );
+
+    restore_workspace_env(prior);
 }

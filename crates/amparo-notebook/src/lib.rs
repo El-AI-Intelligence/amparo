@@ -35,9 +35,16 @@
 #![warn(missing_docs)]
 
 mod record;
+mod retrieve;
 mod sink;
+mod skills;
 mod store;
 
 pub use record::{RunRecord, ToolStep, VerificationRecord};
+pub use retrieve::CaseRetriever;
 pub use sink::NotebookSink;
+pub use skills::{
+    append_adopt, append_proposals, read_adoptions, skills_dir, AdoptRecord, ProposalRecord,
+    Proposer, SkillSet, ADOPTED_FILE, PROPOSALS_FILE,
+};
 pub use store::JsonlStore;

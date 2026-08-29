@@ -22,4 +22,6 @@ amparo-privacy = { path = "../amparo-privacy" }
 amparo-tools = { path = "../amparo-tools" }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }

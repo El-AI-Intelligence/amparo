@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M6 in progress — M6a (lab notebook) landed
+## Status: pre-alpha, M6 in progress — M6a (lab notebook) + M6b (case library) + M6c (gated skills) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -186,6 +186,27 @@ without the flag, no record file is ever created. In chat mode the
 workspace root is `AMPARO_WORKSPACE`, or the current directory when it
 is unset (records land in `./.amparo/notebook/`).
 
+With `--growth` the notebook also becomes the verification case library
+(M6b): prior same-tenant records resembling the task are retrieved into
+the self-verification prompt as read-only observations ("Prior cases in
+this tenant…"), formatted as evidence, never as instructions, and never
+shown to the action loop. Growth is write + read — one opt-in, and still
+off by default.
+
+`--growth` also enables gated skills (M6c). A skill is a named
+procedure — preconditions, an ordered list of tool-call steps, an
+expected outcome — managed with `amparo skill add|propose|list|show|
+adopt`. Adoption runs the same gate chain as a tool call (a policy check
+on `use_skill`) plus human approval showing the full step plan; the
+`Proposer` distills recurring VERIFIED tool sequences from the notebook
+into inert candidate proposals, but nothing is adopted automatically. At
+execution the model may call `use_skill`, and the loop expands it into
+its steps — each gated, run and recorded individually, so a skill can
+never grant its steps an exemption. Skills live under
+`<workspace>/.amparo/skills/`; without `--growth` the `use_skill` tool is
+not registered at all. Growth is write + read + act — still one opt-in,
+still off by default.
+
 ## What Amparo is meant to be
 
 An agent that runs a real tool-use loop — shell, files, git, web, tests — where
@@ -223,7 +244,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 3 | Install path + release — the `amparo` CLI drives the loop end-to-end (headless: no screen/desktop tools in the registry) | ✅ done |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | ✅ done — all three behind one transport seam, inline-button approval |
 | 5 | Multi-tenant identity and per-user policy | ✅ done — TOML tenant directory, per-user ceilings/workspaces, attributed approvals |
-| 6 | Controlled self-improvement | 🚧 in progress — M6a landed: the lab notebook (`--growth`, PII-stripped run records) |
+| 6 | Controlled self-improvement | 🚧 in progress — M6a + M6b + M6c landed: the lab notebook (`--growth`, PII-stripped run records), the verification case library (same-tenant evidence in the verification prompt only), and gated skills (adopted procedures executed step-by-step through the gate chain) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant

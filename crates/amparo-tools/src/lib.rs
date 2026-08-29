@@ -13,6 +13,7 @@ pub mod memory;
 pub mod paths;
 pub mod registry;
 pub mod shell;
+pub mod skills;
 pub mod testing;
 pub mod web;
 
@@ -21,4 +22,7 @@ pub use paths::PathPolicy;
 pub use registry::{
     default_registry, ToolCall, ToolExecutor, ToolParam, ToolRegistry, ToolResult, ToolSchema,
     ToolTrustTier,
+};
+pub use skills::{
+    SkillLibrary, SkillOrigin, SkillSpec, SkillStep, UseSkillTool, USE_SKILL,
 };

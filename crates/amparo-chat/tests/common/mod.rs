@@ -153,11 +153,13 @@ impl ChatTransport for MockTransport {
 /// one SSE script (a `Vec<String>` of frames) and streams it, so the full
 /// driver path runs without any HTTP. Exhausted scripts stream a plain
 /// "Done." turn, and `complete` (the self-verification call) always answers
-/// "VERIFIED".
+/// "VERIFIED" while recording the prompt so tests can observe what evidence
+/// (if any) the verification carried.
 pub struct StubProvider {
     scripts: Mutex<VecDeque<Vec<String>>>,
     panicking: AtomicBool,
     requests: Mutex<Vec<String>>,
+    complete_prompts: Mutex<Vec<String>>,
 }
 
 impl StubProvider {
@@ -167,6 +169,7 @@ impl StubProvider {
             scripts: Mutex::new(script.into()),
             panicking: AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
+            complete_prompts: Mutex::new(Vec::new()),
         })
     }
 
@@ -177,6 +180,7 @@ impl StubProvider {
             scripts: Mutex::new(VecDeque::new()),
             panicking: AtomicBool::new(true),
             requests: Mutex::new(Vec::new()),
+            complete_prompts: Mutex::new(Vec::new()),
         })
     }
 
@@ -184,6 +188,11 @@ impl StubProvider {
     /// what the LLM was told (tool results, workspace paths).
     pub fn recorded_requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Every `complete` (self-verification) prompt answered so far, in order.
+    pub fn recorded_complete_prompts(&self) -> Vec<String> {
+        self.complete_prompts.lock().unwrap().clone()
     }
 }
 
@@ -229,8 +238,9 @@ fn sse_stream(frames: &[String]) -> InferenceStream {
 impl InferenceProvider for StubProvider {
     async fn complete(
         &self,
-        _request: InferenceRequest,
+        request: InferenceRequest,
     ) -> Result<InferenceResponse, InferenceError> {
+        self.complete_prompts.lock().unwrap().push(request.prompt);
         Ok(InferenceResponse { text: "VERIFIED".into(), tokens: 1, finish_reason: "stop".into() })
     }
 

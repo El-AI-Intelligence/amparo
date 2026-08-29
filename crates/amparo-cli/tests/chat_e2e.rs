@@ -240,6 +240,26 @@ impl MockLlm {
             .iter()
             .any(|body| body.contains("tool_call_id") && body.contains("call_1"))
     }
+
+    /// The prompt of every recorded non-stream (self-verification) request,
+    /// in arrival order.
+    fn verification_prompts(&self) -> Vec<String> {
+        self.bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| !body.contains("\"stream\":true"))
+            .filter_map(|body| {
+                let value: Value = serde_json::from_str(body).ok()?;
+                Some(
+                    value["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
 }
 
 /// One SSE frame carrying a content delta.
@@ -716,7 +736,7 @@ async fn chat_telegram_roundtrip_message_approval_tool_answer() {
     );
 }
 
-// ── Growth notebook (M6a) ────────────────────────────────────────────────────
+// ── Growth notebook (M6a + M6b) ──────────────────────────────────────────────
 
 /// Whether the notebook file holds a record tagged with `tenant`.
 ///
@@ -791,6 +811,68 @@ async fn chat_telegram_growth_writes_run_record() {
     let task_text = record.get("task_text").and_then(|t| t.as_str()).expect("task text");
     assert!(task_text.contains("[EMAIL_1]"), "stripped placeholder kept: {task_text}");
     assert!(!task_text.contains("user@example.com"), "raw email stripped: {task_text}");
+}
+
+#[tokio::test]
+async fn chat_telegram_growth_retrieves_prior_cases_into_verification() {
+    let _guard = LOCK.lock().await;
+
+    // Two text-only tasks from the same user in different chats (the busy
+    // claim is per chat, so the second task never races the first). Task 1
+    // seeds the notebook; task 2's verification prompt must carry the case.
+    let llm = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(message_update(801, 111, 111, "deploy the staging site"));
+
+    let ws = fresh_workspace("growth-retrieval").display().to_string();
+    let base = telegram.url();
+    let llm_url = llm.url();
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_ALLOWLIST", "111"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", base.as_str()),
+            ("AMPARO_INFERENCE_URL", llm_url.as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+            ("AMPARO_WORKSPACE", ws.as_str()),
+        ],
+        &[],
+    );
+
+    let mut child = spawn_serve(&["chat", "telegram", "--allow-all", "--growth"]);
+
+    // Task 1's record must land before task 2 starts — its verification
+    // precedes the record, so the prompt order below is deterministic.
+    let records_path = PathBuf::from(&ws).join(".amparo/notebook/records.jsonl");
+    let first = wait_until(|| record_landed(&records_path, "telegram:111")).await;
+    assert!(first, "task 1 record never landed");
+
+    telegram.push_update(message_update(802, 111, 222, "deploy the staging site"));
+    let verified = wait_until(|| llm.verification_prompts().len() >= 2).await;
+
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for amparo chat");
+    drop(env);
+
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(verified, "second verification never arrived; child stderr: {err}");
+
+    let prompts = llm.verification_prompts();
+    assert!(
+        !prompts[0].contains("Prior cases"),
+        "an empty notebook leaves the first verification unchanged: {}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains("Prior cases in this tenant resembling the current task:"),
+        "the second verification carries the evidence section: {}",
+        prompts[1]
+    );
+    assert!(
+        prompts[1].contains("deploy the staging site"),
+        "the evidence names the prior task: {}",
+        prompts[1]
+    );
 }
 
 // ── Chat config (M5 tenant directory) ───────────────────────────────────────

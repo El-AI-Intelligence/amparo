@@ -124,6 +124,14 @@ controlled experiment — one variable (evidence) added to one measurement
 (the judgment of the candidate answer), with the rest of the loop
 unchanged.
 
+> **Landed (M6b).** The section is rendered by
+> `amparo_agent::cases::evidence_section` (caps: 3 cases per prompt,
+> 120-char task/outcome snippets, 5 tool names per line) and fed by
+> `amparo_notebook::CaseRetriever`, which enforces the same-tenant filter
+> at retrieval time over the store. The CLI and chat driver attach it
+> only under `--growth` — growth is write + read, and off by default.
+> The operator-promotion path from §3.2 remains M6e work.
+
 ### 3.3 Gated skills — procedures as hypotheses
 
 A **skill** is a named procedure: preconditions, an ordered list of steps
@@ -154,6 +162,18 @@ structural difference from self-improvement schemes where a distilled
 skill becomes raw instructions the model reads and follows. Here the
 distilled artifact is, at execution time, indistinguishable from any
 other sequence of tool calls — because it *is* a sequence of tool calls.
+
+**Landed (M6c).** `SkillSpec` (preconditions, ordered `SkillStep`s with
+fixed arguments, expected outcome, origin, provenance) and `UseSkillTool`
+live in `amparo-tools`; the expansion happens loop-side in `amparo-agent`
+— every step is gated, executed and recorded like a model-issued call
+(one synthesized tool result for the whole skill, steps add no
+conversation messages). Storage under `<workspace>/.amparo/skills/`:
+operator-authored candidates are TOML files (`amparo skill add`),
+adoptions are an append-only tenant-tagged log, proposals are inert
+`amparo skill propose` outputs. Adoption = `judge_tool("use_skill", name)`
+plus human approval rendering the full step plan; execution requires
+`--growth` (write + read + act, still off by default).
 
 ### 3.4 Metrics — falsifiability made operational
 
@@ -347,20 +367,29 @@ while the built-in default store stays cheap).
   path through the `Memory` trait in `amparo-tools`; `--growth` /
   `--no-growth` switch on the CLI and chat driver; audit-log-style
   append only.
-- **M6b — case library.** Retrieval over the store with the same-tenant
-  filter; evidence section appended to the verification prompt only;
-  observation-format serialization; operator promotion of cases.
-- **M6c — gated skills.** `SkillSpec` schema (preconditions, ordered
-  steps, expected outcome); candidate proposal from repeated high-VERIFIED
-  sequences (inert, flagged); adoption = policy event + full-plan human
-  approval; `use_skill` tool whose executor runs each step through the
-  gate chain individually.
+- **M6b — case library.** ✅ landed — `CaseLibrary` / `EvidenceCase`
+  seam in `amparo-agent`; evidence section appended to the verification
+  prompt only, observation-format serialization; `CaseRetriever` over
+  the store with the same-tenant filter, wired into the CLI and chat
+  driver under `--growth` (write + read). Operator promotion of cases
+  moved to M6e.
+- **M6c — gated skills.** ✅ landed — `SkillSpec` schema (preconditions,
+  ordered steps, expected outcome) and `UseSkillTool` in `amparo-tools`;
+  loop-side expansion in `amparo-agent` runs each step through the gate
+  chain individually (a blocked step aborts; steps emit the standard
+  events, so run records include the expansion); `SkillSet` +
+  `Proposer` in `amparo-notebook` with per-tenant folding; the
+  `amparo skill` CLI surface (add/propose/list/show/adopt — adoption =
+  policy event + full-plan human approval); execution wired into
+  `amparo run` and `amparo chat` under `--growth`. Candidate proposals
+  are explicit and opt-in (`amparo skill propose`), and remain inert
+  until adopted.
 - **M6d — metrics and retirement.** Per-skill counters; policy-drift
   dry-run re-check; performance-retirement thresholds; retire = disable +
   notify, audit record intact.
 - **M6e — rollup and archival.** Defaults from §4 (selective persistence,
-  4 KB caps, 90-day rollup to cold archive); sync-relay guidance for
-  teams.
+  4 KB caps, 90-day rollup to cold archive); operator promotion of
+  cases; sync-relay guidance for teams.
 
 ---
 
@@ -382,7 +411,20 @@ while the built-in default store stays cheap).
 - **Verification-prompt identity.** The verification step must remain a
   standalone completion (as today); the evidence section is injected
   text, not a change to how the round runs.
-- **Open:** is candidate proposal on by default or opt-in per tenant?
-  What is the default VERIFIED-rate retirement threshold? Should the
-  case library also inform the *nudge* path (same-tool repeats), or stay
-  strictly in verification?
+- **Open:** none for M6c. The default VERIFIED-rate *retirement*
+  threshold remains an M6d decision (it governs adoption *retirement*,
+  not candidate proposal — the proposal thresholds are the `amparo skill
+  propose` flags).
+- **Closed (M6c):** candidate proposal is an explicit operator command
+  (`amparo skill propose`, defaults `--min-runs 3` / `--min-verified-rate
+  0.8`) — never on by default, never auto-adopted. `use_skill` sits at
+  trust tier Observational, fixed (no new flag): the tool *names* a skill
+  to the model and reveals nothing the operator has not already adopted;
+  its expansion still runs at the ceiling of each step. Skill execution
+  requires `--growth`, the same single opt-in that governs the rest of
+  controlled growth — write + read + act, still off by default.
+- **Closed (M6b):** the case library stays strictly in verification —
+  the nudge path gets no evidence. The design doc's M6b wording governs:
+  evidence feeds "the *verification prompt only* … never in the action
+  loop." One variable (evidence) added to one measurement (verification)
+  keeps the growth mechanism legible.

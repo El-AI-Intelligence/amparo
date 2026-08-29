@@ -16,14 +16,15 @@
 //! stdout carries the final answer only; the report goes to stderr.
 
 use amparo_agent::{
-    Agent, AgentConfig, ApprovalGate, AutoApprove, AutoDeny, EventSink, FanoutSink, TaskStatus,
+    Agent, AgentConfig, ApprovalGate, AutoApprove, AutoDeny, CaseLibrary, EventSink, FanoutSink,
+    TaskStatus,
 };
 use amparo_inference::{InferenceConfig, MAX_TIMEOUT_SECS};
-use amparo_notebook::{JsonlStore, NotebookSink};
+use amparo_notebook::{CaseRetriever, JsonlStore, NotebookSink, SkillSet};
 use amparo_policy::{
     AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, wire::WirePolicyEngine,
 };
-use amparo_tools::{PathPolicy, ToolTrustTier, default_registry};
+use amparo_tools::{PathPolicy, SkillLibrary, ToolTrustTier, UseSkillTool, default_registry};
 use std::sync::Arc;
 
 use crate::approve::InteractiveApprovalGate;
@@ -240,7 +241,7 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     if let Some(dir) = &flags.workspace {
         std::env::set_var("AMPARO_WORKSPACE", dir);
     }
-    let registry = default_registry();
+    let mut registry = default_registry();
 
     let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {
@@ -272,15 +273,45 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     // The lab notebook: with --growth, records flow to a local append-only
     // store next to the printing sink; without it, printing exactly as
     // before. Kept outside the fanout so `flush` can await the final write.
+    // The same store feeds the case library (M6b): prior `cli` records are
+    // retrieved into the self-verification prompt — growth is write + read.
     let printing = Arc::new(PrintingSink);
+    let mut case_library: Option<Arc<dyn CaseLibrary>> = None;
+    let mut skills: Option<Arc<dyn SkillLibrary>> = None;
     let notebook: Option<Arc<NotebookSink>> = if flags.growth {
         let path = PathPolicy::from_env()
             .workspace_root
             .join(".amparo/notebook/records.jsonl");
-        let store = JsonlStore::open(&path)
-            .map_err(|e| format!("cannot open the growth notebook: {e}"))?;
+        let store: Arc<dyn amparo_tools::Memory> = Arc::new(
+            JsonlStore::open(&path)
+                .map_err(|e| format!("cannot open the growth notebook: {e}"))?,
+        );
         eprintln!("[growth] recording PII-stripped run records to {}", path.display());
-        Some(Arc::new(NotebookSink::new(Arc::new(store), "cli")))
+        eprintln!("[growth] retrieval: prior cli cases inform self-verification");
+        case_library = Some(Arc::new(CaseRetriever::new(
+            Arc::clone(&store),
+            "cli",
+        )));
+        // Gated skills (M6c): adopted skills register `use_skill` and the
+        // loop expands it step by step through the gate chain. No adopted
+        // skills → no registration and no line (byte-stable without growth).
+        let skill_set = SkillSet::load(
+            &PathPolicy::from_env()
+                .workspace_root
+                .join(".amparo/skills/adopted.jsonl"),
+            "cli",
+        );
+        let adopted_names = skill_set.names();
+        if !adopted_names.is_empty() {
+            let library: Arc<dyn SkillLibrary> = Arc::new(skill_set);
+            registry.register(Arc::new(UseSkillTool::new(Arc::clone(&library))));
+            eprintln!(
+                "[growth] skills: {} adopted for tenant cli",
+                adopted_names.len()
+            );
+            skills = Some(library);
+        }
+        Some(Arc::new(NotebookSink::new(store, "cli")))
     } else {
         None
     };
@@ -292,11 +323,17 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
         None => printing,
     };
 
-    let agent = Agent::new(provider, registry, policy)
+    let mut agent = Agent::new(provider, registry, policy)
         .with_approval(approval)
         .with_events(sink)
         .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
         .with_config(agent_config);
+    if let Some(library) = case_library {
+        agent = agent.with_case_library(library);
+    }
+    if let Some(library) = skills {
+        agent = agent.with_skills(library);
+    }
 
     let report = agent.run(flags.task).await;
     // The CLI is a short-lived host: await the pending record write so it

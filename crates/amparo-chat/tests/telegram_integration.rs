@@ -20,8 +20,9 @@ use amparo_chat::telegram::TelegramTransport;
 use amparo_chat::transport::{
     ApprovalButtonPress, ChatError, ChatRef, ChatTransport, PressOutcome,
 };
+use amparo_notebook::{AdoptRecord, JsonlStore, append_adopt};
 use amparo_policy::AllowAllPolicyEngine;
-use amparo_tools::ToolTrustTier;
+use amparo_tools::{MemoryEntry, SkillOrigin, SkillSpec, SkillStep, ToolTrustTier};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -439,6 +440,121 @@ async fn receive_loop_polls_offsets_and_feeds_the_driver() {
     loop_task.abort();
     let _ = loop_task.await;
     mock.stop();
+}
+
+/// A Telegram task with a growth notebook attached executes the tenant's
+/// adopted skill end-to-end through the real adapter: `use_skill` expands
+/// into its echo step, the final answer lands as a sendMessage, and the
+/// growth record carries the `telegram:111` tenant plus both tool calls.
+#[tokio::test]
+async fn growth_executes_an_adopted_skill_for_the_telegram_tenant() {
+    let mock = MockTelegram::start().await;
+    mock.push_update(message_update(301, 111, 222, "use the demo skill"));
+
+    let root = std::env::temp_dir()
+        .join(format!("amparo-chat-skills-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let spec = SkillSpec {
+        name: "demo-skill".into(),
+        description: "one echo step".into(),
+        preconditions: vec![],
+        steps: vec![SkillStep {
+            tool: "echo".into(),
+            arguments: serde_json::json!({"message": "from-skill"}),
+        }],
+        expected_outcome: "the echo runs".into(),
+        origin: SkillOrigin::Operator,
+        source_run_ids: vec![],
+        adopted_at: None,
+    };
+    append_adopt(
+        &root.join(".amparo/skills/adopted.jsonl"),
+        &AdoptRecord {
+            event: "adopt".into(),
+            tenant_id: "telegram:111".into(),
+            name: "demo-skill".into(),
+            spec,
+            adopted_at: "2026-08-29T00:00:00Z".into(),
+        },
+    )
+    .expect("the seed adoption writes");
+    std::fs::create_dir_all(root.join(".amparo/notebook")).unwrap();
+    let records = root.join(".amparo/notebook/records.jsonl");
+
+    let transport: Arc<dyn ChatTransport> =
+        Arc::new(TelegramTransport::new(mock.url(), "TEST-TOKEN-6"));
+    let driver = Arc::new(
+        ChatDriver::new(
+            Tenants::LegacyAllowlist(HashSet::from(["111".to_string()])),
+            StubProvider::new(vec![
+                turn_tool_call("call_1", "use_skill", r#"{"skill_name":"demo-skill"}"#),
+                turn_text("Skill done."),
+            ]),
+            PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
+            registry_with_echo(ToolTrustTier::Observational),
+            root.clone(),
+            transport.clone(),
+            Arc::new(ApprovalRouter::new()),
+            true,
+        )
+        .with_trust_ceiling(ToolTrustTier::SystemControl)
+        .with_growth(Arc::new(
+            JsonlStore::open(&records).expect("the growth notebook opens"),
+        )),
+    );
+    let loop_task = tokio::spawn({
+        let transport = Arc::clone(&transport);
+        async move { transport.receive(driver).await }
+    });
+
+    // The final answer arrives over the real adapter.
+    wait_until(|| {
+        mock.log()
+            .iter()
+            .any(|r| r.path.contains("/sendMessage") && body_contains(&r.body, "Skill done."))
+    })
+    .await;
+
+    // The record write lands on the spawned task — poll the file. Lines
+    // are `MemoryEntry` wrappers, so the run record lives (escaped) inside
+    // `content`; parse rather than substring-match the raw line.
+    wait_until(|| {
+        std::fs::read_to_string(&records)
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .filter_map(|line| serde_json::from_str::<MemoryEntry>(line).ok())
+                    .next()
+                    .map(|entry| entry.content)
+            })
+            .map(|content| content.contains(r#""tenant_id":"telegram:111""#))
+            .unwrap_or(false)
+    })
+    .await;
+    let content = std::fs::read_to_string(&records)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<MemoryEntry>(line).ok())
+        .map(|entry| entry.content)
+        .next()
+        .expect("one record");
+    assert!(
+        content.contains(r#""tool_name":"use_skill""#),
+        "the skill call is recorded: {content}"
+    );
+    assert!(
+        content.contains(r#""tool_name":"echo""#),
+        "the step ran through its own gate: {content}"
+    );
+    assert!(
+        content.contains(r#""decision":"allowed""#),
+        "both calls passed the gate: {content}"
+    );
+
+    loop_task.abort();
+    let _ = loop_task.await;
+    mock.stop();
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A callback from a user who did not start the task is answered with the

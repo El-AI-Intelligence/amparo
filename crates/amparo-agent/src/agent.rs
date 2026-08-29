@@ -20,12 +20,13 @@
 //! VERIFIED/INCOMPLETE self-verification pass.
 
 use crate::approval::{ApprovalGate, ApprovalRequest, AutoDeny};
-use crate::events::{AgentEvent, EventSink, InMemoryEventSink};
+use crate::cases::{evidence_section, CaseLibrary};
+use crate::events::{truncate, AgentEvent, EventSink, InMemoryEventSink};
 use crate::sse::accumulate_turn;
 use amparo_inference::{ChatMessage, ChatRequest, InferenceProvider, InferenceRequest, Tool};
 use amparo_policy::{PolicyEngine, PolicyVerdict};
 use amparo_privacy::{DataCategory, PiiPlaceholder};
-use amparo_tools::{ToolCall, ToolRegistry, ToolResult, ToolTrustTier};
+use amparo_tools::{SkillLibrary, ToolCall, ToolRegistry, ToolResult, ToolTrustTier, USE_SKILL};
 use futures_util::future::join_all;
 use serde::Serialize;
 use std::sync::Arc;
@@ -134,6 +135,26 @@ message containing your final answer — do not call tools when the task is \
 done. If a tool result does not contain what was requested, say honestly what \
 you see and what is missing. Never invent tool results.";
 
+/// The outcome of gating one call.
+enum GateOutcome {
+    /// The call may execute; `reasons` are the gate reasons recorded on the
+    /// `ToolGate` event.
+    Ready { reasons: Vec<String> },
+    /// A gate blocked the call; the caller records the failed `result`
+    /// (for model calls, via [`Agent::block_call`] — for skill steps, into
+    /// the expansion record).
+    Blocked { result: ToolResult, decision: String, reasons: Vec<String> },
+}
+
+/// One batch item, in model order: either a direct call still to execute,
+/// or an already-expanded skill result.
+enum ExecItem {
+    /// A gated model call, executed concurrently with the rest of the batch.
+    Call(ToolCall),
+    /// A `use_skill` expansion result, already in hand.
+    Skill(ToolResult),
+}
+
 /// The agent. `inference` supplies the model; `registry` the tools; `policy`
 /// the deny-by-default gate. Everything else has a safe default and a
 /// `with_*` builder.
@@ -144,6 +165,12 @@ pub struct Agent {
     approval: Arc<dyn ApprovalGate>,
     events: Arc<dyn EventSink>,
     privacy: Option<Arc<amparo_privacy::PrivacyPolicy>>,
+    /// The optional verification case library (M6b): retrieved prior cases
+    /// appear as an evidence section in the self-verification prompt only.
+    cases: Option<Arc<dyn CaseLibrary>>,
+    /// The optional adopted-skill library (M6c): `use_skill` calls expand
+    /// into their steps in the loop, each step gated individually.
+    skills: Option<Arc<dyn SkillLibrary>>,
     config: AgentConfig,
 }
 
@@ -164,6 +191,8 @@ impl Agent {
             approval: Arc::new(AutoDeny),
             events: Arc::new(InMemoryEventSink::new()),
             privacy: None,
+            cases: None,
+            skills: None,
             config: AgentConfig::default(),
         }
     }
@@ -184,6 +213,23 @@ impl Agent {
     /// stripped before inference and restored after (Secure Minions).
     pub fn with_privacy(mut self, policy: Arc<amparo_privacy::PrivacyPolicy>) -> Self {
         self.privacy = Some(policy);
+        self
+    }
+
+    /// Attach the verification case library — retrieved prior cases appear
+    /// as an evidence section in the self-verification prompt only (never
+    /// in the action loop; a case can never execute anything).
+    pub fn with_case_library(mut self, library: Arc<dyn CaseLibrary>) -> Self {
+        self.cases = Some(library);
+        self
+    }
+
+    /// Attach the adopted-skill library (M6c). `use_skill` calls expand
+    /// into their ordered steps in the loop, and every step runs the full
+    /// gate chain individually — a skill can never grant its steps an
+    /// exemption.
+    pub fn with_skills(mut self, library: Arc<dyn SkillLibrary>) -> Self {
+        self.skills = Some(library);
         self
     }
 
@@ -241,6 +287,9 @@ impl Agent {
         let mut final_answer: Option<String> = None;
         let mut verification: Option<Verification> = None;
         let mut steps_used = 0;
+        // Tool names this run has called, in first-use order — the case
+        // library's retrieval query uses them as a sequence signal (M6b).
+        let mut used_tool_names: Vec<String> = Vec::new();
 
         for step in 0..self.config.max_steps {
             steps_used = step + 1;
@@ -413,6 +462,9 @@ impl Agent {
                 for call in &calls {
                     steps.push(AgentStep::ToolCall(call.clone()));
                     self.events.emit(&AgentEvent::ToolCallRequested { call: call.clone() });
+                    if !used_tool_names.contains(&call.name) {
+                        used_tool_names.push(call.name.clone());
+                    }
                 }
 
                 // Pre-flight gates run serially; each call ends up either
@@ -420,207 +472,70 @@ impl Agent {
                 // call — executed or not — must be answered by a tool-role
                 // message carrying the same tool_call_id, or providers reject
                 // the next request.
-                let mut ready: Vec<ToolCall> = Vec::new();
+                let mut ready: Vec<ExecItem> = Vec::new();
                 let mut blocked_obs: Vec<String> = Vec::new();
                 let mut tool_messages: Vec<ChatMessage> = Vec::new();
 
                 for call in &calls {
-                    let make_result =
-                        |success: bool, output: serde_json::Value, summary: &str| ToolResult {
-                            tool_call_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            success,
-                            output,
-                            display_summary: summary.to_string(),
-                            duration_ms: 0,
-                        };
-
-                    // Registry lookup first — unknown tools get an honest
-                    // error naming what is available, not a trust verdict.
-                    if self.registry.get_executor(&call.name).is_none() {
-                        let available: Vec<String> = self
-                            .registry
-                            .list_schemas()
-                            .iter()
-                            .map(|s| s.name.clone())
-                            .collect();
-                        let error = format!(
-                            "Unknown tool: {}. Available: {}",
-                            call.name,
-                            available.join(", ")
-                        );
-                        let result =
-                            make_result(false, serde_json::json!({"error": error}), "Unknown tool");
-                        self.block_call(
-                            &result,
-                            "unknown_tool",
-                            Vec::new(),
-                            &mut steps,
-                            &mut blocked_obs,
-                            &mut tool_messages,
-                        );
-                        continue;
-                    }
-
-                    // Trust ceiling
-                    let tier_ok = self
-                        .registry
-                        .get_tier(&call.name)
-                        .map(|t| t <= self.config.trust_ceiling)
-                        .unwrap_or(false);
-                    if !tier_ok {
-                        let result = make_result(
-                            false,
-                            serde_json::json!({"error": "tool blocked by trust ceiling"}),
-                            "Blocked",
-                        );
-                        self.block_call(
-                            &result,
-                            "trust_blocked",
-                            vec!["tool tier exceeds the trust ceiling".to_string()],
-                            &mut steps,
-                            &mut blocked_obs,
-                            &mut tool_messages,
-                        );
-                        continue;
-                    }
-
-                    // Policy gate — the deny-by-default seam.
-                    let (target, params) = extract_target(call);
-                    let param_refs: Vec<(&str, &str)> =
-                        params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    let decision =
-                        self.policy.judge_tool(&call.name, &target, &param_refs).await;
-                    let mut escalate_pending = false;
-                    let reasons: Vec<String> = match decision.verdict {
-                        PolicyVerdict::Deny => {
-                            let error = format!(
-                                "Policy denied {}: {}",
-                                call.name,
-                                decision.fired.join("; ")
-                            );
-                            let result = make_result(
-                                false,
-                                serde_json::json!({"error": error}),
-                                "Blocked by policy",
-                            );
+                    match self.gate_call(call).await {
+                        GateOutcome::Blocked { result, decision, reasons } => {
                             self.block_call(
                                 &result,
-                                "policy_denied",
-                                decision.fired,
+                                &decision,
+                                reasons,
                                 &mut steps,
                                 &mut blocked_obs,
                                 &mut tool_messages,
                             );
-                            continue;
                         }
-                        PolicyVerdict::Escalate => {
-                            // Escalate means ask — never execute silently.
-                            escalate_pending = true;
-                            let reasons = decision.fired;
-                            tracing::warn!(
-                                "[amparo-agent] policy escalate on {} (asking for approval): {}",
-                                call.name,
-                                reasons.join("; ")
-                            );
-                            reasons
-                        }
-                        PolicyVerdict::Allow => {
-                            // Audit-mode allows carry the engine's real
-                            // verdict in `fired` — keep it visible.
-                            decision.fired
-                        }
-                    };
-
-                    // Human-approval gate — tier ≥ ExternalEffector or a
-                    // policy Escalate. The gate decides how a human is asked
-                    // and when to auto-deny; Amparo's built-ins auto-deny.
-                    let tier = self
-                        .registry
-                        .get_tier(&call.name)
-                        .unwrap_or(ToolTrustTier::Observational);
-                    if escalate_pending || tier >= ToolTrustTier::ExternalEffector {
-                        let mut ask_reasons = reasons.clone();
-                        if escalate_pending {
-                            ask_reasons
-                                .push("policy escalated this call for human review".to_string());
-                        }
-                        if tier >= ToolTrustTier::ExternalEffector {
-                            ask_reasons
-                                .push(format!("tool tier {:?} requires human approval", tier));
-                        }
-                        let approval_request = ApprovalRequest {
-                            call_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                            reasons: ask_reasons.clone(),
-                        };
-                        self.events.emit(&AgentEvent::ApprovalRequested {
-                            call_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            reasons: ask_reasons.clone(),
-                        });
-                        let approved = self.approval.request(&approval_request).await;
-                        self.events.emit(&AgentEvent::ApprovalResolved {
-                            call_id: call.id.clone(),
-                            approved,
-                        });
-                        if !approved {
-                            let result = make_result(
-                                false,
-                                serde_json::json!({"error": "User denied the action or approval timed out"}),
-                                "Denied by user",
-                            );
-                            self.block_call(
-                                &result,
-                                "approval_denied",
-                                vec!["human approval denied".to_string()],
-                                &mut steps,
-                                &mut blocked_obs,
-                                &mut tool_messages,
-                            );
-                            continue;
+                        GateOutcome::Ready { reasons } => {
+                            self.events.emit(&AgentEvent::ToolGate {
+                                call_id: call.id.clone(),
+                                tool_name: call.name.clone(),
+                                decision: "allowed".to_string(),
+                                reasons,
+                            });
+                            if call.name == USE_SKILL {
+                                // A skill expands in the loop: every step runs
+                                // the same gate chain, serially, before the
+                                // rest of the batch executes. Steps never add
+                                // conversation messages — the model asked for
+                                // `use_skill` and gets ONE tool-role answer.
+                                let (result, step_tools) = self.expand_skill(call).await;
+                                for tool in step_tools {
+                                    if !used_tool_names.contains(&tool) {
+                                        used_tool_names.push(tool);
+                                    }
+                                }
+                                ready.push(ExecItem::Skill(result));
+                            } else {
+                                ready.push(ExecItem::Call(call.clone()));
+                            }
                         }
                     }
-
-                    self.events.emit(&AgentEvent::ToolGate {
-                        call_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        decision: "allowed".to_string(),
-                        reasons,
-                    });
-                    ready.push(call.clone());
                 }
 
                 // Execute all gated tools concurrently, retrying failures.
-                let exec_futures = ready.iter().map(|call| {
-                    let registry = &self.registry;
-                    let call = call.clone();
-                    async move {
-                        let execute = || async {
-                            match registry.get_executor(&call.name) {
-                                Some(executor) => executor.execute(&call).await,
-                                // Pre-checked above; keep an honest fallback.
-                                None => ToolResult {
-                                    tool_call_id: call.id.clone(),
-                                    tool_name: call.name.clone(),
-                                    success: false,
-                                    output: serde_json::json!({"error": "unknown tool"}),
-                                    display_summary: "Unknown tool".to_string(),
-                                    duration_ms: 0,
-                                },
-                            }
-                        };
-                        let mut result = execute().await;
-                        let mut retry = 0usize;
-                        while !result.success && retry < MAX_TOOL_RETRIES {
-                            retry += 1;
-                            result = execute().await;
-                        }
-                        result
+                // Skill results are already in hand; the ordered walk below
+                // rebuilds `exec_results` in model order so everything
+                // downstream sees one result per call, batch position intact.
+                let exec_futures = ready.iter().filter_map(|item| match item {
+                    ExecItem::Call(call) => {
+                        let call = call.clone();
+                        Some(async move { self.execute_call(&call).await })
                     }
+                    ExecItem::Skill(_) => None,
                 });
-                let exec_results: Vec<ToolResult> = join_all(exec_futures).await;
+                let mut exec_results: Vec<ToolResult> = Vec::with_capacity(ready.len());
+                let mut call_results = join_all(exec_futures).await.into_iter();
+                for item in &ready {
+                    match item {
+                        ExecItem::Call(_) => {
+                            exec_results.push(call_results.next().expect("one result per call"))
+                        }
+                        ExecItem::Skill(result) => exec_results.push(result.clone()),
+                    }
+                }
 
                 // One-shot action detection: a simple "open X" request whose
                 // single batch all succeeded needs no further turns.
@@ -754,7 +669,7 @@ impl Agent {
             // an otherwise-finished task. The prompt includes the candidate
             // answer because this verification runs as a standalone
             // completion — and it is PII-stripped like every other message.
-            let verify_prompt = format!(
+            let mut verify_prompt = format!(
                 "You just completed this task: \"{}\"\nYour final answer was: \"{}\"\n\
                  Verification check: Does the final answer fully and correctly address \
                  the task?\n\
@@ -764,6 +679,19 @@ impl Agent {
                 safe_prompt.chars().take(200).collect::<String>(),
                 assistant_content
             );
+            // M6b: retrieved prior cases — observation-format evidence —
+            // appended to the verification prompt only. An empty result
+            // leaves the prompt byte-identical to the no-library build.
+            if let Some(library) = &self.cases {
+                let cases = library
+                    .retrieve(&safe_prompt, &used_tool_names, 3)
+                    .await;
+                if let Some(section) = evidence_section(&cases) {
+                    verify_prompt.push('\n');
+                    verify_prompt.push('\n');
+                    verify_prompt.push_str(&section);
+                }
+            }
             let verify_prompt = match &self.privacy {
                 Some(policy) if policy.auto_redact_pii => {
                     amparo_privacy::secure_minions_strip(&verify_prompt).sanitised_text
@@ -882,6 +810,323 @@ impl Agent {
             result.tool_call_id.clone(),
             serde_json::to_string(&result.output).unwrap_or_default(),
         ));
+    }
+
+    /// Gate one call: registry lookup → trust ceiling → policy engine →
+    /// human approval. Returns [`GateOutcome::Ready`] with the gate reasons,
+    /// or [`GateOutcome::Blocked`] with the failed result the caller must
+    /// record (model calls via [`Self::block_call`]; skill steps into the
+    /// expansion record). Emits `ApprovalRequested`/`ApprovalResolved` when
+    /// the approval gate runs; never emits `ToolGate` — the caller decides.
+    async fn gate_call(&self, call: &ToolCall) -> GateOutcome {
+        let make_result = |success: bool, output: serde_json::Value, summary: &str| ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success,
+            output,
+            display_summary: summary.to_string(),
+            duration_ms: 0,
+        };
+
+        // Registry lookup first — unknown tools get an honest error naming
+        // what is available, not a trust verdict.
+        if self.registry.get_executor(&call.name).is_none() {
+            let available: Vec<String> = self
+                .registry
+                .list_schemas()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            let error = format!(
+                "Unknown tool: {}. Available: {}",
+                call.name,
+                available.join(", ")
+            );
+            return GateOutcome::Blocked {
+                result: make_result(false, serde_json::json!({"error": error}), "Unknown tool"),
+                decision: "unknown_tool".to_string(),
+                reasons: Vec::new(),
+            };
+        }
+
+        // Trust ceiling
+        let tier_ok = self
+            .registry
+            .get_tier(&call.name)
+            .map(|t| t <= self.config.trust_ceiling)
+            .unwrap_or(false);
+        if !tier_ok {
+            return GateOutcome::Blocked {
+                result: make_result(
+                    false,
+                    serde_json::json!({"error": "tool blocked by trust ceiling"}),
+                    "Blocked",
+                ),
+                decision: "trust_blocked".to_string(),
+                reasons: vec!["tool tier exceeds the trust ceiling".to_string()],
+            };
+        }
+
+        // Policy gate — the deny-by-default seam. For `use_skill` the engine
+        // judges the skill name, matching the adoption check; its steps get
+        // their own checks with their own targets when they expand.
+        let (target, params) = if call.name == USE_SKILL {
+            (
+                call.arg_str("skill_name").unwrap_or("").to_string(),
+                Vec::new(),
+            )
+        } else {
+            extract_target(call)
+        };
+        let param_refs: Vec<(&str, &str)> =
+            params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let decision = self.policy.judge_tool(&call.name, &target, &param_refs).await;
+        let mut escalate_pending = false;
+        let reasons: Vec<String> = match decision.verdict {
+            PolicyVerdict::Deny => {
+                let error = format!("Policy denied {}: {}", call.name, decision.fired.join("; "));
+                return GateOutcome::Blocked {
+                    result: make_result(
+                        false,
+                        serde_json::json!({"error": error}),
+                        "Blocked by policy",
+                    ),
+                    decision: "policy_denied".to_string(),
+                    reasons: decision.fired,
+                };
+            }
+            PolicyVerdict::Escalate => {
+                // Escalate means ask — never execute silently.
+                escalate_pending = true;
+                let reasons = decision.fired;
+                tracing::warn!(
+                    "[amparo-agent] policy escalate on {} (asking for approval): {}",
+                    call.name,
+                    reasons.join("; ")
+                );
+                reasons
+            }
+            PolicyVerdict::Allow => {
+                // Audit-mode allows carry the engine's real verdict in
+                // `fired` — keep it visible.
+                decision.fired
+            }
+        };
+
+        // Human-approval gate — tier ≥ ExternalEffector or a policy
+        // Escalate. The gate decides how a human is asked and when to
+        // auto-deny; Amparo's built-ins auto-deny.
+        let tier = self
+            .registry
+            .get_tier(&call.name)
+            .unwrap_or(ToolTrustTier::Observational);
+        if escalate_pending || tier >= ToolTrustTier::ExternalEffector {
+            let mut ask_reasons = reasons.clone();
+            if escalate_pending {
+                ask_reasons.push("policy escalated this call for human review".to_string());
+            }
+            if tier >= ToolTrustTier::ExternalEffector {
+                ask_reasons.push(format!("tool tier {:?} requires human approval", tier));
+            }
+            let approval_request = ApprovalRequest {
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                reasons: ask_reasons.clone(),
+            };
+            self.events.emit(&AgentEvent::ApprovalRequested {
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                reasons: ask_reasons.clone(),
+            });
+            let approved = self.approval.request(&approval_request).await;
+            self.events.emit(&AgentEvent::ApprovalResolved {
+                call_id: call.id.clone(),
+                approved,
+            });
+            if !approved {
+                return GateOutcome::Blocked {
+                    result: make_result(
+                        false,
+                        serde_json::json!({"error": "User denied the action or approval timed out"}),
+                        "Denied by user",
+                    ),
+                    decision: "approval_denied".to_string(),
+                    reasons: vec!["human approval denied".to_string()],
+                };
+            }
+        }
+
+        GateOutcome::Ready { reasons }
+    }
+
+    /// Execute one already-gated call through its executor, retrying failed
+    /// executions up to [`MAX_TOOL_RETRIES`] times.
+    async fn execute_call(&self, call: &ToolCall) -> ToolResult {
+        let execute = || async {
+            match self.registry.get_executor(&call.name) {
+                Some(executor) => executor.execute(call).await,
+                // Pre-checked by the gate; keep an honest fallback.
+                None => ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: serde_json::json!({"error": "unknown tool"}),
+                    display_summary: "Unknown tool".to_string(),
+                    duration_ms: 0,
+                },
+            }
+        };
+        let mut result = execute().await;
+        let mut retry = 0usize;
+        while !result.success && retry < MAX_TOOL_RETRIES {
+            retry += 1;
+            result = execute().await;
+        }
+        result
+    }
+
+    /// Expand a `use_skill` call into its ordered steps, running each one
+    /// through the full gate chain individually (registry → ceiling →
+    /// policy → approval) before executing it. A blocked step aborts the
+    /// skill: remaining steps are skipped and the overall result fails with
+    /// the per-step record including the block reason.
+    ///
+    /// Steps emit the standard `ToolCallRequested`/`ToolGate`/`ToolExecuted`
+    /// events (so the notebook records the expansion) but add no
+    /// conversation messages and do not feed the same-tool counter — an
+    /// authored finite sequence is not a loop symptom. The returned
+    /// `Vec<String>` is the step tool names in first-use order, feeding the
+    /// case-library retrieval query.
+    async fn expand_skill(&self, call: &ToolCall) -> (ToolResult, Vec<String>) {
+        let skill_name = call.arg_str("skill_name").unwrap_or("").to_string();
+        let names = self
+            .skills
+            .as_ref()
+            .map(|library| library.names())
+            .unwrap_or_default();
+        let spec = match self.skills.as_ref().and_then(|l| l.get(&skill_name)) {
+            Some(spec) => spec,
+            None => {
+                // Defensive: the tool is only registered with a library
+                // attached. An honest failure names what was available.
+                let listed = if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
+                };
+                let error = format!("Unknown skill: {}. Adopted skills: {}", skill_name, listed);
+                return (
+                    ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: false,
+                        output: serde_json::json!({"error": error}),
+                        display_summary: "Unknown skill".to_string(),
+                        duration_ms: 0,
+                    },
+                    Vec::new(),
+                );
+            }
+        };
+
+        let total = spec.steps.len();
+        let mut done: Vec<serde_json::Value> = Vec::new();
+        let mut step_tools: Vec<String> = Vec::new();
+        let mut duration_ms: u64 = 0;
+        let mut blocked = false;
+
+        for (k, step) in spec.steps.iter().enumerate() {
+            let step_call = ToolCall {
+                id: format!("{}-step-{}", call.id, k),
+                name: step.tool.clone(),
+                arguments: step.arguments.clone(),
+            };
+            if !step_tools.contains(&step_call.name) {
+                step_tools.push(step_call.name.clone());
+            }
+            self.events.emit(&AgentEvent::ToolCallRequested { call: step_call.clone() });
+            match self.gate_call(&step_call).await {
+                GateOutcome::Blocked { result, decision, reasons } => {
+                    self.events.emit(&AgentEvent::ToolGate {
+                        call_id: step_call.id.clone(),
+                        tool_name: step_call.name.clone(),
+                        decision: decision.clone(),
+                        reasons: reasons.clone(),
+                    });
+                    done.push(serde_json::json!({
+                        "step": k + 1,
+                        "tool": step_call.name,
+                        "success": false,
+                        "blocked": true,
+                        "decision": decision,
+                        "reasons": reasons,
+                        "error": result.output.get("error").cloned().unwrap_or(serde_json::Value::Null),
+                    }));
+                    blocked = true;
+                    break;
+                }
+                GateOutcome::Ready { reasons } => {
+                    self.events.emit(&AgentEvent::ToolGate {
+                        call_id: step_call.id.clone(),
+                        tool_name: step_call.name.clone(),
+                        decision: "allowed".to_string(),
+                        reasons,
+                    });
+                    let result = self.execute_call(&step_call).await;
+                    duration_ms = duration_ms.saturating_add(result.duration_ms);
+                    done.push(serde_json::json!({
+                        "step": k + 1,
+                        "tool": step_call.name,
+                        "success": result.success,
+                        "display_summary": result.display_summary,
+                        "output": result.output,
+                    }));
+                    self.events.emit(&AgentEvent::ToolExecuted { result });
+                }
+            }
+        }
+
+        let output = serde_json::json!({
+            "skill": skill_name,
+            "success": !blocked,
+            "steps": done,
+            "skipped": total - done.len(),
+            "expected_outcome": spec.expected_outcome,
+        });
+        let (success, summary) = if blocked {
+            (
+                false,
+                format!(
+                    "skill {}: blocked at step {} of {} — remaining steps skipped",
+                    skill_name,
+                    done.len(),
+                    total
+                ),
+            )
+        } else {
+            (
+                true,
+                format!(
+                    "skill {}: {}/{} steps succeeded — {}",
+                    skill_name,
+                    done.len(),
+                    total,
+                    truncate(&spec.expected_outcome)
+                ),
+            )
+        };
+        (
+            ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success,
+                output,
+                display_summary: summary,
+                duration_ms,
+            },
+            step_tools,
+        )
     }
 }
 
@@ -1003,7 +1248,10 @@ mod tests {
     use crate::approval::{ApprovalGate, AutoApprove};
     use amparo_inference::InferenceError;
     use amparo_policy::PolicyDecision;
-    use amparo_tools::{ToolExecutor, ToolParam, ToolSchema};
+    use amparo_tools::{
+        SkillLibrary, SkillOrigin, SkillSpec, SkillStep, ToolExecutor, ToolParam, ToolSchema,
+        UseSkillTool,
+    };
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1012,12 +1260,13 @@ mod tests {
 
     /// Scripted provider: pops one SSE script per chat turn (a Vec of frames),
     /// then a final-answer script when exhausted. `complete()` (used by
-    /// self-verification) pops from a separate queue. Every chat request is
-    /// recorded for assertions.
+    /// self-verification) pops from a separate queue. Every chat request and
+    /// every completion request is recorded for assertions.
     struct ScriptedProvider {
         chat_scripts: std::sync::Mutex<std::collections::VecDeque<Vec<String>>>,
         complete_scripts: std::sync::Mutex<std::collections::VecDeque<String>>,
         chat_requests: std::sync::Mutex<Vec<ChatRequest>>,
+        complete_requests: std::sync::Mutex<Vec<InferenceRequest>>,
     }
 
     impl ScriptedProvider {
@@ -1026,6 +1275,7 @@ mod tests {
                 chat_scripts: std::sync::Mutex::new(Default::default()),
                 complete_scripts: std::sync::Mutex::new(Default::default()),
                 chat_requests: std::sync::Mutex::new(Vec::new()),
+                complete_requests: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -1039,6 +1289,10 @@ mod tests {
 
         fn recorded_requests(&self) -> Vec<ChatRequest> {
             self.chat_requests.lock().unwrap().clone()
+        }
+
+        fn recorded_complete_requests(&self) -> Vec<InferenceRequest> {
+            self.complete_requests.lock().unwrap().clone()
         }
     }
 
@@ -1081,8 +1335,9 @@ mod tests {
     impl InferenceProvider for ScriptedProvider {
         async fn complete(
             &self,
-            _request: InferenceRequest,
+            request: InferenceRequest,
         ) -> Result<amparo_inference::InferenceResponse, InferenceError> {
+            self.complete_requests.lock().unwrap().push(request);
             let reply = self
                 .complete_scripts
                 .lock()
@@ -1291,6 +1546,440 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, AgentStep::FinalAnswer { .. })));
+    }
+
+    // ── Case library (M6b) tests ────────────────────────────────────────────
+
+    fn evidence_case(id: &str) -> crate::cases::EvidenceCase {
+        crate::cases::EvidenceCase {
+            id: id.to_string(),
+            date: "2026-08-14".to_string(),
+            verdict: "VERIFIED".to_string(),
+            task_text: "run the tests".to_string(),
+            tool_names: vec!["run_command".to_string()],
+            outcome: Some("all passed".to_string()),
+        }
+    }
+
+    /// Returns scripted cases and records every retrieval for assertions.
+    struct RecordingCaseLibrary {
+        cases: std::sync::Mutex<Vec<crate::cases::EvidenceCase>>,
+        seen: std::sync::Mutex<Vec<(String, Vec<String>, usize)>>,
+    }
+
+    impl RecordingCaseLibrary {
+        fn new(cases: Vec<crate::cases::EvidenceCase>) -> Arc<Self> {
+            Arc::new(Self {
+                cases: std::sync::Mutex::new(cases),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<(String, Vec<String>, usize)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CaseLibrary for RecordingCaseLibrary {
+        async fn retrieve(
+            &self,
+            task_text: &str,
+            tool_names: &[String],
+            limit: usize,
+        ) -> Vec<crate::cases::EvidenceCase> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((task_text.to_string(), tool_names.to_vec(), limit));
+            self.cases.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn case_library_feeds_verification_prompt_only() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("The answer."));
+        provider.push_verify("VERIFIED");
+
+        let library = RecordingCaseLibrary::new(vec![evidence_case("rec-1")]);
+        let (registry, _calls) = echo_registry();
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_case_library(library.clone());
+
+        let report = agent.run("run the tests").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+
+        // The evidence section reached the verification completion…
+        let verify_prompt = provider
+            .recorded_complete_requests()
+            .into_iter()
+            .map(|r| r.prompt)
+            .find(|p| p.contains("Verification check"))
+            .expect("verification completion ran");
+        assert!(verify_prompt.contains("Prior cases in this tenant resembling the current task:"));
+        assert!(verify_prompt.contains("Case rec-1 (2026-08-14, VERIFIED)"));
+
+        // …and nowhere in the action-loop chat requests.
+        for req in provider.recorded_requests() {
+            for msg in req.messages {
+                assert!(
+                    !msg.content.contains("Prior cases"),
+                    "evidence must never reach the action loop"
+                );
+            }
+        }
+
+        // Retrieval saw the stripped task and the host's limit.
+        assert_eq!(library.seen().len(), 1);
+        assert_eq!(library.seen()[0].0, "run the tests");
+        assert_eq!(library.seen()[0].2, 3);
+    }
+
+    #[tokio::test]
+    async fn empty_case_library_leaves_verify_prompt_unchanged() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("The answer."));
+        provider.push_verify("VERIFIED");
+
+        let library = RecordingCaseLibrary::new(vec![]);
+        let (registry, _calls) = echo_registry();
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_case_library(library.clone());
+
+        let report = agent.run("run the tests").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(library.seen().len(), 1, "retrieval still ran");
+        let verify_prompt = provider
+            .recorded_complete_requests()
+            .into_iter()
+            .map(|r| r.prompt)
+            .find(|p| p.contains("Verification check"))
+            .expect("verification completion ran");
+        assert!(!verify_prompt.contains("Prior cases"));
+    }
+
+    #[tokio::test]
+    async fn retrieval_receives_stripped_task_and_tool_names() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+        provider.push_chat(turn_text("The answer."));
+        provider.push_verify("VERIFIED");
+
+        let library = RecordingCaseLibrary::new(vec![]);
+        let (registry, _calls) = echo_registry();
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
+            .with_case_library(library.clone());
+
+        let report = agent.run("email user@example.com please").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+
+        let seen = library.seen();
+        assert_eq!(seen.len(), 1, "one retrieval per verification round");
+        assert!(
+            seen[0].0.contains("[EMAIL_1]"),
+            "retrieval sees the PII-stripped task, got: {}",
+            seen[0].0
+        );
+        assert!(!seen[0].0.contains("user@example.com"));
+        assert_eq!(seen[0].1, vec!["echo".to_string()], "tool names reach retrieval");
+    }
+
+    #[tokio::test]
+    async fn one_shot_path_never_consults_case_library() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+
+        let library = RecordingCaseLibrary::new(vec![evidence_case("rec-1")]);
+        let (registry, _calls) = echo_registry();
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_case_library(library.clone());
+
+        let report = agent.run("open the thing").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert!(report.verification.is_none(), "one-shot skips verification");
+        assert!(
+            library.seen().is_empty(),
+            "no verification ran, so no retrieval may run"
+        );
+        assert!(provider.recorded_complete_requests().is_empty());
+    }
+
+    // ── Skill expansion (M6c) tests ──────────────────────────────────────────
+
+    /// A test skill library over owned specs.
+    struct SpecLibrary(Vec<SkillSpec>);
+
+    impl SkillLibrary for SpecLibrary {
+        fn names(&self) -> Vec<String> {
+            self.0.iter().map(|s| s.name.clone()).collect()
+        }
+        fn get(&self, name: &str) -> Option<SkillSpec> {
+            self.0.iter().find(|s| s.name == name).cloned()
+        }
+    }
+
+    /// A skill whose `n` steps all echo a fixed message.
+    fn skill_spec(name: &str, n: usize) -> SkillSpec {
+        SkillSpec {
+            name: name.to_string(),
+            description: "echoes a greeting".to_string(),
+            preconditions: vec![],
+            steps: (0..n)
+                .map(|i| SkillStep {
+                    tool: "echo".to_string(),
+                    arguments: serde_json::json!({"message": format!("hi {i}")}),
+                })
+                .collect(),
+            expected_outcome: "the greeting is echoed".to_string(),
+            origin: SkillOrigin::Operator,
+            source_run_ids: vec![],
+            adopted_at: None,
+        }
+    }
+
+    /// A registry with `echo` plus a `use_skill` tool over the given specs.
+    /// Returns the echo counter and the library for `with_skills`.
+    fn skill_registry(
+        specs: Vec<SkillSpec>,
+    ) -> (ToolRegistry, Arc<AtomicUsize>, Arc<dyn SkillLibrary>) {
+        let (echo, calls) = EchoTool::new(ToolTrustTier::Observational);
+        let mut registry = registry_with(Arc::new(echo));
+        let library: Arc<dyn SkillLibrary> = Arc::new(SpecLibrary(specs));
+        registry.register(Arc::new(UseSkillTool::new(Arc::clone(&library))));
+        (registry, calls, library)
+    }
+
+    #[tokio::test]
+    async fn skill_expansion_runs_every_step_and_answers_once() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, calls, library) = skill_registry(vec![skill_spec("greet", 2)]);
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_skills(library);
+
+        let report = agent.run("greet me").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "both steps executed");
+
+        // The synthesized skill result is recorded like any batch result.
+        let skill_result = report
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                AgentStep::ToolResult(r) if r.tool_name == "use_skill" => Some(r),
+                _ => None,
+            })
+            .expect("use_skill result recorded");
+        assert!(skill_result.success);
+        assert_eq!(skill_result.output["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(skill_result.output["skipped"], 0);
+        assert!(
+            skill_result
+                .display_summary
+                .contains("skill greet: 2/2 steps succeeded"),
+            "got: {}",
+            skill_result.display_summary
+        );
+
+        // Exactly ONE tool-role message answers the model's use_skill call —
+        // the steps never become conversation messages.
+        let requests = provider.recorded_requests();
+        let tool_answers: Vec<_> = requests[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
+        assert_eq!(tool_answers.len(), 1);
+        assert_eq!(tool_answers[0].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[tokio::test]
+    async fn unknown_skill_fails_naming_available_skills() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"nope"}"#));
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, calls, library) = skill_registry(vec![skill_spec("greet", 1)]);
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_skills(library);
+
+        let report = agent.run("use a skill").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no steps run");
+        let skill_result = report
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                AgentStep::ToolResult(r) if r.tool_name == "use_skill" => Some(r),
+                _ => None,
+            })
+            .expect("use_skill result recorded");
+        assert!(!skill_result.success);
+        let error = skill_result.output["error"].as_str().unwrap();
+        assert!(error.contains("Unknown skill: nope"), "got: {error}");
+        assert!(error.contains("greet"), "must list available skills: {error}");
+    }
+
+    #[tokio::test]
+    async fn blocked_step_aborts_skill_and_skips_the_rest() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, calls, library) = skill_registry(vec![skill_spec("greet", 3)]);
+        // The engine allows use_skill itself but denies echo — the first
+        // step is blocked, so no step may run.
+        let policy = RecordingPolicy::new(&[("echo", PolicyVerdict::Deny)]);
+        let sink = Arc::new(InMemoryEventSink::new());
+        let agent = Agent::new(provider.clone(), registry, policy)
+            .with_approval(Arc::new(AutoApprove))
+            .with_skills(library)
+            .with_events(sink.clone());
+
+        let report = agent.run("greet me").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no step may execute");
+
+        let skill_result = report
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                AgentStep::ToolResult(r) if r.tool_name == "use_skill" => Some(r),
+                _ => None,
+            })
+            .expect("use_skill result recorded");
+        assert!(!skill_result.success);
+        let steps = skill_result.output["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1, "the blocked step is recorded");
+        assert_eq!(steps[0]["blocked"], true);
+        assert_eq!(steps[0]["decision"], "policy_denied");
+        assert_eq!(skill_result.output["skipped"], 2, "remaining steps skipped");
+        assert!(
+            skill_result.display_summary.contains("blocked at step 1 of 3"),
+            "got: {}",
+            skill_result.display_summary
+        );
+
+        // The step's gate decision was emitted as an event.
+        let events = sink.snapshot();
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::ToolGate { call_id, decision, .. }
+                if call_id == "call_1-step-0" && decision == "policy_denied")));
+    }
+
+    #[tokio::test]
+    async fn skill_steps_emit_the_standard_event_trio() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, calls, library) = skill_registry(vec![skill_spec("greet", 2)]);
+        let sink = Arc::new(InMemoryEventSink::new());
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_skills(library)
+            .with_events(sink.clone());
+
+        let report = agent.run("greet me").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let events = sink.snapshot();
+        for k in 0..2 {
+            let id = format!("call_1-step-{k}");
+            assert!(events.iter().any(|e| matches!(e,
+                AgentEvent::ToolCallRequested { call } if call.id == id)));
+            assert!(events.iter().any(|e| matches!(e,
+                AgentEvent::ToolGate { call_id, decision, .. }
+                    if call_id == &id && decision == "allowed")));
+            assert!(events.iter().any(|e| matches!(e,
+                AgentEvent::ToolExecuted { result } if result.tool_call_id == id)));
+        }
+    }
+
+    #[tokio::test]
+    async fn use_skill_policy_target_is_the_skill_name() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, _calls, library) = skill_registry(vec![skill_spec("greet", 1)]);
+        let policy = RecordingPolicy::new(&[]);
+        let agent = Agent::new(provider.clone(), registry, policy.clone())
+            .with_approval(Arc::new(AutoApprove))
+            .with_skills(library);
+
+        agent.run("greet me").await;
+        // The use_skill check judged the skill name (not the JSON fallback);
+        // the echo step then got its own check with the echo target.
+        assert_eq!(policy.seen()[0], ("use_skill".to_string(), "greet".to_string()));
+        assert!(policy.seen().iter().any(|(tool, _)| tool == "echo"));
+    }
+
+    #[tokio::test]
+    async fn same_tool_steps_do_not_trip_the_loop_guard() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, calls, library) = skill_registry(vec![skill_spec("greet", 3)]);
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_skills(library);
+
+        let report = agent.run("greet me").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "all three steps ran");
+
+        // The steps must not count as same-tool repetition — no same-tool
+        // nudge (soft or hard) may mention them.
+        let requests = provider.recorded_requests();
+        for req in &requests {
+            for msg in &req.messages {
+                assert!(
+                    !msg.content.contains("times in a row")
+                        && !msg.content.contains("You've called"),
+                    "loop guard must not fire on skill steps: {}",
+                    msg.content
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_deny_on_use_skill_blocks_before_expansion() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+
+        let (registry, calls, library) = skill_registry(vec![skill_spec("greet", 2)]);
+        let policy = RecordingPolicy::new(&[("use_skill", PolicyVerdict::Deny)]);
+        let agent = Agent::new(provider.clone(), registry, policy).with_skills(library);
+
+        let report = agent.run("greet me").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "denied skill must not expand");
+        assert!(report.steps.iter().any(|s| matches!(s, AgentStep::ToolResult(r)
+            if r.tool_name == "use_skill" && !r.success
+                && r.output["error"].as_str().unwrap_or("").contains("Policy denied use_skill"))));
+
+        // The blocked call is still answered with a tool-role message.
+        let requests = provider.recorded_requests();
+        let tool_answer = requests[1].messages.iter().find(|m| m.role == "tool");
+        assert_eq!(tool_answer.unwrap().tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(report.status, TaskStatus::Complete);
     }
 
     #[tokio::test]

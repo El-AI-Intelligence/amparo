@@ -22,6 +22,28 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   is ever created.
 - `FanoutSink` in `amparo-agent` — fans every event out to several sinks
   (plus `truncate`/`TRUNCATE` re-exports).
+- The verification case library (M6b): `CaseLibrary` / `EvidenceCase` /
+  `evidence_section` in `amparo-agent` (the `Agent::with_case_library`
+  seam) and `CaseRetriever` in `amparo-notebook` — prior same-tenant
+  records are retrieved into the self-verification prompt as read-only
+  observations, never instructions, never in the action loop. `--growth`
+  now also reads: on both `amparo run` and `amparo chat`, prior `cli` /
+  `platform:user_id` records feed the verification prompt (still off by
+  default).
+- Gated skills (M6c): `SkillSpec` / `SkillStep` / `UseSkillTool` in
+  `amparo-tools`; loop-side expansion in `amparo-agent` (the
+  `Agent::with_skills` seam) — `use_skill` expands into its ordered
+  steps, each gated, executed and recorded individually, so a skill can
+  never grant its steps an exemption. `SkillSet` + `Proposer` in
+  `amparo-notebook` (per-tenant adoptions under
+  `<workspace>/.amparo/skills/`; recurring VERIFIED sequences distill
+  into inert proposals). New `amparo skill add|propose|list|show|adopt`
+  CLI: candidates are operator-authored TOML, adoption runs the same
+  policy check as a tool call plus human approval rendering the full
+  step plan, and nothing is adopted automatically. Skill execution
+  requires `--growth` on `amparo run` / `amparo chat` (write + read +
+  act — still off by default); without it, `use_skill` is never
+  registered.
 
 ## [0.3.0] — 2026-08-28
 
