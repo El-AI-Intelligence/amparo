@@ -5,6 +5,8 @@
 //! a host application can render live progress, an audit log can persist
 //! it, or a test can assert on it.
 
+use std::sync::Arc;
+
 use amparo_tools::{ToolCall, ToolResult};
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -133,6 +135,30 @@ impl EventSink for InMemoryEventSink {
         self.events.lock().unwrap().push(event.clone());
         // No receivers is fine — the log above still holds the event.
         let _ = self.tx.send(event.clone());
+    }
+}
+
+/// A sink that fans every event out to several other sinks.
+///
+/// Useful when a host wants its own rendering sink *and* an additional
+/// consumer (an audit writer, the lab notebook) to observe the same event
+/// stream — each sink sees the identical event, in the same order.
+pub struct FanoutSink {
+    sinks: Vec<Arc<dyn EventSink>>,
+}
+
+impl FanoutSink {
+    /// Fan events out to `sinks`, in the order given.
+    pub fn new(sinks: Vec<Arc<dyn EventSink>>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl EventSink for FanoutSink {
+    fn emit(&self, event: &AgentEvent) {
+        for sink in &self.sinks {
+            sink.emit(event);
+        }
     }
 }
 
@@ -341,5 +367,24 @@ mod tests {
     fn denied_approvals_say_denied() {
         let line = format_event(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: false });
         assert_eq!(line, "[approval] denied");
+    }
+
+    #[test]
+    fn fanout_delivers_every_event_to_every_sink() {
+        let a = Arc::new(InMemoryEventSink::new());
+        let b = Arc::new(InMemoryEventSink::new());
+        let fanout = FanoutSink::new(vec![
+            a.clone() as Arc<dyn EventSink>,
+            b.clone() as Arc<dyn EventSink>,
+        ]);
+        fanout.emit(&AgentEvent::TaskStarted { prompt: "hi".into() });
+        fanout.emit(&AgentEvent::TaskComplete { final_answer: "done".into() });
+        // Both sinks saw both events, in order.
+        assert_eq!(a.snapshot().len(), 2);
+        assert_eq!(b.snapshot().len(), 2);
+        assert!(matches!(a.snapshot()[0], AgentEvent::TaskStarted { .. }));
+        assert!(matches!(b.snapshot()[0], AgentEvent::TaskStarted { .. }));
+        assert!(matches!(a.snapshot()[1], AgentEvent::TaskComplete { .. }));
+        assert!(matches!(b.snapshot()[1], AgentEvent::TaskComplete { .. }));
     }
 }
