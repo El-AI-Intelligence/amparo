@@ -8,6 +8,92 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-08-29
+
+Instrumentation & hardening (M7): the always-on privacy ledger, session
+persistence, and preflight blast-radius classification — three
+instruments that answer, for every executed action, *who allowed it and
+under what policy* (see `docs/m7-instrumentation.md`).
+
+### Added
+
+- The **privacy ledger** in `amparo-privacy`: `LedgerKind`
+  (`network_call` / `pii_strip`), `LedgerRow`, the append-only
+  `LedgerStore` (one JSON line per row, flushed; `read_all` skips a
+  crash's partial final line; `summary()` aggregates), `privacy_dir`
+  and `site_host_only` (scheme + host only — path, query and fragment
+  dropped). Rows land in `<workspace>/.amparo/privacy/ledger.jsonl`.
+  **Always-on in both hosts**, `--growth` or not: the `LedgerSink` in
+  `amparo-agent` (an `EventSink` consumer) tracks `web_search`,
+  `fetch_url` and `run_command` from request to execution and appends
+  one row per execution attempt — tool, host at most (never a path,
+  query or command), outcome (`ok` / `error` / `denied`), and the
+  human gate's answer (`human_approved` / `human_denied`, absent when
+  no human was asked). A human denial writes its row *immediately*
+  (the execution never happens; the denial is the audit answer), a
+  policy-blocked call writes none, and observational/local tools write
+  none. PII strips are rows too — per-category counts, never values —
+  via the new `AgentEvent::PrivacyStripped`. Open/write failures warn
+  once per task (`[ledger] …`) and never fail the task.
+- **`amparo privacy [--workspace DIR] [--tenant T] [--last N]`** — the
+  reviewer's front door: summary first (network calls, PII strips,
+  human-approved, human-denied, per-tool and per-category breakdowns),
+  then the newest rows (default 10, tenant `cli`). Exit codes follow
+  the `amparo run` contract: 2 usage, 1 runtime, 0 ok.
+- **Preflight blast radius** in `amparo-agent`: `BlastRadius`
+  (`read_only` < `workspace_local` < `network` < `system_wide` <
+  `destructive`) and `classify` — the tool's trust tier seeds the
+  class; argument inspection can only raise it (a `run_command`
+  matching `PathPolicy::check_command_blocked` → `destructive`;
+  network-transfer utilities `curl`/`wget`/`nc`/`scp`/`rsync`/`ssh` as
+  whole shell words → at least `network`; file tools given an absolute
+  path outside the workspace, `/tmp` and `/dev/shm` → at least
+  `system_wide`; an unknown tool → `system_wide`). The label rides on
+  `ApprovalRequest::blast_radius` (`Option` — non-agent sites pass
+  `None`) and renders in the approval copy: a `[preflight] blast
+  radius: …` line in CLI approvals, the same line in chat approval
+  messages. **Display-only by design (I1)**: classification runs after
+  the gate has decided and feeds nothing back — a wrong label can only
+  misdescribe the approval text, never allow or block anything.
+- **Session persistence** in `amparo-agent`: `Checkpoint` (version 1;
+  tenant, `task_id` `sess-<nanos>-<pid>`, `started_at`, PII-stripped
+  prompt, `status` running/complete/failed, the conversation without
+  system-role messages and with `tool_calls` arguments stripped,
+  `LoopState` — `last_tool_name`, `same_tool_count`,
+  `empty_turn_retried`, `last_good_summary`, `used_tool_names`,
+  `steps_used` — and the stripped final answer), the `CheckpointStore`
+  trait and `JsonCheckpointStore` at
+  `<workspace>/.amparo/sessions/<tenant ':' → '-'>/<task_id>.json` —
+  one file per task, atomic tmp + rename, no index ("latest" = scan by
+  `started_at`), corrupt files skipped with a warn. A snapshot saves
+  once per loop iteration and at every terminal return (a crash loses
+  at most one turn); failures warn, never fail the task. `Agent::resume`
+  re-prepends the *current* system prompt (I5 — checkpoints store
+  none), restores the loop state, emits `TaskResumed` (never
+  `TaskStarted`, and a resume opens no new notebook record — the
+  checkpoint is the session trail), and the resumed loop re-judges
+  every call through the gate chain. Every fresh CLI run checkpoints
+  too — a crash mid-task is resumable.
+- **`amparo run --resume`** — resumes the newest incomplete checkpoint
+  for tenant `cli`; no task argument (with one → usage error, exit 2),
+  none → exit 1, a stale `Running` (> 7 days) is skipped with a warn,
+  never resumed. Configuration comes from the current flags.
+- **Chat continuity** (W8): when a new chat task starts, the driver
+  loads the tenant's newest complete checkpoint and hands the agent
+  `continuity_context` — the last 6 user/assistant messages (tool
+  messages skipped), truncated, plus the task's last good tool
+  summary, as one string — injected via `Agent::with_continuity` as
+  **one user-role message** between the system prompt and the task
+  prompt. Per-tenant only; chat never reads `Running` checkpoints.
+  Chat tasks checkpoint through the same store, one format for both
+  hosts.
+- **The minimal stderr subscriber** in `amparo-cli` (the `tracing`
+  0.1 crate, already a workspace dependency): the binary installs a
+  ~50-line `Subscriber` that prints agent `warn`/`error` events to
+  stderr as-is (each already carries its `[tag]`), so a checkpoint
+  save failure or a corrupt session file is visible to the operator;
+  `info`/`debug` stay silent.
+
 ## [0.4.0] — 2026-08-29
 
 Controlled growth (M6): the lab notebook, the verification case library,

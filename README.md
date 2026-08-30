@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M6 in progress — M6a (lab notebook) + M6b (case library) + M6c (gated skills) + M6d (metrics and retirement) + M6e (rollup and archival) landed
+## Status: pre-alpha, M7 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -20,9 +20,14 @@ Discord and Slack chat adapters behind one transport seam, with
 inline-button approval and a fail-closed operator allowlist,
 **Milestone 5 is in**: a TOML tenant directory with per-user policy
 checks, per-user trust ceilings, per-user workspace directories, and
-requester-only approval presses, and **Milestone 6a is in**: the lab
+requester-only approval presses, and **Milestone 6 is in**: the lab
 notebook — with `--growth`, every completed or failed task is recorded
 as a PII-stripped, tenant-tagged run record (off by default).
+**Milestone 7 is in**: the always-on privacy ledger (every
+network-touching execution attempt and every PII strip, with the human
+gate's answer), session persistence (`amparo run --resume`, per-tenant
+chat continuity), and preflight blast-radius classification in the
+approval copy.
 
 ### What exists today: the crate set
 
@@ -64,18 +69,24 @@ as a PII-stripped, tenant-tagged run record (off by default).
   drives the approval gate.
 - **`amparo-memory`** (M2a) — the memory interface with a built-in default
   store. Engram is the recommended backend; it is never a dependency.
-- **`amparo-privacy`** (M2a) — privacy policy evaluation, blocked/allowed
-  domain routing, and the Secure Minions PII strip/restore primitives the
-  loop uses.
+- **`amparo-privacy`** (M2a, M7) — privacy policy evaluation, blocked/allowed
+  domain routing, the Secure Minions PII strip/restore primitives the loop
+  uses, and the always-on privacy ledger: an append-only JSONL evidence
+  log at `<workspace>/.amparo/privacy/ledger.jsonl` recording every
+  network-touching execution attempt (tool, host at most, outcome, human
+  gate answer) and every PII strip as per-category counts.
 - **`amparo-chat`** (M4) — the chat adapter layer: one `ChatTransport`
   seam, a per-task `ChatDriver` (allowlist, one task per chat, panic-proof
   task boundary), an `ApprovalRouter` for inline-button presses, a
   `ChatApprovalGate` (inline Approve/Deny buttons, 60 s auto-deny), and
   hand-rolled transports for **Telegram** (long polling), **Discord**
   (gateway websocket) and **Slack** (Socket Mode).
-- **`amparo-cli`** (M3, M4) — the one binary: `amparo run "task"` drives
+- **`amparo-cli`** (M3, M4, M7) — the one binary: `amparo run "task"` drives
   the loop end-to-end (fail-closed BYO-LLM env, interactive terminal
-  approval, `--auto-approve`/`--auto-deny` overrides), `amparo mcp-serve`
+  approval with a `[preflight] blast radius` line, `--auto-approve`/
+  `--auto-deny` overrides), `amparo run --resume` resumes the newest
+  incomplete checkpoint for tenant `cli`, `amparo privacy` reads the
+  ledger (summary + tail), `amparo mcp-serve`
   reuses the same implementation as the standalone `amparo-mcp-serve`
   binary (same help, errors, exit codes), `amparo chat
   telegram|discord|slack` serves the agent over a messaging platform,
@@ -241,6 +252,47 @@ record into the hot layer, `rollup` forces promote + fold on demand
 (cron-able, exit 0; `--dry-run` writes nothing). The cold archive is
 never modified by any of this — it is the record, not a cache.
 
+## Instrumentation & hardening
+
+M7 adds three instruments that make the agent legible while it works —
+answering, for every executed action, *who allowed it and under what
+policy* (see `docs/m7-instrumentation.md`).
+
+**The privacy ledger** is always-on — `--growth` or not — in both
+hosts. Every execution attempt of `web_search`, `fetch_url` or
+`run_command` appends one JSON line to
+`<workspace>/.amparo/privacy/ledger.jsonl`: the tool, the host at most
+(never a path, query or command), the outcome (`ok` / `error` /
+`denied`), and whether a human approved or denied it. A human denial
+writes its row immediately — the denial is itself the answer the
+ledger exists to record. Every PII strip is a row too: per-category
+counts, never values. A ledger failure warns (`[ledger] …`) and never
+fails the task. `amparo privacy [--workspace DIR] [--tenant T]
+[--last N]` is the reviewer's front door — a summary first, then the
+newest rows.
+
+**Session persistence** snapshots every task once per loop iteration
+to `<workspace>/.amparo/sessions/<tenant>/<task>.json` — PII-stripped,
+system-prompt-free, written atomically. A crashed CLI run resumes with
+`amparo run --resume` (newest incomplete checkpoint, no task argument;
+none → exit 1; stale `Running` > 7 days is skipped). The resumed loop
+re-judges every call through the gate chain — nothing carries a
+pre-approved verdict across the restart, and a resume opens no new
+notebook record: the checkpoint is the session trail. In chat, a new
+task receives the previous completed task's tail (last 6
+user/assistant messages + last tool summary) as one user-role context
+message — per-tenant, never a mid-loop resume, and chat never reads a
+`Running` checkpoint.
+
+**Preflight blast radius** labels every gated call before the approval
+question: `read_only` < `workspace_local` < `network` < `system_wide`
+< `destructive`. The label is display-only — classification runs after
+the gate has decided and feeds nothing back, so a wrong label can only
+misdescribe the approval text, never allow or block anything (I1). It
+renders as a `[preflight] blast radius: …` line in CLI approvals and
+the same line in chat approval messages: the human approves a concrete
+consequence, not an abstraction.
+
 ## What Amparo is meant to be
 
 An agent that runs a real tool-use loop — shell, files, git, web, tests — where
@@ -278,7 +330,8 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 3 | Install path + release — the `amparo` CLI drives the loop end-to-end (headless: no screen/desktop tools in the registry) | ✅ done |
 | 4 | Chat adapters — Telegram first, then Discord and Slack | ✅ done — all three behind one transport seam, inline-button approval |
 | 5 | Multi-tenant identity and per-user policy | ✅ done — TOML tenant directory, per-user ceilings/workspaces, attributed approvals |
-| 6 | Controlled self-improvement | 🚧 in progress — M6a + M6b + M6c + M6d + M6e landed: the lab notebook (`--growth`, PII-stripped run records), the verification case library (same-tenant evidence in the verification prompt only), gated skills (adopted procedures executed step-by-step through the gate chain), metrics + retirement (running per-skill records, startup drift re-checks, `amparo skill check|retire`), and rollup + archival (the hot layer over the cold archive, `amparo notebook list|promote|rollup`) |
+| 6 | Controlled self-improvement | ✅ done — M6a + M6b + M6c + M6d + M6e landed: the lab notebook (`--growth`, PII-stripped run records), the verification case library (same-tenant evidence in the verification prompt only), gated skills (adopted procedures executed step-by-step through the gate chain), metrics + retirement (running per-skill records, startup drift re-checks, `amparo skill check|retire`), and rollup + archival (the hot layer over the cold archive, `amparo notebook list|promote|rollup`) |
+| 7 | Instrumentation & hardening | ✅ landed — the always-on privacy ledger (every network-touching execution attempt and human denial, every PII strip as counts; `amparo privacy`), session persistence (`amparo run --resume` for crashed runs, per-tenant chat continuity from completed tasks), and preflight blast-radius classification (display-only labels in the approval copy) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant
