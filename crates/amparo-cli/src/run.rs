@@ -27,7 +27,8 @@ use amparo_notebook::{
 use amparo_policy::{
     AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, wire::WirePolicyEngine,
 };
-use amparo_privacy::{LedgerStore, privacy_dir};
+use amparo_privacy::{LedgerQuota, LedgerStore, privacy_dir};
+use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{PathPolicy, SkillLibrary, ToolTrustTier, UseSkillTool, default_registry};
 use std::sync::Arc;
 
@@ -56,6 +57,9 @@ FLAGS:
                       (sets AMPARO_WORKSPACE)
   --resume            resume the newest incomplete checkpoint (tenant cli);
                       takes no task — the prompt comes from the checkpoint
+  --ledger-max-bytes N  bound the always-on privacy ledger file; when it
+                      would grow past N, the oldest rows rotate off and a
+                      marker records the drop (K/M/G suffixes, e.g. 64K)
 
 The task is the joined positional arguments. stdout carries the final answer
 only; progress, gate decisions and the report go to stderr.
@@ -94,6 +98,9 @@ pub struct RunFlags {
     pub growth: bool,
     /// Resume the newest incomplete checkpoint instead of running a task.
     pub resume: bool,
+    /// Bound the privacy ledger file in bytes; when it would grow past
+    /// this, the oldest rows rotate off (M7b). `None` = unbounded.
+    pub ledger_max_bytes: Option<u64>,
     /// The task — joined positional arguments (empty when resuming).
     pub task: String,
 }
@@ -112,9 +119,46 @@ impl Default for RunFlags {
             workspace: None,
             growth: false,
             resume: false,
+            ledger_max_bytes: None,
             task: String::new(),
         }
     }
+}
+
+/// Parse a byte size for `--ledger-max-bytes`: plain digits, or digits
+/// plus a `K`/`M`/`G` suffix (powers of 1024, case-insensitive). Rejects
+/// zero, negatives, fractions, unknown suffixes and overflow.
+pub fn parse_bytes(raw: &str) -> Result<u64, String> {
+    let (digits, multiplier) = match raw.as_bytes().last().copied() {
+        Some(suffix @ (b'K' | b'M' | b'G' | b'k' | b'm' | b'g')) => {
+            let power = match suffix.to_ascii_uppercase() {
+                b'K' => 10u32,
+                b'M' => 20,
+                _ => 30,
+            };
+            (&raw[..raw.len() - 1], 1u64 << power)
+        }
+        Some(b'0'..=b'9') => (raw, 1),
+        _ => {
+            return Err(format!(
+                "--ledger-max-bytes must be a positive size like 64K, got '{raw}'"
+            ))
+        }
+    };
+    let base: u64 = if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "--ledger-max-bytes must be a positive size like 64K, got '{raw}'"
+        ));
+    } else {
+        digits
+            .parse()
+            .map_err(|_| format!("--ledger-max-bytes is too large, got '{raw}'"))?
+    };
+    if base == 0 {
+        return Err(format!("--ledger-max-bytes must be positive, got '{raw}'"));
+    }
+    base.checked_mul(multiplier)
+        .ok_or_else(|| format!("--ledger-max-bytes is too large, got '{raw}'"))
 }
 
 /// Outcome of [`parse_run_flags`]: run with these flags, print
@@ -190,6 +234,15 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
             "--workspace" => match args.next() {
                 Some(dir) => flags.workspace = Some(dir),
                 None => return ParseRunResult::Error("--workspace requires a directory".into()),
+            },
+            "--ledger-max-bytes" => match args.next() {
+                Some(raw) => match parse_bytes(&raw) {
+                    Ok(bytes) => flags.ledger_max_bytes = Some(bytes),
+                    Err(message) => return ParseRunResult::Error(message),
+                },
+                None => {
+                    return ParseRunResult::Error("--ledger-max-bytes requires a size".into())
+                }
             },
             "--help" | "-h" => return ParseRunResult::Help,
             other if other.starts_with('-') => {
@@ -332,6 +385,9 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
     let provider = config.build().map_err(|e| e.to_string())?;
 
     let mut registry = default_registry();
+    // M7b: eval_wasm is host-registered (like use_skill below), not part
+    // of the default registry — amparo-tools stays wasmtime-free.
+    registry.register(Arc::new(EvalWasmTool::new()));
 
     let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {
@@ -456,16 +512,18 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
     // strip, readable via `amparo privacy`. An open failure warns and the
     // run continues without the ledger; a write failure warns once per
     // task inside the sink itself.
-    let ledger: Option<Arc<LedgerSink>> =
-        match LedgerStore::open(privacy_dir(&workspace_root).join("ledger.jsonl")) {
-            Ok(store) => Some(Arc::new(LedgerSink::new(store, "cli"))),
-            Err(e) => {
-                eprintln!(
-                    "[ledger] unavailable — the run continues without the privacy ledger: {e}"
-                );
-                None
-            }
-        };
+    let ledger: Option<Arc<LedgerSink>> = match LedgerStore::open_with_quota(
+        privacy_dir(&workspace_root).join("ledger.jsonl"),
+        flags.ledger_max_bytes.map(LedgerQuota::new),
+    ) {
+        Ok(store) => Some(Arc::new(LedgerSink::new(store, "cli"))),
+        Err(e) => {
+            eprintln!(
+                "[ledger] unavailable — the run continues without the privacy ledger: {e}"
+            );
+            None
+        }
+    };
     let mut sinks: Vec<Arc<dyn EventSink>> = vec![printing];
     if let Some(nb) = &notebook {
         sinks.push(Arc::clone(nb) as Arc<dyn EventSink>);
@@ -674,5 +732,32 @@ mod tests {
         assert!(f.resume);
         assert_eq!(f.max_steps, Some(3));
         assert!(f.auto_approve);
+    }
+
+    #[test]
+    fn ledger_max_bytes_parses_plain_and_suffixed_sizes() {
+        assert_eq!(parse_bytes("1024"), Ok(1024));
+        assert_eq!(parse_bytes("4K"), Ok(4096));
+        assert_eq!(parse_bytes("4k"), Ok(4096));
+        assert_eq!(parse_bytes("2M"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_bytes("1G"), Ok(1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("1g"), Ok(1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("18446744073709551615"), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn ledger_max_bytes_rejects_garbage() {
+        for raw in ["", "K", "0", "4KB", "4.5K", "12 K", "-1", "18446744073709551615G", "M3"] {
+            assert!(parse_bytes(raw).is_err(), "'{raw}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn ledger_max_bytes_flag_parses_and_errors_exit_2_shaped() {
+        assert_eq!(flags(parse(&["task"])).ledger_max_bytes, None);
+        let f = flags(parse(&["--ledger-max-bytes", "64K", "task"]));
+        assert_eq!(f.ledger_max_bytes, Some(65_536));
+        assert!(error(parse(&["--ledger-max-bytes", "banana", "task"])).contains("64K"));
+        assert!(error(parse(&["--ledger-max-bytes"])).contains("requires a size"));
     }
 }

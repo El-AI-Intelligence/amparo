@@ -99,6 +99,15 @@ const NETWORK_COMMANDS: &[&str] = &["curl", "wget", "nc", "scp", "rsync", "ssh"]
 /// first) is labeled [`BlastRadius::SystemWide`], the honest
 /// worst-case claim short of a destructive match.
 pub fn classify(registry: &ToolRegistry, policy: &PathPolicy, call: &ToolCall) -> BlastRadius {
+    // Static override (M7b): eval_wasm computes inside a sealed sandbox —
+    // no imports, no WASI — so it observes and modifies nothing outside
+    // its own memory. Its tier stays ExternalEffector (untrusted code
+    // always asks a human); the radius says what executing it can touch:
+    // nothing. Display-only, like everything here.
+    if call.name == "eval_wasm" {
+        return BlastRadius::ReadOnly;
+    }
+
     let mut radius = match registry.get_tier(&call.name) {
         Some(ToolTrustTier::Observational) => BlastRadius::ReadOnly,
         Some(ToolTrustTier::LocalMutating) => BlastRadius::WorkspaceLocal,
@@ -317,6 +326,22 @@ mod tests {
         // …and relative paths never leave the workspace.
         let relative = call("write_file", serde_json::json!({"path": "notes.txt"}));
         assert_eq!(classify(&registry, &policy, &relative), BlastRadius::WorkspaceLocal);
+    }
+
+    #[test]
+    fn eval_wasm_is_read_only_despite_the_effector_tier() {
+        // The sandbox tool is registered at ExternalEffector — executing
+        // untrusted code always asks a human — but its blast radius is
+        // read-only: a sealed module can touch nothing outside its own
+        // memory. The override is display-only; the tier is unchanged.
+        let registry = registry(&[("eval_wasm", ToolTrustTier::ExternalEffector)]);
+        let policy = policy();
+        let call = call("eval_wasm", serde_json::json!({"wasm_base64": "AGFzbQE="}));
+        assert_eq!(classify(&registry, &policy, &call), BlastRadius::ReadOnly);
+        assert_eq!(
+            registry.get_tier("eval_wasm"),
+            Some(ToolTrustTier::ExternalEffector)
+        );
     }
 
     #[test]

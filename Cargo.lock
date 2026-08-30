@@ -50,6 +50,7 @@ dependencies = [
  "amparo-notebook",
  "amparo-policy",
  "amparo-privacy",
+ "amparo-sandbox",
  "amparo-tools",
  "async-trait",
  "bytes",
@@ -75,13 +76,16 @@ dependencies = [
  "amparo-notebook",
  "amparo-policy",
  "amparo-privacy",
+ "amparo-sandbox",
  "amparo-tools",
  "async-trait",
+ "base64",
  "chrono",
  "serde_json",
  "tokio",
  "toml",
  "tracing",
+ "wat",
 ]
 
 [[package]]
@@ -104,6 +108,7 @@ version = "0.5.0"
 dependencies = [
  "amparo-agent",
  "amparo-policy",
+ "amparo-sandbox",
  "amparo-tools",
  "async-trait",
  "futures-util",
@@ -155,6 +160,7 @@ dependencies = [
 name = "amparo-privacy"
 version = "0.5.0"
 dependencies = [
+ "chrono",
  "regex",
  "serde",
  "serde_json",
@@ -165,6 +171,8 @@ dependencies = [
 name = "amparo-sandbox"
 version = "0.5.0"
 dependencies = [
+ "amparo-tools",
+ "async-trait",
  "base64",
  "serde",
  "serde_json",

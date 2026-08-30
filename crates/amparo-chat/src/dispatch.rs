@@ -27,6 +27,7 @@ use crate::transport::ChatTransport;
 use amparo_inference::InferenceConfig;
 use amparo_notebook::{notebook_dir, HOT_FILE, JsonlStore};
 use amparo_policy::{AllowAllPolicyEngine, DenyAllPolicyEngine};
+use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{default_registry, ToolTrustTier};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -280,7 +281,11 @@ pub async fn build_driver(
     })?;
     let provider = config.build().map_err(|e| ChatServeError::new(e.to_string(), 1))?;
 
-    let registry = default_registry();
+    let mut registry = default_registry();
+    // M7b: the sandbox tool is host-registered, like use_skill. This
+    // registry is also the driver's legacy shared registry, so the
+    // allowlist tenant arm gets eval_wasm from here.
+    registry.register(Arc::new(EvalWasmTool::new()));
 
     let policy_source = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {

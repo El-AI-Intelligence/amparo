@@ -13,7 +13,10 @@
 pub mod canary;
 pub mod ledger;
 pub use canary::{CanaryToken, CanaryTokenManager, CanaryTrigger};
-pub use ledger::{privacy_dir, site_host_only, LedgerKind, LedgerRow, LedgerStore, LedgerSummary};
+pub use ledger::{
+    privacy_dir, read_ledger, recorded_quota, site_host_only, LedgerKind, LedgerQuota, LedgerRow,
+    LedgerStore, LedgerSummary,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

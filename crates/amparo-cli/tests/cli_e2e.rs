@@ -136,6 +136,9 @@ struct MockLlm {
     addr: std::net::SocketAddr,
     /// Every non-stream (`complete`) request body, in arrival order.
     complete_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    /// Every `stream: true` request body, in arrival order — lets tests
+    /// assert what the model actually saw (tool schemas, tool results).
+    stream_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 impl MockLlm {
@@ -148,11 +151,15 @@ impl MockLlm {
         let complete_requests: Arc<tokio::sync::Mutex<Vec<Value>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&complete_requests);
+        let stream_requests: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let streamed = Arc::clone(&stream_requests);
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { break };
                 let scripts = Arc::clone(&scripts);
                 let complete_requests = Arc::clone(&recorded);
+                let stream_requests = Arc::clone(&streamed);
                 tokio::spawn(async move {
                     // Read the request head, then the body by Content-Length.
                     let mut buf = Vec::new();
@@ -190,6 +197,11 @@ impl MockLlm {
                     }
 
                     let streaming = String::from_utf8_lossy(&body).contains("\"stream\":true");
+                    if streaming {
+                        if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                            stream_requests.lock().await.push(value);
+                        }
+                    }
                     let response = if streaming {
                         let script = {
                             let mut remaining = scripts.lock().await;
@@ -242,6 +254,7 @@ impl MockLlm {
         MockLlm {
             addr,
             complete_requests,
+            stream_requests,
         }
     }
 
@@ -253,6 +266,11 @@ impl MockLlm {
     /// Every recorded non-stream (`complete`) request body, in arrival order.
     async fn complete_requests(&self) -> Vec<Value> {
         self.complete_requests.lock().await.clone()
+    }
+
+    /// Every recorded `stream: true` request body, in arrival order.
+    async fn stream_requests(&self) -> Vec<Value> {
+        self.stream_requests.lock().await.clone()
     }
 
     /// The env surface for the mock endpoint (openai provider is the default).
@@ -306,6 +324,31 @@ fn tool_call_script(command: &str) -> Script {
 /// A scripted turn that invokes the adopted skill `name`.
 fn use_skill_script(name: &str) -> Script {
     tool_script("use_skill", &format!("{{\"skill_name\":\"{name}\"}}"))
+}
+
+/// A scripted turn that requests `eval_wasm` with the W1 echo module
+/// (built from WAT at test runtime — `wat` and `base64` are dev-only
+/// deps, already workspace deps through amparo-sandbox) and `input`.
+fn eval_wasm_script(input: &str) -> Script {
+    let wasm = wat::parse_str(
+        r#"(module
+        (memory (export "memory") 8)
+        (func (export "axiom_eval") (param $in_ptr i32) (param $in_len i32) (param $out_ptr i32) (param $out_cap i32) (result i32)
+            (local $i i32)
+            (block $done
+                (loop $copy
+                    (br_if $done (i32.ge_u (local.get $i) (local.get $in_len)))
+                    (i32.store8 (i32.add (local.get $out_ptr) (local.get $i))
+                                (i32.load8_u (i32.add (local.get $in_ptr) (local.get $i))))
+                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                    (br $copy)))
+            (local.get $in_len)))"#,
+    )
+    .expect("valid WAT");
+    use base64::Engine as _;
+    let wasm_b64 = base64::engine::general_purpose::STANDARD.encode(wasm);
+    let arguments = serde_json::json!({"wasm_base64": wasm_b64, "input": input}).to_string();
+    tool_script("eval_wasm", &arguments)
 }
 
 /// Sets the mock env and workspace for one test. Callers hold `LOCK`.
@@ -550,6 +593,88 @@ async fn run_auto_approve_skips_stdin_entirely() {
     assert!(err.contains("[exec] run_command"), "{err}");
     assert!(!err.contains("approve? [y/N]"), "no prompt may be printed: {err}");
     assert_eq!(stdout(&out).trim(), "Done.");
+}
+
+#[tokio::test]
+async fn run_executes_approved_eval_wasm_with_read_only_radius() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![
+        eval_wasm_script(r#"{"msg":"hello"}"#),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    let out = run_with_stdin(&["run", "--allow-all", "evaluate the module"], b"y\n").await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    // M7b: the sandbox computes in place — the preflight radius is
+    // read_only even though the tier is an external effector.
+    assert!(err.contains("[preflight] blast radius: read_only"), "{err}");
+    assert!(err.contains("[approval] granted"), "{err}");
+    assert!(err.contains("[exec] eval_wasm"), "the approved module ran: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // The sandbox contract reaches the model: the first request carries
+    // the eval_wasm schema with its stated limits, and the second —
+    // after execution — carries the module's output. The result feeds
+    // the loop.
+    let streams = mock.stream_requests().await;
+    assert!(streams.len() >= 2, "tool call, then post-execution turn: {streams:?}");
+    assert!(
+        streams[0].to_string().contains("10M fuel"),
+        "the schema states the limits: {}",
+        streams[0]
+    );
+    assert!(
+        streams[1].to_string().contains("hello"),
+        "the echo output feeds the loop: {}",
+        streams[1]
+    );
+
+    // Nothing left the machine: the always-on ledger (its file exists
+    // because the sink opens at task start) holds no eval_wasm row.
+    let ledger = workspace().join(".amparo/privacy/ledger.jsonl");
+    let text = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert!(!text.contains("eval_wasm"), "eval_wasm never leaves the machine: {text}");
+}
+
+#[tokio::test]
+async fn run_denied_eval_wasm_executes_nothing_and_writes_no_row() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![
+        eval_wasm_script(r#"{"msg":"never"}"#),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    // stdin is closed — the gate denies the untrusted module and the
+    // loop survives to the next turn.
+    let out = run_with(&["run", "--allow-all", "evaluate the module"]).await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[preflight] blast radius: read_only"), "{err}");
+    assert!(err.contains("no input (EOF) — denying"), "{err}");
+    assert!(err.contains("[approval] denied"), "{err}");
+    assert!(!err.contains("[exec] eval_wasm"), "a denied module never runs: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // And unlike a denied network tool, the denial writes no ledger row:
+    // eval_wasm is not a network tool, so the ledger holds nothing.
+    let ledger = workspace().join(".amparo/privacy/ledger.jsonl");
+    let text = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert!(!text.contains("eval_wasm"), "{text}");
 }
 
 #[tokio::test]
@@ -1748,6 +1873,91 @@ async fn privacy_subcommand_reports_ledger_after_run() {
 
     restore_workspace_env(prior);
     drop(env);
+}
+
+#[tokio::test]
+async fn run_with_tiny_ledger_quota_rotates_and_privacy_reports_it() {
+    let _guard = LOCK.lock().await;
+    // One ~180-byte row per call against a 250-byte quota: after the
+    // first append every further append rotates, dropping the previous
+    // row + previous marker — steady state is [newest row, marker
+    // recording dropped 2], ~270 bytes.
+    let mut scripts: Vec<Script> = (1..=8)
+        .map(|n| tool_script("fetch_url", &format!("{{\"url\":\"http://127.0.0.1:1/{n}\"}}")))
+        .collect();
+    scripts.push(vec![content_frame("Done.")]);
+    let mock = MockLlm::start(scripts).await;
+    let (env, prior) = mock_env(&mock).await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+
+    let out = run_with(&[
+        "run",
+        "--allow-all",
+        "--auto-approve",
+        "--ledger-max-bytes",
+        "250",
+        "fetch pages",
+    ])
+    .await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(stdout(&out).contains("Done."), "{}", stdout(&out));
+
+    let ledger = workspace().join(".amparo/privacy/ledger.jsonl");
+    let text = std::fs::read_to_string(&ledger).expect("ledger exists");
+    let row_count = text.matches(r#""kind":"network_call""#).count();
+    assert_eq!(row_count, 1, "rotation keeps one surviving row: {text}");
+    assert!(text.contains(r#""kind":"rotated""#), "marker row present: {text}");
+    assert!(
+        text.contains(r#""dropped_rows":2"#),
+        "steady state drops the previous row + previous marker: {text}"
+    );
+    let bytes = std::fs::metadata(&ledger).map(|m| m.len()).unwrap_or(u64::MAX);
+    assert!(
+        bytes < 600,
+        "the bounded ledger stays well under a kilobyte: {bytes} bytes"
+    );
+    // The quota sidecar is how the reviewer surface reports the bound.
+    assert_eq!(
+        std::fs::read_to_string(workspace().join(".amparo/privacy/quota"))
+            .map(|s| s.trim().to_string())
+            .ok(),
+        Some("250".to_string())
+    );
+
+    // `amparo privacy` reports the bound, the rotation and the drop —
+    // and the marker row renders in the tail.
+    let out = run_with(&["privacy"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let out_stdout = stdout(&out);
+    assert!(out_stdout.contains("quota 250"), "{out_stdout}");
+    assert!(out_stdout.contains("rotations: 1"), "{out_stdout}");
+    assert!(out_stdout.contains("rows dropped 2"), "{out_stdout}");
+    assert!(out_stdout.contains("rotated  dropped 2 rows"), "{out_stdout}");
+
+    restore_workspace_env(prior);
+    drop(env);
+}
+
+#[tokio::test]
+async fn run_ledger_max_bytes_garbage_exits_2() {
+    let _guard = LOCK.lock().await;
+    // Usage errors never reach the LLM or the ledger: parse first.
+    let out = run_with(&["run", "--ledger-max-bytes", "banana", "x"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--ledger-max-bytes"),
+        "{}",
+        stderr(&out)
+    );
+    let out = run_with(&["run", "--ledger-max-bytes", "0", "x"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("must be positive"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[tokio::test]

@@ -19,6 +19,7 @@ amparo-mcp = { path = "../amparo-mcp" }
 amparo-notebook = { path = "../amparo-notebook" }
 amparo-policy = { path = "../amparo-policy" }
 amparo-privacy = { path = "../amparo-privacy" }
+amparo-sandbox = { path = "../amparo-sandbox" }
 amparo-tools = { path = "../amparo-tools" }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -26,3 +27,9 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = "0.1"
+
+[dev-dependencies]
+# Test-only: build the eval_wasm fixture module at test runtime (both are
+# already workspace deps through amparo-sandbox).
+base64 = "0.22"
+wat = "1.0"

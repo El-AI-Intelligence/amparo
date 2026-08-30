@@ -40,6 +40,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+pub mod tool;
+pub use tool::{EvalWasmTool, EVAL_WASM};
+
 /// Byte offset where the module must write its output — 256 KB, the
 /// start of the output region.
 pub const OUTPUT_BASE: u32 = 256 * 1024;
@@ -127,6 +130,7 @@ pub struct SandboxResult {
 /// four bounds: instruction fuel, module size, linear-memory size, and
 /// wall-clock time. Thread-safe: `Arc<SandboxRuntime>` is the intended
 /// sharing pattern; the concurrency semaphore caps parallel evals.
+#[derive(Clone)]
 pub struct SandboxRuntime {
     /// Max instructions before forcible abort (per eval call).
     pub fuel_limit: u64,

@@ -27,6 +27,11 @@ pub struct UserProfile {
     /// `..` are rejected at load.
     #[serde(default)]
     pub workspace: Option<PathBuf>,
+    /// Privacy-ledger quota in bytes for this tenant's ledger file;
+    /// absent → unbounded. Zero is rejected at load — `None` is how a
+    /// profile says "unbounded".
+    #[serde(default)]
+    pub ledger_max_bytes: Option<u64>,
 }
 
 /// The parsed chat config: the tenant directory — the only users who may
@@ -73,6 +78,12 @@ impl ChatConfig {
                         value: workspace.clone(),
                     });
                 }
+            }
+            if profile.ledger_max_bytes == Some(0) {
+                return Err(ConfigError::Quota {
+                    path: path.to_path_buf(),
+                    key: key.clone(),
+                });
             }
         }
         Ok(config)
@@ -125,6 +136,14 @@ pub enum ConfigError {
         key: String,
         /// The workspace value that was rejected.
         value: PathBuf,
+    },
+    /// A profile ledger quota is zero — a quota must bound the file.
+    #[error("chat config {path}: tenant {key}: ledger_max_bytes must be positive (use no key for unbounded)")]
+    Quota {
+        /// The path that failed validation.
+        path: PathBuf,
+        /// The offending tenant's key.
+        key: String,
     },
 }
 
@@ -291,6 +310,29 @@ mod tests {
         match &err {
             ConfigError::Io { .. } => {}
             other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ledger_quota_parses_and_defaults_to_unbounded() {
+        let path = write_cfg(
+            "ledger_quota",
+            "[users.\"telegram:111\"]\nledger_max_bytes = 4096\n[users.\"discord:222\"]\n",
+        );
+        let config = ChatConfig::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(config.users["telegram:111"].ledger_max_bytes, Some(4096));
+        assert_eq!(config.users["discord:222"].ledger_max_bytes, None);
+    }
+
+    #[test]
+    fn zero_ledger_quota_is_rejected() {
+        let path = write_cfg("zero_quota", "[users.\"telegram:111\"]\nledger_max_bytes = 0\n");
+        let err = ChatConfig::load(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match &err {
+            ConfigError::Quota { key, .. } => assert_eq!(key, "telegram:111"),
+            other => panic!("expected Quota, got {other:?}"),
         }
     }
 }

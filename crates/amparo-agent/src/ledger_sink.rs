@@ -109,6 +109,7 @@ impl EventSink for LedgerSink {
                             outcome: Some("denied".to_string()),
                             gate: Some("human_denied".to_string()),
                             pii_counts: Vec::new(),
+                            dropped_rows: None,
                         });
                     }
                 }
@@ -124,6 +125,7 @@ impl EventSink for LedgerSink {
                         outcome: Some(if result.success { "ok" } else { "error" }.to_string()),
                         gate: tracker.gate,
                         pii_counts: Vec::new(),
+                        dropped_rows: None,
                     });
                 }
             }
@@ -137,6 +139,7 @@ impl EventSink for LedgerSink {
                     outcome: None,
                     gate: None,
                     pii_counts: categories.clone(),
+                    dropped_rows: None,
                 });
             }
             _ => {}
@@ -261,6 +264,19 @@ mod tests {
         request(&sink, "c2", "write_file", json!({"path": "notes.txt"}));
         executed(&sink, "c1", "read_file", true);
         executed(&sink, "c2", "write_file", true);
+        assert!(rows(&dir).is_empty());
+    }
+
+    #[test]
+    fn eval_wasm_writes_no_ledger_row() {
+        // eval_wasm never leaves the machine — the sandbox has no
+        // imports and no network — so even an approved execution writes
+        // nothing: the ledger's "what left the machine" contract holds.
+        let dir = temp_dir();
+        let sink = sink(&dir);
+        request(&sink, "c1", "eval_wasm", json!({"wasm_base64": "AGFzbQE="}));
+        sink.emit(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: true });
+        executed(&sink, "c1", "eval_wasm", true);
         assert!(rows(&dir).is_empty());
     }
 

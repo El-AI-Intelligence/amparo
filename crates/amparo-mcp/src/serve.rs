@@ -14,6 +14,7 @@ use amparo_agent::{ApprovalGate, AutoApprove, AutoDeny};
 use amparo_policy::{
     AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, wire::WirePolicyEngine,
 };
+use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{ToolRegistry, ToolTrustTier, default_registry};
 use std::sync::Arc;
 
@@ -146,7 +147,10 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
         Arc::new(AutoDeny)
     };
 
-    let registry: ToolRegistry = default_registry();
+    let mut registry: ToolRegistry = default_registry();
+    // M7b: eval_wasm is served over MCP too; approval defaults to
+    // AutoDeny here, so it is refused until an operator allows.
+    registry.register(Arc::new(EvalWasmTool::new()));
     let server = McpServer::new(registry, policy)
         .with_approval(approval)
         .with_trust_ceiling(flags.trust_ceiling);

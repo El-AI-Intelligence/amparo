@@ -21,7 +21,8 @@ use amparo_notebook::{
 };
 use amparo_policy::wire::WirePolicyEngine;
 use amparo_policy::PolicyEngine;
-use amparo_privacy::{privacy_dir, LedgerStore, PrivacyPolicy};
+use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore, PrivacyPolicy};
+use amparo_sandbox::EvalWasmTool;
 use amparo_tools::registry::default_registry_with_policy;
 use amparo_tools::{
     Memory, PathPolicy, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool,
@@ -160,6 +161,10 @@ struct TaskParts {
     /// directory mode (each tenant keeps its own ledger file), the shared
     /// workspace root in allowlist mode.
     ledger_root: PathBuf,
+    /// This task's ledger quota in bytes (M7b): `None` → unbounded. The
+    /// directory-mode profile's `ledger_max_bytes`; always `None` in
+    /// allowlist mode (no per-user profile to carry one).
+    ledger_max_bytes: Option<u64>,
 }
 
 impl ChatDriver {
@@ -284,12 +289,18 @@ impl ChatDriver {
                 let profile = config.users.get(&key)?;
                 let workspace = self.workspace_for(chat, profile)?;
                 let path_policy = Arc::new(PathPolicy::from_root(workspace.clone()));
+                let mut registry = default_registry_with_policy(Arc::clone(&path_policy));
+                // M7b: eval_wasm for the directory-mode arm (the
+                // allowlist arm inherits it from the dispatch-built
+                // shared registry).
+                registry.register(Arc::new(EvalWasmTool::new()));
                 Some(TaskParts {
                     policy: self.task_policy(chat),
-                    registry: default_registry_with_policy(Arc::clone(&path_policy)),
+                    registry,
                     trust_ceiling: profile.trust_ceiling.unwrap_or(self.trust_ceiling),
                     path_policy,
                     ledger_root: workspace,
+                    ledger_max_bytes: profile.ledger_max_bytes,
                 })
             }
             Tenants::LegacyAllowlist(_) => Some(TaskParts {
@@ -298,6 +309,7 @@ impl ChatDriver {
                 trust_ceiling: self.trust_ceiling,
                 path_policy: Arc::new(PathPolicy::from_root(self.workspace_root.clone())),
                 ledger_root: self.workspace_root.clone(),
+                ledger_max_bytes: None,
             }),
         }
     }
@@ -394,7 +406,14 @@ impl ChatDriver {
             return;
         }
 
-        let TaskParts { policy, mut registry, trust_ceiling, path_policy, ledger_root } = parts;
+        let TaskParts {
+            policy,
+            mut registry,
+            trust_ceiling,
+            path_policy,
+            ledger_root,
+            ledger_max_bytes,
+        } = parts;
         let provider = Arc::clone(&self.provider);
         let privacy = self.privacy.clone();
         let transport = Arc::clone(&self.transport);
@@ -431,8 +450,10 @@ impl ChatDriver {
             // tenant key and land in this task's ledger root (the
             // per-user workspace in directory mode). An open failure
             // warns and continues — the ledger is observational.
-            let ledger_sink: Option<Arc<LedgerSink>> =
-                match LedgerStore::open(privacy_dir(&ledger_root).join("ledger.jsonl")) {
+            let ledger_sink: Option<Arc<LedgerSink>> = match LedgerStore::open_with_quota(
+                privacy_dir(&ledger_root).join("ledger.jsonl"),
+                ledger_max_bytes.map(LedgerQuota::new),
+            ) {
                     Ok(store) => Some(Arc::new(LedgerSink::new(store, tenant_key.clone()))),
                     Err(e) => {
                         eprintln!(
@@ -692,7 +713,7 @@ mod tests {
     }
 
     fn profile() -> UserProfile {
-        UserProfile { trust_ceiling: None, workspace: None }
+        UserProfile { trust_ceiling: None, workspace: None, ledger_max_bytes: None }
     }
 
     /// A chat for `user_id` in its own chat (so concurrent tasks don't
@@ -1214,7 +1235,11 @@ mod tests {
         // permissive default.
         users.insert(
             "mock:user_1".to_string(),
-            UserProfile { trust_ceiling: Some(ToolTrustTier::Observational), workspace: None },
+            UserProfile {
+                trust_ceiling: Some(ToolTrustTier::Observational),
+                workspace: None,
+                ledger_max_bytes: None,
+            },
         );
         let driver = driver_directory(
             users,
@@ -1287,7 +1312,11 @@ mod tests {
         users.insert("mock:user_a".to_string(), profile());
         users.insert(
             "mock:user_b".to_string(),
-            UserProfile { trust_ceiling: None, workspace: Some(PathBuf::from("team-b")) },
+            UserProfile {
+                trust_ceiling: None,
+                workspace: Some(PathBuf::from("team-b")),
+                ledger_max_bytes: None,
+            },
         );
         let driver = driver_directory(users, transport.clone(), provider.clone(), true, root.clone());
 
@@ -1384,6 +1413,102 @@ mod tests {
         assert!(
             !ledger_b.contains("mock:user_a"),
             "no cross-tenant rows in user_b's ledger: {ledger_b}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn directory_mode_ledger_quotas_rotate_independently_per_tenant() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-chat-quota-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        // user_a's ledger is bounded at 250 bytes — well under the ~180
+        // bytes of one network-call row, so after the first append every
+        // further append rotates, dropping the previous row + previous
+        // marker (steady state: dropped == 2). user_b is unbounded. The
+        // messages are driven sequentially, so the shared script queue
+        // cannot interleave; the fetch targets are refused-connection
+        // ports — deterministic, fully offline.
+        let provider = StubProvider::new(vec![
+            turn_tool_call("a1", "fetch_url", r#"{"url":"http://127.0.0.1:1/a1"}"#),
+            turn_tool_call("a2", "fetch_url", r#"{"url":"http://127.0.0.1:1/a2"}"#),
+            turn_tool_call("a3", "fetch_url", r#"{"url":"http://127.0.0.1:1/a3"}"#),
+            turn_tool_call("a4", "fetch_url", r#"{"url":"http://127.0.0.1:1/a4"}"#),
+            turn_text("A done."),
+            turn_tool_call("b1", "fetch_url", r#"{"url":"http://127.0.0.1:2/b1"}"#),
+            turn_tool_call("b2", "fetch_url", r#"{"url":"http://127.0.0.1:2/b2"}"#),
+            turn_tool_call("b3", "fetch_url", r#"{"url":"http://127.0.0.1:2/b3"}"#),
+            turn_tool_call("b4", "fetch_url", r#"{"url":"http://127.0.0.1:2/b4"}"#),
+            turn_text("B done."),
+        ]);
+        let mut users = BTreeMap::new();
+        users.insert(
+            "mock:user_a".to_string(),
+            UserProfile {
+                trust_ceiling: None,
+                workspace: None,
+                ledger_max_bytes: Some(250),
+            },
+        );
+        users.insert("mock:user_b".to_string(), profile());
+        let driver = driver_directory(users, transport.clone(), provider, true, root.clone());
+
+        driver.on_message(chat_for("user_a"), "fetch pages".into()).await;
+        wait_for_text(&transport, "A done.").await;
+        driver.on_message(chat_for("user_b"), "fetch pages".into()).await;
+        wait_for_text(&transport, "B done.").await;
+
+        // The bounded tenant's ledger rotated down to the newest row plus
+        // the marker recording the drop — and the marker's tenant tag is
+        // the surviving row's (user_a), never a mix.
+        let ledger_a = std::fs::read_to_string(
+            root.join("users/mock-user_a/.amparo/privacy/ledger.jsonl"),
+        )
+        .expect("user_a's ledger exists");
+        assert_eq!(
+            ledger_a.matches(r#""kind":"network_call""#).count(),
+            1,
+            "the bounded ledger keeps one surviving row: {ledger_a}"
+        );
+        assert!(
+            ledger_a.contains(r#""kind":"rotated""#),
+            "the bounded ledger carries a rotation marker: {ledger_a}"
+        );
+        assert!(
+            ledger_a.contains(r#""dropped_rows":2"#),
+            "steady state drops the previous row + previous marker: {ledger_a}"
+        );
+        assert!(
+            ledger_a.contains(r#""tenant":"mock:user_a""#),
+            "the marker is tagged with the surviving tenant: {ledger_a}"
+        );
+        // The unbounded tenant keeps every row and never rotates.
+        let ledger_b = std::fs::read_to_string(
+            root.join("users/mock-user_b/.amparo/privacy/ledger.jsonl"),
+        )
+        .expect("user_b's ledger exists");
+        assert_eq!(
+            ledger_b.matches(r#""kind":"network_call""#).count(),
+            4,
+            "the unbounded ledger keeps all four rows: {ledger_b}"
+        );
+        assert!(
+            !ledger_b.contains("rotated"),
+            "the unbounded tenant never rotates: {ledger_b}"
+        );
+        // The quota sidecar exists only under the bounded tenant (the
+        // sidecar is how `amparo privacy` reports the bound).
+        assert_eq!(
+            std::fs::read_to_string(root.join("users/mock-user_a/.amparo/privacy/quota"))
+                .map(|s| s.trim().to_string())
+                .ok(),
+            Some("250".to_string()),
+            "user_a's quota sidecar records the bound"
+        );
+        assert!(
+            !root.join("users/mock-user_b/.amparo/privacy/quota").exists(),
+            "no quota sidecar for the unbounded tenant"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

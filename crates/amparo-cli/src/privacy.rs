@@ -13,7 +13,9 @@
 //! Exit codes follow the `amparo run` contract: usage problems exit 2,
 //! runtime failures (an unreadable ledger) exit 1.
 
-use amparo_privacy::{LedgerKind, LedgerRow, LedgerStore, LedgerSummary, privacy_dir};
+use amparo_privacy::{
+    LedgerKind, LedgerRow, LedgerSummary, privacy_dir, read_ledger, recorded_quota,
+};
 use amparo_tools::PathPolicy;
 
 pub const PRIVACY_USAGE: &str = "\
@@ -23,10 +25,11 @@ USAGE:
   amparo privacy [--workspace DIR] [--tenant T] [--last N]
 
 Reads the always-on privacy ledger at <workspace>/.amparo/privacy/
-ledger.jsonl: one summary (network calls with human gate answers, PII
-strips) followed by the last N rows, newest first. Every amparo run and
-chat task writes the ledger; rows never carry PII values, query strings
-or command text — a site is host-only.
+ledger.jsonl: one summary (file size and quota, network calls with human
+gate answers, PII strips, rotations) followed by the last N rows, newest
+first. Every amparo run and chat task writes the ledger; rows never
+carry PII values, query strings or command text — a site is host-only.
+Reading never creates, rewrites or rotates the ledger.
 
 FLAGS:
   --workspace DIR    workspace root (sets AMPARO_WORKSPACE); the ledger
@@ -154,15 +157,24 @@ fn execute(flags: &PrivacyFlags) -> Result<(), String> {
         );
         return Ok(());
     }
-    let store = LedgerStore::open(&path)
-        .map_err(|e| format!("cannot open the privacy ledger at {}: {e}", path.display()))?;
-    let mut rows = store
-        .read_all()
-        .map_err(|e| format!("cannot read the privacy ledger at {}: {e}", path.display()))?;
+    // Read-only: the free functions never open a store, so the ledger is
+    // not created, rewritten or rotated just by being read — and the
+    // quota sidecar is read before anything could touch it.
+    let quota = recorded_quota(&path);
+    let mut rows =
+        read_ledger(&path).map_err(|e| format!("cannot read the privacy ledger: {e}"))?;
     rows.retain(|row| row.tenant == flags.tenant());
 
     let summary = LedgerSummary::compute(&rows);
     println!("tenant {}", flags.tenant());
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    match quota {
+        Some(quota) => println!("ledger: {bytes} bytes (quota {})", quota.max_bytes),
+        None => println!("ledger: {bytes} bytes (unbounded)"),
+    }
+    if summary.rotations > 0 {
+        println!("rotations: {} (rows dropped {})", summary.rotations, summary.rows_dropped);
+    }
     println!(
         "network calls: {} (approved {}, denied {})",
         summary.network_calls, summary.human_approved, summary.human_denied
@@ -219,6 +231,9 @@ fn render_row(row: &LedgerRow) -> String {
                     .join(", ")
             };
             format!("{}  pii-strip  {}", row.ts, counts)
+        }
+        LedgerKind::Rotated => {
+            format!("{}  rotated  dropped {} rows", row.ts, row.dropped_rows.unwrap_or(0))
         }
     }
 }
