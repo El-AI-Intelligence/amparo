@@ -2749,3 +2749,73 @@ async fn schedule_list_and_cancel_work_the_queue() {
 
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+// ── M8 W6: cross-feature e2e ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn resume_lands_a_swarm_with_the_chain_stamped() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("w6-resume-swarm");
+    write_checkpoint(&ws, "sess-1", unix_now(), 2);
+
+    // Four turns on one FIFO queue: the resumed parent spawns a child,
+    // the child runs a gated command, then both answer.
+    let mock = MockLlm::start(vec![
+        tool_script("spawn_agent", r#"{"task":"run the child command"}"#),
+        tool_call_script("echo child-side-effect"),
+        vec![content_frame("child done")],
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let env_pairs = mock.env();
+    let vars: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let env = set_env(&vars, &[]);
+    let prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--resume", "--allow-all", "--auto-approve"]).await;
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[session] resumed sess-1 (step 2)"), "{err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // The resumed task's swarm chains off the checkpoint's id: the child
+    // runs under sess-1.1 and the swarm line names it (M8 W2 + W6).
+    assert!(
+        err.contains("[swarm] swarm: 1 sub-agent(s) (sess-1.1), 2 tool calls"),
+        "{err}"
+    );
+
+    // The ledger stamps the child's executed call with the chain.
+    let ledger = ws.join(".amparo/privacy/ledger.jsonl");
+    let text = std::fs::read_to_string(&ledger).expect("ledger exists");
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one ledger row per line"))
+        .collect();
+    assert_eq!(rows.len(), 1, "the child's command is the only row: {text}");
+    assert_eq!(rows[0]["task_id"], "sess-1.1");
+    assert_eq!(rows[0]["parent_task_id"], "sess-1");
+    assert_eq!(rows[0]["gate"], "human_approved");
+
+    // The child's checkpoint names its parent — the delegation chain is
+    // legible in the session files, not just the ledger.
+    let child: Value = serde_json::from_str(
+        &std::fs::read_to_string(ws.join(".amparo/sessions/cli/sess-1.1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(child["status"], "complete");
+    assert_eq!(child["parent_task_id"], "sess-1");
+    // The resumed parent replaced its Running checkpoint with the
+    // terminal one.
+    let parent: Value = serde_json::from_str(
+        &std::fs::read_to_string(ws.join(".amparo/sessions/cli/sess-1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(parent["status"], "complete");
+    let _ = std::fs::remove_dir_all(&ws);
+}

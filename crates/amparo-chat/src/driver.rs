@@ -1041,7 +1041,26 @@ mod tests {
         done_frame, registry_with_echo, tool_call_frame, turn_text, turn_tool_call, wait_for_text,
         wait_until, wait_until_async, MockTransport, StubProvider,
     };
+    use serde_json::Value;
     use std::collections::BTreeMap;
+
+    /// The first file named `name` under `dir` — the fire path roots its
+    /// ledger at a per-user workspace, so the denial test finds it by
+    /// name rather than guessing the layout.
+    fn find_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_file(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
 
     fn chat() -> ChatRef {
         ChatRef {
@@ -2463,6 +2482,165 @@ mod tests {
         assert_eq!(
             queue_status(&root, "sched-busy-1"),
             Some(ScheduledStatus::Fired)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn swarm_budget_and_schedule_coexist_in_one_task_and_one_ticker() {
+        // The cross-feature proof (M8 W6): one chat task spawns a child
+        // AND schedules a promise — both M8 tools on one registry, one
+        // driver — and the same ticker then fires the promise through
+        // the reduced fire path while the swarm's budget stays per-task.
+        let root =
+            std::env::temp_dir().join(format!("amparo-schedule-swarm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        // Five turns on one FIFO queue: the parent's spawn, the child's
+        // answer, the parent's schedule call and final answer, then the
+        // fired promise's answer.
+        let at = (Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+        let provider = StubProvider::new(vec![
+            turn_tool_call("call_1", "spawn_agent", r#"{"task":"run the child"}"#),
+            turn_text("child done"),
+            turn_tool_call(
+                "call_2",
+                "schedule",
+                &format!(r#"{{"at":"{at}","task":"stand and deliver"}}"#),
+            ),
+            turn_text("Done."),
+            turn_text("Fired answer."),
+        ]);
+        let users = BTreeMap::from([(
+            "mock:user_1".to_string(),
+            profile_with_swarm(swarm_profile(4, true)),
+        )]);
+        let driver = Arc::new(driver_directory(
+            users,
+            transport.clone(),
+            provider,
+            true,
+            root.clone(),
+        ));
+
+        driver
+            .on_message(chat_for("user_1"), "delegate and schedule".into())
+            .await;
+        // The answer carries the swarm breakdown — the budget consumed
+        // one slot — while the schedule call persisted the promise.
+        wait_until(|| {
+            transport
+                .texts()
+                .iter()
+                .any(|t| t.contains("Done.") && t.contains("swarm: 1 sub-agent(s)"))
+        })
+        .await;
+        let store = JsonScheduleStore::new(schedule_dir(&root));
+        let tasks = store.load_all();
+        assert_eq!(tasks.len(), 1, "one pending promise: {tasks:?}");
+        assert_eq!(tasks[0].status, ScheduledStatus::Pending);
+        let id = tasks[0].id.clone();
+
+        // The same ticker that fires the promise scans the queue the
+        // swarm task wrote — a synthetic `now` past the instant.
+        let scan = driver
+            .scan_schedules(Utc::now() + chrono::Duration::seconds(30))
+            .await;
+        assert_eq!(
+            scan,
+            ScheduleScan {
+                fired: 1,
+                missed: 0
+            }
+        );
+
+        let line = wait_for_text(&transport, &format!("[schedule] {id} fired")).await;
+        assert!(line.contains("Fired answer."), "{line}");
+        let task = store.load(&id).unwrap().unwrap();
+        assert_eq!(task.status, ScheduledStatus::Fired);
+        assert_eq!(task.result.as_deref(), Some("Fired answer."));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn denied_fire_never_executes_and_tells_the_requester() {
+        // The fail-closed fire (M8 W6): a scheduled promise whose gated
+        // call is denied never executes ahead of the gate — the approval
+        // message goes out first, the requester denies, and the promise
+        // records the loop's answer, not the tool's work.
+        let root =
+            std::env::temp_dir().join(format!("amparo-schedule-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![
+            turn_tool_call("call_1", "run_command", r#"{"command":"echo fired-work"}"#),
+            turn_text("Done despite denial."),
+        ]);
+        let users = BTreeMap::from([("mock:user_1".to_string(), profile())]);
+        let driver = Arc::new(driver_directory(
+            users,
+            transport.clone(),
+            provider,
+            false, // the gate must ask a human
+            root.clone(),
+        ));
+
+        let at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        seed_promise(&root, "sched-deny-1", "mock:user_1", "chat_1", &at);
+        let scan = driver.scan_schedules(Utc::now()).await;
+        assert_eq!(
+            scan,
+            ScheduleScan {
+                fired: 1,
+                missed: 0
+            }
+        );
+
+        // The fire re-entered the chain: the approval message reached
+        // the requester BEFORE any execution.
+        wait_until(|| !transport.approvals().is_empty()).await;
+        let press = ApprovalButtonPress {
+            chat_id: "chat_1".into(),
+            approval_id: "call_1".into(),
+            approved: false,
+            user_id: "user_1".into(),
+        };
+        assert_eq!(
+            driver.on_approval(press).await,
+            PressOutcome::Routed,
+            "the denial reached the waiting gate"
+        );
+
+        let line = wait_for_text(&transport, "[schedule] sched-deny-1 fired").await;
+        assert!(line.contains("Done despite denial."), "{line}");
+        let task = JsonScheduleStore::new(schedule_dir(&root))
+            .load("sched-deny-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, ScheduledStatus::Fired);
+        assert_eq!(task.result.as_deref(), Some("Done despite denial."));
+
+        // The denial is the ledger row — the command never executed.
+        let ledger = find_file(&root, "ledger.jsonl").expect("the fire's ledger exists");
+        let text = std::fs::read_to_string(&ledger).expect("ledger readable");
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one ledger row per line"))
+            .collect();
+        assert_eq!(rows.len(), 1, "one denial row: {text}");
+        assert_eq!(rows[0]["tool"], "run_command");
+        assert_eq!(rows[0]["outcome"], "denied");
+        assert_eq!(rows[0]["gate"], "human_denied");
+        assert!(
+            rows[0]["task_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("sess-")),
+            "the fire's own task id: {text}"
+        );
+        assert!(rows[0].get("parent_task_id").is_none(), "{text}");
+        assert!(
+            !text.contains("fired-work"),
+            "the command never reaches the ledger: {text}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -19,9 +19,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use amparo_tools::{
-    ToolCall, ToolExecutor, ToolParam, ToolResult, ToolSchema, ToolTrustTier,
-};
+use amparo_tools::{ToolCall, ToolExecutor, ToolParam, ToolResult, ToolSchema, ToolTrustTier};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -341,13 +339,18 @@ impl ToolExecutor for SpawnAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::AutoApprove;
-    use crate::events::{AgentEvent, EventSink, InMemoryEventSink};
+    use crate::approval::{ApprovalGate, ApprovalRequest, AutoApprove};
+    use crate::events::{AgentEvent, EventSink, FanoutSink, InMemoryEventSink};
+    use crate::ledger_sink::LedgerSink;
     use crate::test_support::{
         registry_with, turn_text, turn_tool_call, AllowAllPolicy, EchoTool, ScriptedProvider,
     };
     use amparo_inference::InferenceError;
-    use amparo_tools::ToolRegistry;
+    use amparo_privacy::LedgerStore;
+    use amparo_tools::registry::default_registry_with_policy;
+    use amparo_tools::{PathPolicy, ToolRegistry};
+    use async_trait::async_trait;
+    use serde_json::Value;
     use std::sync::atomic::Ordering;
 
     /// The parts-donor parent (no spawn tool), the spawn tool, and the real
@@ -691,8 +694,103 @@ mod tests {
         // The summary line carries the chain id and, with a rate, the
         // cost estimate with its method attached — parent counts included.
         let line = tool.summary_line(report.tool_calls, report.tokens_estimated, None);
-        assert!(line.starts_with("swarm: 1 sub-agent(s) (sess-9.1)"), "{line}");
+        assert!(
+            line.starts_with("swarm: 1 sub-agent(s) (sess-9.1)"),
+            "{line}"
+        );
         let line = tool.summary_line(report.tool_calls, report.tokens_estimated, Some(3.0));
         assert!(line.contains("chars/4, $3/1M tokens"), "{line}");
+    }
+
+    /// The one-rule gate for the denial test (M8 W6): a top-level task's
+    /// calls are approved, a sub-agent's are denied — so the child's
+    /// gated call lands a denial row while the parent's spawn passes.
+    struct ParentApprovesChildDenies;
+
+    #[async_trait]
+    impl ApprovalGate for ParentApprovesChildDenies {
+        async fn request(&self, request: &ApprovalRequest) -> bool {
+            request.session_label.is_none()
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_child_call_lands_a_human_denied_row_with_the_chain() {
+        // The cross-feature denial proof (M8 W6): the child's gated
+        // command is refused at the shared gate, and the privacy ledger
+        // records the denial stamped with the delegation chain — a
+        // sub-agent's refused call is exactly as auditable as an
+        // executed one.
+        let dir = std::env::temp_dir().join(format!("amparo-spawn-denied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger_path = dir.join("ledger.jsonl");
+
+        let provider = ScriptedProvider::new();
+        provider.push_chat(spawn_call("call_1", "run the child command"));
+        provider.push_chat(turn_tool_call(
+            "call_2",
+            "run_command",
+            r#"{"command":"echo child-work"}"#,
+        ));
+        provider.push_chat(turn_text("child done"));
+        provider.push_chat(turn_text("parent done"));
+
+        let base = default_registry_with_policy(Arc::new(PathPolicy::from_env()));
+        let gate: Arc<dyn ApprovalGate> = Arc::new(ParentApprovesChildDenies);
+        let events = Arc::new(InMemoryEventSink::new());
+        let ledger = Arc::new(LedgerSink::new(
+            LedgerStore::open(&ledger_path).unwrap(),
+            "tenant",
+            Some("sess-123".to_string()),
+            None,
+        ));
+        let sink: Arc<dyn EventSink> = Arc::new(FanoutSink::new(vec![
+            Arc::clone(&events) as Arc<dyn EventSink>,
+            Arc::clone(&ledger) as Arc<dyn EventSink>,
+        ]));
+        let donor = Agent::new(provider.clone(), base.clone(), Arc::new(AllowAllPolicy))
+            .with_approval(Arc::clone(&gate))
+            .with_events(Arc::clone(&sink))
+            .with_path_policy(Arc::new(PathPolicy::from_env()))
+            .with_task_id("sess-123");
+        let budget = Arc::new(Mutex::new(2));
+        let tool = Arc::new(SpawnAgentTool::new(
+            &donor,
+            "sess-123",
+            Arc::clone(&budget),
+            2,
+        ));
+        let mut registry = base;
+        registry.register(Arc::clone(&tool) as Arc<dyn ToolExecutor>);
+        let parent = Agent::new(provider, registry, Arc::new(AllowAllPolicy))
+            .with_approval(gate)
+            .with_events(sink)
+            .with_path_policy(Arc::new(PathPolicy::from_env()))
+            .with_task_id("sess-123");
+
+        let report = parent.run("delegate").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(tool.reports().len(), 1, "the spawn ran");
+
+        // The denied child call is the ledger row — the loop never
+        // executes a denied call, but the audit question has its answer,
+        // stamped with the chain the CLI e2e proves for executions.
+        let text = std::fs::read_to_string(&ledger_path).expect("ledger exists");
+        let rows: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one ledger row per line"))
+            .collect();
+        assert_eq!(rows.len(), 1, "one denial row: {text}");
+        assert_eq!(rows[0]["tool"], "run_command");
+        assert_eq!(rows[0]["outcome"], "denied");
+        assert_eq!(rows[0]["gate"], "human_denied");
+        assert_eq!(rows[0]["task_id"], "sess-123.1");
+        assert_eq!(rows[0]["parent_task_id"], "sess-123");
+        assert!(
+            !text.contains("child-work"),
+            "the command never reaches the ledger: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
