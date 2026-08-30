@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/amparo-inference", "crates/amparo-memory", "crates/amparo-privacy", "crates/amparo-policy", "crates/amparo-tools", "crates/amparo-agent", "crates/amparo-mcp", "crates/amparo-cli", "crates/amparo-chat", "crates/amparo-notebook"]
+members = ["crates/amparo-inference", "crates/amparo-memory", "crates/amparo-privacy", "crates/amparo-policy", "crates/amparo-tools", "crates/amparo-agent", "crates/amparo-mcp", "crates/amparo-cli", "crates/amparo-chat", "crates/amparo-notebook", "crates/amparo-sandbox"]
 
 [workspace.package]
 version = "0.5.0"

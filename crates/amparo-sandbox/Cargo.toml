@@ -1,0 +1,19 @@
+[package]
+name = "amparo-sandbox"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Amparo's fuel-metered WASM execution sandbox: bounded, import-free code evaluation"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+base64 = "0.22"
+wasmtime = { version = "16", default-features = false, features = ["cranelift"] }
+
+[dev-dependencies]
+wat = "1.0"
