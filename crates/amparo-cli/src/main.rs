@@ -21,6 +21,10 @@
 //! - `amparo privacy [FLAGS]` reads the privacy ledger (M7): the summary
 //!   plus the most recent network-call and PII-strip rows — the reviewer's
 //!   front door to "who allowed this, and under what policy".
+//! - `amparo doctor [FLAGS]` runs the operator's QA pass (M9): one
+//!   deterministic, read-only sweep over the workspace, ledger, sessions,
+//!   notebook, skills, schedule, policy-engine reachability and chat
+//!   config — exit 0 healthy, 1 problems, 2 usage.
 //! - `amparo schedule list|cancel [FLAGS]` inspects the schedule queue
 //!   (M8): list every persisted promise or cancel a pending one — a status
 //!   change, never a deletion; the chat driver's ticker does the firing.
@@ -30,6 +34,7 @@
 //! gate decisions, the report and errors go to stderr.
 
 mod approve;
+mod doctor;
 mod events;
 mod notebook;
 mod privacy;
@@ -50,6 +55,7 @@ USAGE:
   amparo skill add|propose|list|show|adopt|check|retire [FLAGS]
   amparo notebook list|promote|rollup [FLAGS]
   amparo privacy [FLAGS]
+  amparo doctor [FLAGS]
   amparo schedule list|cancel [FLAGS]
   amparo version
 
@@ -63,13 +69,15 @@ SUBCOMMANDS:
              case into the hot layer, force the promote + fold
   privacy    read the privacy ledger: a summary plus the most recent
              network-call and PII-strip rows
+  doctor     the operator's QA pass: workspace, ledger, sessions, notebook,
+             skills, schedule, policy reachability, chat-config
   schedule   inspect the schedule queue: list every persisted promise or
              cancel a pending one (a status change, never a deletion)
   version    print the version
 
 Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help`,
-`amparo skill --help`, `amparo notebook --help`, `amparo privacy --help`
-or `amparo schedule --help` for flags.";
+`amparo skill --help`, `amparo notebook --help`, `amparo privacy --help`,
+`amparo doctor --help` or `amparo schedule --help` for flags.";
 
 #[tokio::main]
 async fn main() {
@@ -90,6 +98,7 @@ async fn main() {
         "skill" => skill::dispatch(args).await,
         "notebook" => notebook::dispatch(args),
         "privacy" => privacy::dispatch(args),
+        "doctor" => doctor::dispatch(args).await,
         "schedule" => schedule::dispatch(args),
         "version" | "-V" | "--version" => println!("amparo {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{USAGE}"),
