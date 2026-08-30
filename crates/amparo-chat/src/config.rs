@@ -14,6 +14,36 @@ use amparo_tools::registry::ToolTrustTier;
 use serde::Deserialize;
 use thiserror::Error;
 
+/// The M8 swarm knobs for one tenant: how many sub-agents the parent may
+/// spawn, and whether the `schedule` tool is registered.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmProfile {
+    /// Swarm budget: at most this many sub-agents per task; `0` turns
+    /// `spawn_agent` off. Absent → 4 (the CLI default).
+    #[serde(default = "default_max_sub_agents")]
+    pub max_sub_agents: usize,
+    /// Register the `schedule` tool (M8 W5): the tenant may persist
+    /// tasks that re-enter the gate chain when they fire. Absent → false.
+    #[serde(default)]
+    pub schedule: bool,
+}
+
+/// The default swarm budget — the same 4 as the CLI's `--max-sub-agents`.
+fn default_max_sub_agents() -> usize {
+    4
+}
+
+impl Default for SwarmProfile {
+    /// The driver default: budget 4, no schedule.
+    fn default() -> Self {
+        Self {
+            max_sub_agents: 4,
+            schedule: false,
+        }
+    }
+}
+
 /// One tenant's profile in a [`ChatConfig`] file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +62,10 @@ pub struct UserProfile {
     /// profile says "unbounded".
     #[serde(default)]
     pub ledger_max_bytes: Option<u64>,
+    /// The M8 swarm knobs: sub-agent budget and the `schedule` tool.
+    /// Absent → the driver's default (budget 4, no schedule).
+    #[serde(default)]
+    pub swarm: Option<SwarmProfile>,
 }
 
 /// The parsed chat config: the tenant directory — the only users who may
@@ -333,6 +367,42 @@ mod tests {
         match &err {
             ConfigError::Quota { key, .. } => assert_eq!(key, "telegram:111"),
             other => panic!("expected Quota, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn swarm_profile_parses_with_defaults_and_is_absent_by_default() {
+        let path = write_cfg(
+            "swarm",
+            "[users.\"telegram:111\"]\n[users.\"telegram:111\".swarm]\nmax_sub_agents = 2\nschedule = true\n[users.\"discord:222\"]\n[users.\"discord:222\".swarm]\n",
+        );
+        let config = ChatConfig::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // An explicit profile carries both knobs…
+        let explicit = config.users["telegram:111"].swarm.as_ref().unwrap();
+        assert_eq!(explicit.max_sub_agents, 2);
+        assert!(explicit.schedule);
+        // …a bare `[swarm]` table defaults the budget to 4 and schedule
+        // to false…
+        let bare = config.users["discord:222"].swarm.as_ref().unwrap();
+        assert_eq!(bare.max_sub_agents, 4);
+        assert!(!bare.schedule);
+        // …and a tenant with no table has no swarm profile at all (the
+        // driver applies its default).
+        assert!(SwarmProfile::default().max_sub_agents == 4);
+    }
+
+    #[test]
+    fn swarm_profile_rejects_unknown_keys() {
+        let path = write_cfg(
+            "swarm_unknown",
+            "[users.\"telegram:111\".swarm]\nmax_sub_agents = 2\nnope = true\n",
+        );
+        let err = ChatConfig::load(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        match &err {
+            ConfigError::Parse { .. } => {}
+            other => panic!("expected Parse, got {other:?}"),
         }
     }
 }

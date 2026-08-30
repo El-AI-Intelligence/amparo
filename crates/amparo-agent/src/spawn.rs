@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use amparo_tools::{
-    ToolCall, ToolExecutor, ToolParam, ToolRegistry, ToolResult, ToolSchema, ToolTrustTier,
+    ToolCall, ToolExecutor, ToolParam, ToolResult, ToolSchema, ToolTrustTier,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -86,24 +86,23 @@ impl SpawnAgentTool {
     /// A spawn tool for the task whose id is `parent_task_id`, inheriting
     /// the parent's provider, gate chain, sink and instruments.
     ///
-    /// `base_registry` is the parent's tool set **without** `spawn_agent`
-    /// registered — each child's registry is this clone plus a
-    /// child-flavored spawn tool, and the spawn-free base keeps the tool
-    /// from ever holding an `Arc` back to itself.
+    /// The child registry root is the parent's own registry as it stands
+    /// at construction — **without** this tool registered (hosts attach
+    /// the tool afterwards, via [`Agent::with_spawn_agent`]) — so each
+    /// child's registry is that spawn-free clone plus a child-flavored
+    /// spawn tool, and the tool never holds an `Arc` back to itself.
     ///
     /// `budget` starts at `max_sub_agents` and is consumed by every spawn
     /// in the swarm, across generations; the host can read what remains
     /// through the same `Arc`.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         parent: &Agent,
-        base_registry: ToolRegistry,
         parent_task_id: impl Into<String>,
         budget: Arc<Mutex<usize>>,
         max_sub_agents: usize,
     ) -> Self {
         Self {
-            parts: parent.swarm_parts(base_registry),
+            parts: parent.swarm_parts(parent.registry().clone()),
             parent_task_id: parent_task_id.into(),
             budget,
             spawn_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -125,6 +124,41 @@ impl SpawnAgentTool {
     /// Every finished child so far, in completion order.
     pub fn reports(&self) -> Vec<SubAgentSummary> {
         self.reports.lock().unwrap().clone()
+    }
+
+    /// The host's one-line swarm report (M8): the sub-agent count and
+    /// chain ids, the swarm's tool-call total and token estimate (the
+    /// parent's own counts included — the line states what the whole
+    /// swarm burned) and the cost estimate with its method attached —
+    /// the observatory, not the black box. `rate` is the parent's
+    /// [`AgentConfig::cost_per_million_tokens`]; `None` drops the cost
+    /// clause.
+    pub fn summary_line(
+        &self,
+        parent_tool_calls: usize,
+        parent_tokens: usize,
+        rate: Option<f64>,
+    ) -> String {
+        let reports = self.reports();
+        let ids: Vec<&str> = reports.iter().map(|r| r.task_id.as_str()).collect();
+        let tool_calls: usize =
+            reports.iter().map(|r| r.tool_calls).sum::<usize>() + parent_tool_calls;
+        let tokens: usize =
+            reports.iter().map(|r| r.tokens_estimated).sum::<usize>() + parent_tokens;
+        let mut line = format!(
+            "swarm: {} sub-agent(s) ({}), {} tool calls",
+            reports.len(),
+            ids.join(", "),
+            tool_calls,
+        );
+        if let Some(rate) = rate {
+            line.push_str(&format!(
+                ", ~${:.2} in inference (estimate, chars/4, ${}/1M tokens)",
+                tokens as f64 / 4.0 * rate / 1_000_000.0,
+                rate,
+            ));
+        }
+        line
     }
 
     /// A failed result for a spawn that never happened — no budget was
@@ -313,6 +347,7 @@ mod tests {
         registry_with, turn_text, turn_tool_call, AllowAllPolicy, EchoTool, ScriptedProvider,
     };
     use amparo_inference::InferenceError;
+    use amparo_tools::ToolRegistry;
     use std::sync::atomic::Ordering;
 
     /// The parts-donor parent (no spawn tool), the spawn tool, and the real
@@ -330,7 +365,7 @@ mod tests {
             .with_approval(Arc::new(AutoApprove))
             .with_events(Arc::clone(&events) as Arc<dyn EventSink>)
             .with_task_id("sess-123");
-        let mut tool = SpawnAgentTool::new(&donor, base.clone(), "sess-123", budget, max);
+        let mut tool = SpawnAgentTool::new(&donor, "sess-123", budget, max);
         if let Some(tier) = ceiling {
             tool = tool.with_ceiling(tier);
         }
@@ -624,5 +659,40 @@ mod tests {
                 .contains("child inference down"),
             "the child's failure reason reaches the parent as data"
         );
+    }
+
+    #[tokio::test]
+    async fn with_spawn_agent_registers_the_tool_on_the_parent() {
+        // The host path (M8 W4): one builder call attaches the tool to
+        // the agent's own registry and names the parent task.
+        let provider = ScriptedProvider::new();
+        provider.push_chat(spawn_call("call_1", "do the sub-task"));
+        provider.push_chat(turn_text("child done"));
+        provider.push_chat(turn_text("parent done"));
+
+        let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
+        let events = Arc::new(InMemoryEventSink::new());
+        let budget = Arc::new(Mutex::new(1));
+        let (parent, tool) = Agent::new(
+            provider,
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove))
+        .with_events(Arc::clone(&events) as Arc<dyn EventSink>)
+        .with_spawn_agent("sess-9", Arc::clone(&budget), 1);
+
+        let report = parent.run("delegate").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        let reports = tool.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].task_id, "sess-9.1");
+        assert_eq!(*budget.lock().unwrap(), 0);
+        // The summary line carries the chain id and, with a rate, the
+        // cost estimate with its method attached — parent counts included.
+        let line = tool.summary_line(report.tool_calls, report.tokens_estimated, None);
+        assert!(line.starts_with("swarm: 1 sub-agent(s) (sess-9.1)"), "{line}");
+        let line = tool.summary_line(report.tool_calls, report.tokens_estimated, Some(3.0));
+        assert!(line.contains("chars/4, $3/1M tokens"), "{line}");
     }
 }

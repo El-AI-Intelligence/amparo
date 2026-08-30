@@ -2,8 +2,8 @@
 //!
 //! Before the human-approval gate asks its question, [`classify`] labels
 //! the call with a [`BlastRadius`] — what executing it could touch: a
-//! read-only look, the workspace, the network, the wider system, or a
-//! destructive pattern. The label rides on
+//! read-only look, the workspace, a sub-agent spawn, the network, the
+//! wider system, or a destructive pattern. The label rides on
 //! [`crate::approval::ApprovalRequest::blast_radius`] and is rendered in
 //! the approval copy, so the human approves a *concrete consequence*, not
 //! an abstraction.
@@ -22,8 +22,9 @@ use serde::{Deserialize, Serialize};
 
 /// How far a tool call could reach, worst case. Ordered by severity:
 /// [`BlastRadius::ReadOnly`] < [`BlastRadius::WorkspaceLocal`] <
-/// [`BlastRadius::Network`] < [`BlastRadius::SystemWide`] <
-/// [`BlastRadius::Destructive`] (the discriminants are the rank).
+/// [`BlastRadius::SubAgent`] < [`BlastRadius::Network`] <
+/// [`BlastRadius::SystemWide`] < [`BlastRadius::Destructive`] (the
+/// discriminants are the rank).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -33,19 +34,23 @@ pub enum BlastRadius {
     ReadOnly = 0,
     /// Mutates only inside the workspace (or the shared scratch dirs).
     WorkspaceLocal = 1,
+    /// Spawns a sub-agent that acts under the same gate chain — its own
+    /// calls carry their own labels, so the spawn itself ranks below a
+    /// direct network reach but above a plain local mutation.
+    SubAgent = 2,
     /// Reaches the network (or other external effects short of the
     /// machine's own configuration).
-    Network = 2,
+    Network = 3,
     /// Touches the wider system — files outside the workspace, or
     /// system-control tooling.
-    SystemWide = 3,
+    SystemWide = 4,
     /// Matches a blocked destructive pattern (the gate blocks these
     /// independently; the label says how bad the ask was).
-    Destructive = 4,
+    Destructive = 5,
 }
 
 impl BlastRadius {
-    /// The severity rank: 0 ([`BlastRadius::ReadOnly`]) through 4
+    /// The severity rank: 0 ([`BlastRadius::ReadOnly`]) through 5
     /// ([`BlastRadius::Destructive`]).
     pub fn severity(self) -> u8 {
         self as u8
@@ -57,6 +62,7 @@ impl BlastRadius {
         match self {
             Self::ReadOnly => "observes only; nothing is modified",
             Self::WorkspaceLocal => "changes stay inside the workspace",
+            Self::SubAgent => "spawns a sub-agent that acts under the same gate chain",
             Self::Network => "reaches the network",
             Self::SystemWide => "touches files outside the workspace",
             Self::Destructive => "matches a blocked destructive pattern",
@@ -69,6 +75,7 @@ impl std::fmt::Display for BlastRadius {
         match self {
             Self::ReadOnly => write!(f, "read_only"),
             Self::WorkspaceLocal => write!(f, "workspace_local"),
+            Self::SubAgent => write!(f, "sub_agent"),
             Self::Network => write!(f, "network"),
             Self::SystemWide => write!(f, "system_wide"),
             Self::Destructive => write!(f, "destructive"),
@@ -106,6 +113,14 @@ pub fn classify(registry: &ToolRegistry, policy: &PathPolicy, call: &ToolCall) -
     // nothing. Display-only, like everything here.
     if call.name == "eval_wasm" {
         return BlastRadius::ReadOnly;
+    }
+
+    // Static override (M8): a spawn is not itself a network or system
+    // effect — the child's own calls carry their own labels. The tier
+    // stays ExternalEffector (creating an acting entity always asks a
+    // human); the radius says what the spawn itself can touch.
+    if call.name == "spawn_agent" {
+        return BlastRadius::SubAgent;
     }
 
     let mut radius = match registry.get_tier(&call.name) {
@@ -222,16 +237,19 @@ mod tests {
     fn severity_ranks_are_monotonic() {
         assert_eq!(BlastRadius::ReadOnly.severity(), 0);
         assert_eq!(BlastRadius::WorkspaceLocal.severity(), 1);
-        assert_eq!(BlastRadius::Network.severity(), 2);
-        assert_eq!(BlastRadius::SystemWide.severity(), 3);
-        assert_eq!(BlastRadius::Destructive.severity(), 4);
+        assert_eq!(BlastRadius::SubAgent.severity(), 2);
+        assert_eq!(BlastRadius::Network.severity(), 3);
+        assert_eq!(BlastRadius::SystemWide.severity(), 4);
+        assert_eq!(BlastRadius::Destructive.severity(), 5);
         assert!(BlastRadius::ReadOnly < BlastRadius::Destructive);
+        assert!(BlastRadius::SubAgent < BlastRadius::Network);
     }
 
     #[test]
     fn display_names_are_snake_case() {
         assert_eq!(BlastRadius::ReadOnly.to_string(), "read_only");
         assert_eq!(BlastRadius::WorkspaceLocal.to_string(), "workspace_local");
+        assert_eq!(BlastRadius::SubAgent.to_string(), "sub_agent");
         assert_eq!(BlastRadius::Network.to_string(), "network");
         assert_eq!(BlastRadius::SystemWide.to_string(), "system_wide");
         assert_eq!(BlastRadius::Destructive.to_string(), "destructive");
@@ -241,6 +259,10 @@ mod tests {
     fn notes_explain_the_consequence() {
         assert_eq!(BlastRadius::ReadOnly.note(), "observes only; nothing is modified");
         assert_eq!(BlastRadius::WorkspaceLocal.note(), "changes stay inside the workspace");
+        assert_eq!(
+            BlastRadius::SubAgent.note(),
+            "spawns a sub-agent that acts under the same gate chain"
+        );
         assert_eq!(BlastRadius::Network.note(), "reaches the network");
         assert_eq!(BlastRadius::SystemWide.note(), "touches files outside the workspace");
         assert_eq!(BlastRadius::Destructive.note(), "matches a blocked destructive pattern");
@@ -326,6 +348,20 @@ mod tests {
         // …and relative paths never leave the workspace.
         let relative = call("write_file", serde_json::json!({"path": "notes.txt"}));
         assert_eq!(classify(&registry, &policy, &relative), BlastRadius::WorkspaceLocal);
+    }
+
+    #[test]
+    fn spawn_agent_is_labeled_sub_agent_despite_the_effector_tier() {
+        // Spawning always asks a human (ExternalEffector), but the radius
+        // is its own class: the child's calls carry their own labels.
+        let registry = registry(&[("spawn_agent", ToolTrustTier::ExternalEffector)]);
+        let policy = policy();
+        let call = call("spawn_agent", serde_json::json!({"task": "research it"}));
+        assert_eq!(classify(&registry, &policy, &call), BlastRadius::SubAgent);
+        assert_eq!(
+            registry.get_tier("spawn_agent"),
+            Some(ToolTrustTier::ExternalEffector)
+        );
     }
 
     #[test]

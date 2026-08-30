@@ -20,7 +20,7 @@ use amparo_chat::telegram::TelegramTransport;
 use amparo_chat::transport::{
     ApprovalButtonPress, ChatError, ChatRef, ChatTransport, PressOutcome,
 };
-use amparo_notebook::{JsonlStore, SkillLogEvent, append_event};
+use amparo_notebook::{append_event, JsonlStore, SkillLogEvent};
 use amparo_policy::AllowAllPolicyEngine;
 use amparo_tools::registry::default_registry_with_policy;
 use amparo_tools::{MemoryEntry, PathPolicy, SkillOrigin, SkillSpec, SkillStep, ToolTrustTier};
@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::Duration;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -67,7 +67,13 @@ impl MockTelegram {
             Arc::clone(&unauthorized),
             Arc::clone(&next_message_id),
         ));
-        Arc::new(Self { addr, log, updates, unauthorized, task })
+        Arc::new(Self {
+            addr,
+            log,
+            updates,
+            unauthorized,
+            task,
+        })
     }
 
     /// The base URL transports point at.
@@ -106,7 +112,9 @@ async fn serve_mock(
     next_message_id: Arc<AtomicI64>,
 ) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else { return };
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
         tokio::spawn(serve_connection(
             stream,
             Arc::clone(&log),
@@ -134,7 +142,11 @@ async fn serve_connection(
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let path = parts.next().unwrap_or("").to_string();
-        log.lock().unwrap().push(Recorded { method, path: path.clone(), body: body.clone() });
+        log.lock().unwrap().push(Recorded {
+            method,
+            path: path.clone(),
+            body: body.clone(),
+        });
 
         let endpoint = path
             .rsplit_once('/')
@@ -205,7 +217,10 @@ async fn read_request(
     }
     body.truncate(content_length);
     let request_line = head.lines().next().unwrap_or("").to_string();
-    Ok(Some((request_line, String::from_utf8_lossy(&body).to_string())))
+    Ok(Some((
+        request_line,
+        String::from_utf8_lossy(&body).to_string(),
+    )))
 }
 
 /// Whether a form-url-encoded request body contains `needle` after
@@ -249,10 +264,7 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 /// Write a minimal JSON 200 response.
-async fn write_response(
-    writer: &mut (impl AsyncWrite + Unpin),
-    body: &str,
-) -> std::io::Result<()> {
+async fn write_response(writer: &mut (impl AsyncWrite + Unpin), body: &str) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: keep-alive\r\n\r\n",
@@ -341,7 +353,11 @@ async fn message_to_approval_to_answer_roundtrip() {
 
     driver
         .on_message(
-            ChatRef { platform: "telegram", chat_id: "222".into(), user_id: "111".into() },
+            ChatRef {
+                platform: "telegram",
+                chat_id: "222".into(),
+                user_id: "111".into(),
+            },
             "do a thing".into(),
         )
         .await;
@@ -387,11 +403,129 @@ async fn message_to_approval_to_answer_roundtrip() {
 
     // The gate edits the approval message with the outcome (removing the
     // buttons) and the final answer arrives as a plain sendMessage.
-    wait_until(|| mock.log().iter().any(|r| r.path.contains("/editMessageText"))).await;
+    wait_until(|| {
+        mock.log()
+            .iter()
+            .any(|r| r.path.contains("/editMessageText"))
+    })
+    .await;
     wait_until(|| {
         mock.log()
             .iter()
             .any(|r| r.path.contains("/sendMessage") && body_contains(&r.body, "Done."))
+    })
+    .await;
+
+    mock.stop();
+}
+
+/// The swarm path (M8 W4): the parent spawns a child, the spawn approval
+/// labels its blast radius, the child's gated call goes back through the
+/// same chat gate with the delegation chain named in the button copy, and
+/// the final answer rides with the swarm breakdown.
+#[tokio::test]
+async fn swarm_delegation_names_the_sub_agent_chain_in_the_gate_and_answer() {
+    let mock = MockTelegram::start().await;
+    let transport: Arc<dyn ChatTransport> =
+        Arc::new(TelegramTransport::new(mock.url(), "TEST-TOKEN-9"));
+    let driver = test_driver(
+        HashSet::from(["111".to_string()]),
+        StubProvider::new(vec![
+            turn_tool_call("call_1", "spawn_agent", r#"{"task":"ask the echo"}"#),
+            turn_tool_call("call_2", "echo", r#"{"message":"hi"}"#),
+            turn_text("child done"),
+            turn_text("Done."),
+        ]),
+        transport,
+        false, // no auto-approve — the gate must fire for the spawn and the child
+    );
+
+    driver
+        .on_message(
+            ChatRef {
+                platform: "telegram",
+                chat_id: "222".into(),
+                user_id: "111".into(),
+            },
+            "delegate it".into(),
+        )
+        .await;
+
+    // The spawn escalates: the approval copy carries the M8 W4 preflight
+    // label for spawning a sub-agent.
+    wait_until(|| {
+        mock.log().iter().any(|r| {
+            r.method == "POST"
+                && r.path.contains("/sendMessage")
+                && body_contains(&r.body, "approve:call_1")
+        })
+    })
+    .await;
+    let spawn_body = mock
+        .log()
+        .iter()
+        .find(|r| r.path.contains("/sendMessage") && body_contains(&r.body, "approve:call_1"))
+        .map(|r| r.body.clone())
+        .expect("the spawn approval sendMessage was recorded");
+    assert!(
+        body_contains(&spawn_body, "[preflight] blast radius: sub_agent"),
+        "the spawn approval must label its blast radius: {spawn_body}"
+    );
+
+    // Approve the spawn; the child then runs `echo` under the same gate —
+    // its approval names the delegation chain (M8 W2).
+    let press = ApprovalButtonPress {
+        chat_id: "222".into(),
+        approval_id: "call_1".into(),
+        approved: true,
+        user_id: "111".into(),
+    };
+    assert_eq!(
+        driver.on_approval(press).await,
+        PressOutcome::Routed,
+        "the spawn press reached the waiting gate"
+    );
+
+    wait_until(|| {
+        mock.log().iter().any(|r| {
+            r.method == "POST"
+                && r.path.contains("/sendMessage")
+                && body_contains(&r.body, "approve:call_2")
+        })
+    })
+    .await;
+    let child_body = mock
+        .log()
+        .iter()
+        .find(|r| r.path.contains("/sendMessage") && body_contains(&r.body, "approve:call_2"))
+        .map(|r| r.body.clone())
+        .expect("the child's echo approval sendMessage was recorded");
+    assert!(
+        body_contains(&child_body, "[session] sub-agent sess-")
+            && body_contains(&child_body, " of task sess-"),
+        "the child's approval names the delegation chain: {child_body}"
+    );
+
+    let press = ApprovalButtonPress {
+        chat_id: "222".into(),
+        approval_id: "call_2".into(),
+        approved: true,
+        user_id: "111".into(),
+    };
+    assert_eq!(
+        driver.on_approval(press).await,
+        PressOutcome::Routed,
+        "the child's press reached the waiting gate"
+    );
+
+    // The final answer rides with the swarm breakdown (M8 §6): the
+    // sub-agent count and the child's chain id.
+    wait_until(|| {
+        mock.log().iter().any(|r| {
+            r.path.contains("/sendMessage")
+                && body_contains(&r.body, "Done.")
+                && body_contains(&r.body, "swarm: 1 sub-agent(s) (sess-")
+        })
     })
     .await;
 
@@ -426,16 +560,29 @@ async fn receive_loop_polls_offsets_and_feeds_the_driver() {
     // the query string — the receive loop posts Vec<(String, String)>
     // params form-encoded, so assertions decode the recorded body.
     wait_until(|| {
-        mock.log().iter().any(|r| r.path.starts_with("/botTEST-TOKEN-2/getUpdates"))
-            && mock.log()
+        mock.log()
+            .iter()
+            .any(|r| r.path.starts_with("/botTEST-TOKEN-2/getUpdates"))
+            && mock
+                .log()
                 .iter()
                 .any(|r| r.path.contains("/getUpdates") && !body_contains(&r.body, "offset="))
     })
     .await;
 
     // Offsets advance one past the last confirmed update id: 101 → 102 → 103.
-    wait_until(|| mock.log().iter().any(|r| body_contains(&r.body, "offset=102"))).await;
-    wait_until(|| mock.log().iter().any(|r| body_contains(&r.body, "offset=103"))).await;
+    wait_until(|| {
+        mock.log()
+            .iter()
+            .any(|r| body_contains(&r.body, "offset=102"))
+    })
+    .await;
+    wait_until(|| {
+        mock.log()
+            .iter()
+            .any(|r| body_contains(&r.body, "offset=103"))
+    })
+    .await;
 
     // The message update started a task (the final answer was delivered)
     // and the orphan callback was answered as already decided.
@@ -447,8 +594,7 @@ async fn receive_loop_polls_offsets_and_feeds_the_driver() {
     .await;
     wait_until(|| {
         mock.log().iter().any(|r| {
-            r.path.contains("/answerCallbackQuery")
-                && body_contains(&r.body, "Already decided")
+            r.path.contains("/answerCallbackQuery") && body_contains(&r.body, "Already decided")
         })
     })
     .await;
@@ -467,8 +613,7 @@ async fn growth_executes_an_adopted_skill_for_the_telegram_tenant() {
     let mock = MockTelegram::start().await;
     mock.push_update(message_update(301, 111, 222, "use the demo skill"));
 
-    let root = std::env::temp_dir()
-        .join(format!("amparo-chat-skills-e2e-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("amparo-chat-skills-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let spec = SkillSpec {
         name: "demo-skill".into(),
@@ -485,12 +630,7 @@ async fn growth_executes_an_adopted_skill_for_the_telegram_tenant() {
     };
     append_event(
         &root.join(".amparo/skills/adopted.jsonl"),
-        &SkillLogEvent::adopt(
-            "telegram:111",
-            "demo-skill",
-            spec,
-            "2026-08-29T00:00:00Z",
-        ),
+        &SkillLogEvent::adopt("telegram:111", "demo-skill", spec, "2026-08-29T00:00:00Z"),
     )
     .expect("the seed adoption writes");
     std::fs::create_dir_all(root.join(".amparo/notebook")).unwrap();
@@ -599,9 +739,9 @@ async fn callback_from_another_user_gets_the_wrong_user_toast() {
 
     // The task's inline keyboard is on screen (and the gate registered).
     wait_until(|| {
-        mock.log().iter().any(|r| {
-            r.path.contains("/sendMessage") && body_contains(&r.body, "approve:call_1")
-        })
+        mock.log()
+            .iter()
+            .any(|r| r.path.contains("/sendMessage") && body_contains(&r.body, "approve:call_1"))
     })
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -639,7 +779,12 @@ async fn unauthorized_token_is_fatal_without_retry() {
     mock.unauthorized();
     let transport: Arc<dyn ChatTransport> =
         Arc::new(TelegramTransport::new(mock.url(), "TEST-TOKEN-3"));
-    let driver = test_driver(HashSet::new(), StubProvider::new(vec![]), transport.clone(), true);
+    let driver = test_driver(
+        HashSet::new(),
+        StubProvider::new(vec![]),
+        transport.clone(),
+        true,
+    );
 
     let result = transport.receive(driver).await;
     assert!(
@@ -648,7 +793,11 @@ async fn unauthorized_token_is_fatal_without_retry() {
     );
 
     // Fail-closed: exactly one getUpdates, no 5-second retry.
-    let updates = mock.log().iter().filter(|r| r.path.contains("/getUpdates")).count();
+    let updates = mock
+        .log()
+        .iter()
+        .filter(|r| r.path.contains("/getUpdates"))
+        .count();
     assert_eq!(updates, 1, "the 401 must not be retried");
     mock.stop();
 }
@@ -660,8 +809,7 @@ async fn unauthorized_token_is_fatal_without_retry() {
 /// offline and deterministic.
 #[tokio::test]
 async fn web_tool_call_writes_ledger_row_for_tenant() {
-    let root = std::env::temp_dir()
-        .join(format!("amparo-telegram-ledger-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("amparo-telegram-ledger-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let mock = MockTelegram::start().await;
     let transport: Arc<dyn ChatTransport> =
@@ -686,7 +834,11 @@ async fn web_tool_call_writes_ledger_row_for_tenant() {
 
     driver
         .on_message(
-            ChatRef { platform: "telegram", chat_id: "222".into(), user_id: "111".into() },
+            ChatRef {
+                platform: "telegram",
+                chat_id: "222".into(),
+                user_id: "111".into(),
+            },
             "fetch the page".into(),
         )
         .await;

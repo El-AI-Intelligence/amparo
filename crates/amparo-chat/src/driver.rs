@@ -5,28 +5,26 @@
 //! spawned per-task future, so a panicking agent or a hung inference call
 //! can never take down a receive loop.
 
-use crate::config::{ChatConfig, UserProfile};
+use crate::config::{ChatConfig, SwarmProfile, UserProfile};
 use crate::gate::ChatApprovalGate;
 use crate::router::{ApprovalRouter, TakeResult};
 use crate::sink::ChatEventSink;
 use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport, PressOutcome};
 use amparo_agent::{
     continuity_context, Agent, AgentConfig, CaseLibrary, CheckpointStore, EventSink, FanoutSink,
-    JsonCheckpointStore, LedgerSink,
+    JsonCheckpointStore, LedgerSink, SpawnAgentTool,
 };
 use amparo_inference::InferenceProvider;
 use amparo_notebook::{
-    CaseRetriever, NotebookSink, SkillLogEvent, SkillSet, append_event, auto_rollup,
-    check_skill_drift,
+    append_event, auto_rollup, check_skill_drift, CaseRetriever, NotebookSink, SkillLogEvent,
+    SkillSet,
 };
 use amparo_policy::wire::WirePolicyEngine;
 use amparo_policy::PolicyEngine;
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore, PrivacyPolicy};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::registry::default_registry_with_policy;
-use amparo_tools::{
-    Memory, PathPolicy, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool,
-};
+use amparo_tools::{Memory, PathPolicy, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -42,6 +40,17 @@ pub const WRONG_USER_TOAST: &str = "Only the user who started the task can decid
 struct ChatClaim {
     busy: Arc<Mutex<HashSet<String>>>,
     chat_id: String,
+}
+
+/// The task id for one chat task — the same `sess-<nanos>-<pid>` shape
+/// the CLI uses, so children chain `{parent}.{n}` and the checkpoint
+/// stores the same id.
+fn new_task_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("sess-{nanos}-{}", std::process::id())
 }
 
 impl Drop for ChatClaim {
@@ -165,6 +174,10 @@ struct TaskParts {
     /// directory-mode profile's `ledger_max_bytes`; always `None` in
     /// allowlist mode (no per-user profile to carry one).
     ledger_max_bytes: Option<u64>,
+    /// The M8 swarm knobs (W4): the tenant profile's [`SwarmProfile`] in
+    /// directory mode, the driver default (budget 4, no schedule) in
+    /// allowlist mode. `max_sub_agents = 0` keeps `spawn_agent` off.
+    swarm: SwarmProfile,
 }
 
 impl ChatDriver {
@@ -263,9 +276,9 @@ impl ChatDriver {
     /// Allowlist mode: the user id must be in the flat set.
     pub fn allows(&self, chat: &ChatRef) -> bool {
         match &self.tenants {
-            Tenants::Directory(config) => {
-                config.users.contains_key(&format!("{}:{}", chat.platform, chat.user_id))
-            }
+            Tenants::Directory(config) => config
+                .users
+                .contains_key(&format!("{}:{}", chat.platform, chat.user_id)),
             Tenants::LegacyAllowlist(allowlist) => allowlist.contains(&chat.user_id),
         }
     }
@@ -301,6 +314,7 @@ impl ChatDriver {
                     path_policy,
                     ledger_root: workspace,
                     ledger_max_bytes: profile.ledger_max_bytes,
+                    swarm: profile.swarm.clone().unwrap_or_default(),
                 })
             }
             Tenants::LegacyAllowlist(_) => Some(TaskParts {
@@ -310,6 +324,7 @@ impl ChatDriver {
                 path_policy: Arc::new(PathPolicy::from_root(self.workspace_root.clone())),
                 ledger_root: self.workspace_root.clone(),
                 ledger_max_bytes: None,
+                swarm: SwarmProfile::default(),
             }),
         }
     }
@@ -349,8 +364,13 @@ impl ChatDriver {
             });
         // The root's own leading RootDir is expected for absolute roots —
         // only the portion the tenant contributed is hostile territory.
-        let tail = joined.strip_prefix(&self.workspace_root).unwrap_or(joined.as_path());
-        if tail.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir)) {
+        let tail = joined
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(joined.as_path());
+        if tail
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+        {
             return None;
         }
         let _ = std::fs::create_dir_all(&joined);
@@ -401,7 +421,10 @@ impl ChatDriver {
         if busy_reply {
             let _ = self
                 .transport
-                .send_text(&chat, "Another task is still running — wait for it to finish.")
+                .send_text(
+                    &chat,
+                    "Another task is still running — wait for it to finish.",
+                )
                 .await;
             return;
         }
@@ -413,6 +436,7 @@ impl ChatDriver {
             path_policy,
             ledger_root,
             ledger_max_bytes,
+            swarm,
         } = parts;
         let provider = Arc::clone(&self.provider);
         let privacy = self.privacy.clone();
@@ -431,7 +455,10 @@ impl ChatDriver {
         tokio::spawn(async move {
             // The claim is the busy-map entry; dropping it (however this
             // task ends) releases the chat.
-            let _claim = ChatClaim { busy, chat_id: chat.chat_id.clone() };
+            let _claim = ChatClaim {
+                busy,
+                chat_id: chat.chat_id.clone(),
+            };
 
             // Progress events flow through a best-effort outbox; the final
             // answer below bypasses it. With a notebook attached, the same
@@ -442,9 +469,13 @@ impl ChatDriver {
             // its final write before the answer goes out — that closes
             // the back-to-back task window where the next task's
             // promotion could miss this task's record (M6e).
-            let notebook_sink: Option<Arc<NotebookSink>> = notebook.as_ref().map(|store| {
-                Arc::new(NotebookSink::new(Arc::clone(store), tenant_key.clone()))
-            });
+            let notebook_sink: Option<Arc<NotebookSink>> = notebook
+                .as_ref()
+                .map(|store| Arc::new(NotebookSink::new(Arc::clone(store), tenant_key.clone())));
+            // The host names the task (M8): the ledger's stamp and the
+            // swarm chain share one id, so a child's rows chain off the
+            // parent's real session id.
+            let task_id = new_task_id();
             // The privacy ledger (M7) is always-on in chat too — an I6
             // instrument, not growth-gated. Rows are tagged with the
             // tenant key and land in this task's ledger root (the
@@ -454,15 +485,20 @@ impl ChatDriver {
                 privacy_dir(&ledger_root).join("ledger.jsonl"),
                 ledger_max_bytes.map(LedgerQuota::new),
             ) {
-                    Ok(store) => Some(Arc::new(LedgerSink::new(store, tenant_key.clone(), None, None))),
-                    Err(e) => {
-                        eprintln!(
-                            "[ledger] unavailable — the task continues without the privacy \
+                Ok(store) => Some(Arc::new(LedgerSink::new(
+                    store,
+                    tenant_key.clone(),
+                    Some(task_id.clone()),
+                    None,
+                ))),
+                Err(e) => {
+                    eprintln!(
+                        "[ledger] unavailable — the task continues without the privacy \
                              ledger: {e}"
-                        );
-                        None
-                    }
-                };
+                    );
+                    None
+                }
+            };
             // Session persistence (M7 W8): chat tasks checkpoint like CLI
             // runs — one format, both hosts — rooted at this task's ledger
             // root (the per-user workspace in directory mode) and tagged
@@ -511,7 +547,9 @@ impl ChatDriver {
                 if !adopted_names.is_empty() {
                     let now = chrono::Utc::now().to_rfc3339();
                     for name in &adopted_names {
-                        let Some(spec) = skill_set.get(name) else { continue; };
+                        let Some(spec) = skill_set.get(name) else {
+                            continue;
+                        };
                         if let Some(reason) =
                             check_skill_drift(&spec, &registry, trust_ceiling, policy.as_ref())
                                 .await
@@ -602,7 +640,24 @@ impl ChatDriver {
             }
             // The flags' trust ceiling reaches the per-task agent through
             // the shared agent config (the `amparo run` equivalent).
-            agent = agent.with_config(AgentConfig { trust_ceiling, ..AgentConfig::default() });
+            agent = agent.with_config(AgentConfig {
+                trust_ceiling,
+                ..AgentConfig::default()
+            });
+            // The swarm (M8): with the budget above zero the parent
+            // registers `spawn_agent` — the tool captures this agent's
+            // parts as they now stand (a registry without itself), and
+            // every child runs the same loop under the same gate chain.
+            // The shared budget counter fails closed at the limit.
+            let spawn_tool: Option<Arc<SpawnAgentTool>> = if swarm.max_sub_agents > 0 {
+                let budget = Arc::new(Mutex::new(swarm.max_sub_agents));
+                let (swarming, tool) =
+                    agent.with_spawn_agent(task_id, Arc::clone(&budget), swarm.max_sub_agents);
+                agent = swarming;
+                Some(tool)
+            } else {
+                None
+            };
 
             // Run inside its own spawn so a panic becomes a JoinError
             // instead of taking down this task — and the receive loop.
@@ -615,10 +670,25 @@ impl ChatDriver {
                     if let Some(nb) = &notebook_sink {
                         nb.flush().await;
                     }
-                    let answer = match report.final_answer {
+                    let mut answer = match report.final_answer {
                         Some(answer) => answer,
                         None => "The task failed — no final answer was produced.".to_string(),
                     };
+                    // The swarm report (M8 §6): when sub-agents ran, the
+                    // breakdown rides with the answer — the sub-agent count
+                    // and chain ids, the tool-call total (parent included)
+                    // and the cost estimate with its method attached.
+                    if let Some(tool) = &spawn_tool {
+                        let reports = tool.reports();
+                        if !reports.is_empty() {
+                            answer.push('\n');
+                            answer.push_str(&tool.summary_line(
+                                report.tool_calls,
+                                report.tokens_estimated,
+                                AgentConfig::default().cost_per_million_tokens,
+                            ));
+                        }
+                    }
                     let _ = transport.send_text(&chat, &answer).await;
                 }
                 Err(_) => {
@@ -636,7 +706,11 @@ impl ChatDriver {
     /// and [`PressOutcome::WrongUser`] when the presser is not the user who
     /// started the task — the entry stays for the requester's own press.
     pub async fn on_approval(&self, press: ApprovalButtonPress) -> PressOutcome {
-        match self.router.take(&press.chat_id, &press.approval_id, &press.user_id).await {
+        match self
+            .router
+            .take(&press.chat_id, &press.approval_id, &press.user_id)
+            .await
+        {
             TakeResult::Routed(tx) => {
                 // The gate may have timed out and dropped its receiver just
                 // now — the press is still consumed (already decided), never
@@ -658,17 +732,21 @@ mod tests {
     }
 
     use super::*;
-    use amparo_notebook::{HOT_FILE, JsonlStore, SkillLogEvent, append_event};
+    use amparo_notebook::{append_event, JsonlStore, SkillLogEvent, HOT_FILE};
     use amparo_policy::AllowAllPolicyEngine;
     use amparo_tools::{InMemoryStore, SkillOrigin, SkillSpec, SkillStep, ToolTrustTier};
     use common::{
-        done_frame, registry_with_echo, tool_call_frame, turn_text, turn_tool_call,
-        wait_for_text, wait_until, wait_until_async, MockTransport, StubProvider,
+        done_frame, registry_with_echo, tool_call_frame, turn_text, turn_tool_call, wait_for_text,
+        wait_until, wait_until_async, MockTransport, StubProvider,
     };
     use std::collections::BTreeMap;
 
     fn chat() -> ChatRef {
-        ChatRef { platform: "mock", chat_id: "chat_1".into(), user_id: "user_1".into() }
+        ChatRef {
+            platform: "mock",
+            chat_id: "chat_1".into(),
+            user_id: "user_1".into(),
+        }
     }
 
     fn driver_with(
@@ -713,7 +791,12 @@ mod tests {
     }
 
     fn profile() -> UserProfile {
-        UserProfile { trust_ceiling: None, workspace: None, ledger_max_bytes: None }
+        UserProfile {
+            trust_ceiling: None,
+            workspace: None,
+            ledger_max_bytes: None,
+            swarm: None,
+        }
     }
 
     /// A chat for `user_id` in its own chat (so concurrent tasks don't
@@ -760,7 +843,9 @@ mod tests {
         let transport = MockTransport::new();
         let provider = StubProvider::new(vec![turn_text("The answer is 42.")]);
         let driver = driver(transport.clone(), provider, true);
-        driver.on_message(chat(), "what is the answer?".into()).await;
+        driver
+            .on_message(chat(), "what is the answer?".into())
+            .await;
         wait_for_text(&transport, "The answer is 42.").await;
     }
 
@@ -784,7 +869,7 @@ mod tests {
             HashSet::from(["user_1".to_string()]),
             transport.clone(),
             provider,
-            false, // approvals must be pressed, not auto-granted
+            false,                           // approvals must be pressed, not auto-granted
             ToolTrustTier::ExternalEffector, // tier forces the approval gate
         );
         driver.on_message(chat(), "do a thing".into()).await;
@@ -814,7 +899,10 @@ mod tests {
             approved: true,
             user_id: "user_1".into(),
         };
-        assert_eq!(driver.on_approval(press).await, PressOutcome::AlreadyDecided);
+        assert_eq!(
+            driver.on_approval(press).await,
+            PressOutcome::AlreadyDecided
+        );
     }
 
     #[tokio::test]
@@ -828,7 +916,7 @@ mod tests {
             HashSet::from(["user_1".to_string()]),
             transport.clone(),
             provider,
-            false, // approvals must be pressed, not auto-granted
+            false,                           // approvals must be pressed, not auto-granted
             ToolTrustTier::ExternalEffector, // tier forces the approval gate
         );
         driver.on_message(chat(), "do a thing".into()).await;
@@ -886,8 +974,14 @@ mod tests {
             .iter()
             .find(|e| e.content.contains(r#""tenant_id":"mock:user_1""#))
             .expect("a tenant-tagged record landed");
-        assert!(!record.content.contains("user@example.com"), "raw email stripped");
-        assert!(record.content.contains("[EMAIL_1]"), "stripped placeholder kept");
+        assert!(
+            !record.content.contains("user@example.com"),
+            "raw email stripped"
+        );
+        assert!(
+            record.content.contains("[EMAIL_1]"),
+            "stripped placeholder kept"
+        );
     }
 
     #[tokio::test]
@@ -898,7 +992,9 @@ mod tests {
         let driver = driver(transport.clone(), provider.clone(), true).with_growth(store.clone());
 
         // Task 1 seeds the notebook with a VERIFIED case for this user.
-        driver.on_message(chat(), "deploy the staging site".into()).await;
+        driver
+            .on_message(chat(), "deploy the staging site".into())
+            .await;
         wait_for_text(&transport, "Done.").await;
         wait_until_async(|| async {
             store
@@ -911,7 +1007,9 @@ mod tests {
 
         // Task 2: its verification prompt must carry the prior case — the
         // same user, retrieved read-only.
-        driver.on_message(chat(), "deploy the staging site".into()).await;
+        driver
+            .on_message(chat(), "deploy the staging site".into())
+            .await;
         wait_until(|| provider.recorded_complete_prompts().len() == 2).await;
 
         let prompts = provider.recorded_complete_prompts();
@@ -939,8 +1037,7 @@ mod tests {
         // Task 1 writes the cold record (flushed before its answer);
         // task 2's start promotes the tail into hot and its verification
         // reads the promoted case from hot.
-        let root =
-            std::env::temp_dir().join(format!("amparo-chat-hot-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-chat-hot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let transport = MockTransport::new();
         let provider = StubProvider::new(vec![turn_text("Done.")]);
@@ -952,7 +1049,9 @@ mod tests {
             .with_hot_layer(hot, nb_dir);
 
         // Task 1 seeds the cold archive.
-        driver.on_message(chat(), "deploy the staging site".into()).await;
+        driver
+            .on_message(chat(), "deploy the staging site".into())
+            .await;
         wait_for_text(&transport, "Done.").await;
         let cold_path = root.join(".amparo/notebook/records.jsonl");
         wait_until(|| {
@@ -964,7 +1063,9 @@ mod tests {
 
         // Task 2: the startup rollup promotes task 1's tail into hot, and
         // the second verification carries the case from the hot layer.
-        driver.on_message(chat_for("user_1"), "deploy the staging site".into()).await;
+        driver
+            .on_message(chat_for("user_1"), "deploy the staging site".into())
+            .await;
         wait_until(|| provider.recorded_complete_prompts().len() == 2).await;
 
         let hot_path = root.join(".amparo/notebook/hot.jsonl");
@@ -978,7 +1079,11 @@ mod tests {
                 .to_string()
         };
         let cold_rows = std::fs::read_to_string(&cold_path).expect("cold archive");
-        assert_eq!(id_of(&hot_rows), id_of(&cold_rows), "the hot row keeps the cold id");
+        assert_eq!(
+            id_of(&hot_rows),
+            id_of(&cold_rows),
+            "the hot row keeps the cold id"
+        );
 
         let prompts = provider.recorded_complete_prompts();
         assert!(
@@ -1032,18 +1137,12 @@ mod tests {
         };
         append_event(
             &root.join(".amparo/skills/adopted.jsonl"),
-            &SkillLogEvent::adopt(
-                "mock:user_1",
-                "demo-skill",
-                spec,
-                "2026-08-29T00:00:00Z",
-            ),
+            &SkillLogEvent::adopt("mock:user_1", "demo-skill", spec, "2026-08-29T00:00:00Z"),
         )
         .expect("the seed adoption writes");
         let store = Arc::new(InMemoryStore::new());
-        let driver =
-            driver_directory(users, transport, provider, true, root.to_path_buf())
-                .with_growth(store.clone());
+        let driver = driver_directory(users, transport, provider, true, root.to_path_buf())
+            .with_growth(store.clone());
         (driver, store)
     }
 
@@ -1099,7 +1198,9 @@ mod tests {
             turn_text("Done."),
         ]);
         let (driver, store) = seeded_skill_driver(&root, transport.clone(), provider);
-        driver.on_message(chat_for("user_2"), "use the demo skill".into()).await;
+        driver
+            .on_message(chat_for("user_2"), "use the demo skill".into())
+            .await;
         wait_for_text(&transport, "Done.").await;
         let record = tenant_record(&store, "mock:user_2", "use_skill").await;
         assert!(
@@ -1141,12 +1242,7 @@ mod tests {
         };
         append_event(
             &root.join(".amparo/skills/adopted.jsonl"),
-            &SkillLogEvent::adopt(
-                "mock:user_1",
-                "demo-skill",
-                spec,
-                "2026-08-29T00:00:00Z",
-            ),
+            &SkillLogEvent::adopt("mock:user_1", "demo-skill", spec, "2026-08-29T00:00:00Z"),
         )
         .expect("the seed adoption writes");
         let store = Arc::new(InMemoryStore::new());
@@ -1166,10 +1262,9 @@ mod tests {
         // The startup check wrote the retire event with an honest reason.
         let log = std::fs::read_to_string(root.join(".amparo/skills/adopted.jsonl"))
             .expect("the audit log exists");
-        let row: serde_json::Value = serde_json::from_str(
-            log.lines().last().expect("the retire row"),
-        )
-        .expect("the retire row is JSON");
+        let row: serde_json::Value =
+            serde_json::from_str(log.lines().last().expect("the retire row"))
+                .expect("the retire row is JSON");
         assert_eq!(row["event"], "retire");
         assert!(
             row["reason"]
@@ -1217,7 +1312,9 @@ mod tests {
             true,
             PathBuf::from("/tmp/amparo-chat-test-dir"),
         );
-        driver.on_message(chat(), "what is the answer?".into()).await;
+        driver
+            .on_message(chat(), "what is the answer?".into())
+            .await;
         wait_for_text(&transport, "The answer is 42.").await;
         assert_eq!(provider.recorded_requests().len(), 1, "one LLM request");
     }
@@ -1239,6 +1336,7 @@ mod tests {
                 trust_ceiling: Some(ToolTrustTier::Observational),
                 workspace: None,
                 ledger_max_bytes: None,
+                swarm: None,
             },
         );
         let driver = driver_directory(
@@ -1250,10 +1348,15 @@ mod tests {
         );
         driver.on_message(chat(), "run a thing".into()).await;
         wait_for_text(&transport, "Done.").await;
-        assert!(transport.approvals().is_empty(), "no approval for a trust-blocked call");
+        assert!(
+            transport.approvals().is_empty(),
+            "no approval for a trust-blocked call"
+        );
         let requests = provider.recorded_requests();
         assert!(
-            requests.iter().any(|r| r.contains("tool blocked by trust ceiling")),
+            requests
+                .iter()
+                .any(|r| r.contains("tool blocked by trust ceiling")),
             "the blocked call was answered: {requests:?}"
         );
     }
@@ -1278,20 +1381,23 @@ mod tests {
         .with_trust_ceiling(ToolTrustTier::Observational);
         driver.on_message(chat(), "run a thing".into()).await;
         wait_for_text(&transport, "Done.").await;
-        assert!(transport.approvals().is_empty(), "no approval for a trust-blocked call");
+        assert!(
+            transport.approvals().is_empty(),
+            "no approval for a trust-blocked call"
+        );
         let requests = provider.recorded_requests();
         assert!(
-            requests.iter().any(|r| r.contains("tool blocked by trust ceiling")),
+            requests
+                .iter()
+                .any(|r| r.contains("tool blocked by trust ceiling")),
             "the flag ceiling blocked the call: {requests:?}"
         );
     }
 
     #[tokio::test]
     async fn directory_mode_workspaces_are_distinct() {
-        let root = std::env::temp_dir().join(format!(
-            "amparo-chat-driver-ws-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("amparo-chat-driver-ws-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let transport = MockTransport::new();
         // One tool call per turn (tool_call_frame hardcodes index 0, and
@@ -1300,12 +1406,25 @@ mod tests {
         // the shared script queue cannot interleave between the tasks.
         let provider = StubProvider::new(vec![
             // user_a (default workspace): write, then read back.
-            vec![tool_call_frame("call_1", "write_file", r#"{"path":"notes.txt","content":"hello from user_a"}"#), done_frame()],
-            vec![tool_call_frame("call_2", "read_file", r#"{"path":"notes.txt"}"#), done_frame()],
+            vec![
+                tool_call_frame(
+                    "call_1",
+                    "write_file",
+                    r#"{"path":"notes.txt","content":"hello from user_a"}"#,
+                ),
+                done_frame(),
+            ],
+            vec![
+                tool_call_frame("call_2", "read_file", r#"{"path":"notes.txt"}"#),
+                done_frame(),
+            ],
             turn_text("A done."),
             // user_b (workspace = "team-b"): read its own notes.txt — the
             // file lives in user_a's workspace, not here.
-            vec![tool_call_frame("call_3", "read_file", r#"{"path":"notes.txt"}"#), done_frame()],
+            vec![
+                tool_call_frame("call_3", "read_file", r#"{"path":"notes.txt"}"#),
+                done_frame(),
+            ],
             turn_text("B done."),
         ]);
         let mut users = BTreeMap::new();
@@ -1316,13 +1435,24 @@ mod tests {
                 trust_ceiling: None,
                 workspace: Some(PathBuf::from("team-b")),
                 ledger_max_bytes: None,
+                swarm: None,
             },
         );
-        let driver = driver_directory(users, transport.clone(), provider.clone(), true, root.clone());
+        let driver = driver_directory(
+            users,
+            transport.clone(),
+            provider.clone(),
+            true,
+            root.clone(),
+        );
 
-        driver.on_message(chat_for("user_a"), "store a note".into()).await;
+        driver
+            .on_message(chat_for("user_a"), "store a note".into())
+            .await;
         wait_for_text(&transport, "A done.").await;
-        driver.on_message(chat_for("user_b"), "read the note".into()).await;
+        driver
+            .on_message(chat_for("user_b"), "read the note".into())
+            .await;
         wait_for_text(&transport, "B done.").await;
 
         let requests = provider.recorded_requests();
@@ -1350,8 +1480,7 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_writes_per_tenant_rows_in_per_user_workspaces() {
-        let root =
-            std::env::temp_dir().join(format!("amparo-chat-ledger-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-chat-ledger-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let transport = MockTransport::new();
         // The messages are driven sequentially (each task to its final
@@ -1360,12 +1489,20 @@ mod tests {
         // refused-connection ports — deterministic, fully offline.
         let provider = StubProvider::new(vec![
             vec![
-                tool_call_frame("call_1", "fetch_url", r#"{"url":"http://127.0.0.1:1/from-a"}"#),
+                tool_call_frame(
+                    "call_1",
+                    "fetch_url",
+                    r#"{"url":"http://127.0.0.1:1/from-a"}"#,
+                ),
                 done_frame(),
             ],
             turn_text("A done."),
             vec![
-                tool_call_frame("call_2", "fetch_url", r#"{"url":"http://127.0.0.1:2/from-b"}"#),
+                tool_call_frame(
+                    "call_2",
+                    "fetch_url",
+                    r#"{"url":"http://127.0.0.1:2/from-b"}"#,
+                ),
                 done_frame(),
             ],
             turn_text("B done."),
@@ -1375,21 +1512,23 @@ mod tests {
         users.insert("mock:user_b".to_string(), profile());
         let driver = driver_directory(users, transport.clone(), provider, true, root.clone());
 
-        driver.on_message(chat_for("user_a"), "fetch a page".into()).await;
+        driver
+            .on_message(chat_for("user_a"), "fetch a page".into())
+            .await;
         wait_for_text(&transport, "A done.").await;
-        driver.on_message(chat_for("user_b"), "fetch a page".into()).await;
+        driver
+            .on_message(chat_for("user_b"), "fetch a page".into())
+            .await;
         wait_for_text(&transport, "B done.").await;
 
         // Each tenant's row lands in its own workspace ledger (the write
         // is synchronous at ToolExecuted — before the final answer).
-        let ledger_a = std::fs::read_to_string(
-            root.join("users/mock-user_a/.amparo/privacy/ledger.jsonl"),
-        )
-        .expect("user_a's ledger exists");
-        let ledger_b = std::fs::read_to_string(
-            root.join("users/mock-user_b/.amparo/privacy/ledger.jsonl"),
-        )
-        .expect("user_b's ledger exists");
+        let ledger_a =
+            std::fs::read_to_string(root.join("users/mock-user_a/.amparo/privacy/ledger.jsonl"))
+                .expect("user_a's ledger exists");
+        let ledger_b =
+            std::fs::read_to_string(root.join("users/mock-user_b/.amparo/privacy/ledger.jsonl"))
+                .expect("user_b's ledger exists");
         assert!(
             ledger_a.contains(r#""tenant":"mock:user_a""#),
             "user_a's row is tenant-tagged: {ledger_a}"
@@ -1419,8 +1558,7 @@ mod tests {
 
     #[tokio::test]
     async fn directory_mode_ledger_quotas_rotate_independently_per_tenant() {
-        let root =
-            std::env::temp_dir().join(format!("amparo-chat-quota-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-chat-quota-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let transport = MockTransport::new();
         // user_a's ledger is bounded at 250 bytes — well under the ~180
@@ -1449,23 +1587,27 @@ mod tests {
                 trust_ceiling: None,
                 workspace: None,
                 ledger_max_bytes: Some(250),
+                swarm: None,
             },
         );
         users.insert("mock:user_b".to_string(), profile());
         let driver = driver_directory(users, transport.clone(), provider, true, root.clone());
 
-        driver.on_message(chat_for("user_a"), "fetch pages".into()).await;
+        driver
+            .on_message(chat_for("user_a"), "fetch pages".into())
+            .await;
         wait_for_text(&transport, "A done.").await;
-        driver.on_message(chat_for("user_b"), "fetch pages".into()).await;
+        driver
+            .on_message(chat_for("user_b"), "fetch pages".into())
+            .await;
         wait_for_text(&transport, "B done.").await;
 
         // The bounded tenant's ledger rotated down to the newest row plus
         // the marker recording the drop — and the marker's tenant tag is
         // the surviving row's (user_a), never a mix.
-        let ledger_a = std::fs::read_to_string(
-            root.join("users/mock-user_a/.amparo/privacy/ledger.jsonl"),
-        )
-        .expect("user_a's ledger exists");
+        let ledger_a =
+            std::fs::read_to_string(root.join("users/mock-user_a/.amparo/privacy/ledger.jsonl"))
+                .expect("user_a's ledger exists");
         assert_eq!(
             ledger_a.matches(r#""kind":"network_call""#).count(),
             1,
@@ -1484,10 +1626,9 @@ mod tests {
             "the marker is tagged with the surviving tenant: {ledger_a}"
         );
         // The unbounded tenant keeps every row and never rotates.
-        let ledger_b = std::fs::read_to_string(
-            root.join("users/mock-user_b/.amparo/privacy/ledger.jsonl"),
-        )
-        .expect("user_b's ledger exists");
+        let ledger_b =
+            std::fs::read_to_string(root.join("users/mock-user_b/.amparo/privacy/ledger.jsonl"))
+                .expect("user_b's ledger exists");
         assert_eq!(
             ledger_b.matches(r#""kind":"network_call""#).count(),
             4,
@@ -1507,16 +1648,16 @@ mod tests {
             "user_a's quota sidecar records the bound"
         );
         assert!(
-            !root.join("users/mock-user_b/.amparo/privacy/quota").exists(),
+            !root
+                .join("users/mock-user_b/.amparo/privacy/quota")
+                .exists(),
             "no quota sidecar for the unbounded tenant"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Reads one full HTTP request body (head + content-length bytes).
-    async fn read_http_body(
-        sock: &mut tokio::net::TcpStream,
-    ) -> std::io::Result<String> {
+    async fn read_http_body(sock: &mut tokio::net::TcpStream) -> std::io::Result<String> {
         use tokio::io::AsyncReadExt;
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -1575,9 +1716,15 @@ mod tests {
         // answer first), so the shared script queue cannot interleave
         // between the tasks: user_a pops scripts 1-2, user_b pops 3-4.
         let provider = StubProvider::new(vec![
-            vec![tool_call_frame("call_1", "read_file", r#"{"path":"notes.txt"}"#), done_frame()],
+            vec![
+                tool_call_frame("call_1", "read_file", r#"{"path":"notes.txt"}"#),
+                done_frame(),
+            ],
             turn_text("A done."),
-            vec![tool_call_frame("call_2", "read_file", r#"{"path":"notes.txt"}"#), done_frame()],
+            vec![
+                tool_call_frame("call_2", "read_file", r#"{"path":"notes.txt"}"#),
+                done_frame(),
+            ],
             turn_text("B done."),
         ]);
         let mut users = BTreeMap::new();
@@ -1597,20 +1744,28 @@ mod tests {
             true,
         );
 
-        driver.on_message(chat_for("user_a"), "read a note".into()).await;
+        driver
+            .on_message(chat_for("user_a"), "read a note".into())
+            .await;
         wait_for_text(&transport, "A done.").await;
-        driver.on_message(chat_for("user_b"), "read a note".into()).await;
+        driver
+            .on_message(chat_for("user_b"), "read a note".into())
+            .await;
         wait_for_text(&transport, "B done.").await;
         server.await.expect("mock policy engine served both checks");
 
         let bodies = captured.lock().unwrap().clone();
         assert_eq!(bodies.len(), 2, "one check per user: {bodies:?}");
         assert!(
-            bodies.iter().any(|b| b.contains("\"session_id\":\"mock:user_a\"")),
+            bodies
+                .iter()
+                .any(|b| b.contains("\"session_id\":\"mock:user_a\"")),
             "user_a's check carries its session: {bodies:?}"
         );
         assert!(
-            bodies.iter().any(|b| b.contains("\"session_id\":\"mock:user_b\"")),
+            bodies
+                .iter()
+                .any(|b| b.contains("\"session_id\":\"mock:user_b\"")),
             "user_b's check carries its session: {bodies:?}"
         );
     }
@@ -1619,8 +1774,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_task_receives_the_prior_tail_without_its_pii() {
-        let root =
-            std::env::temp_dir().join(format!("amparo-chat-w8-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-chat-w8-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let transport = MockTransport::new();
         let provider = StubProvider::new(vec![
@@ -1669,8 +1823,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuity_stays_within_the_tenant() {
-        let root =
-            std::env::temp_dir().join(format!("amparo-chat-w9-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-chat-w9-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let transport = MockTransport::new();
         // Sequential tasks, one chat call each: user_a first, user_b,
@@ -1683,14 +1836,25 @@ mod tests {
         let mut users = BTreeMap::new();
         users.insert("mock:user_a".to_string(), profile());
         users.insert("mock:user_b".to_string(), profile());
-        let driver =
-            driver_directory(users, transport.clone(), provider.clone(), true, root.clone());
+        let driver = driver_directory(
+            users,
+            transport.clone(),
+            provider.clone(),
+            true,
+            root.clone(),
+        );
 
-        driver.on_message(chat_for("user_a"), "first task".into()).await;
+        driver
+            .on_message(chat_for("user_a"), "first task".into())
+            .await;
         wait_for_text(&transport, "A first answer.").await;
-        driver.on_message(chat_for("user_b"), "b's task".into()).await;
+        driver
+            .on_message(chat_for("user_b"), "b's task".into())
+            .await;
         wait_for_text(&transport, "B answer.").await;
-        driver.on_message(chat_for("user_a"), "second task".into()).await;
+        driver
+            .on_message(chat_for("user_a"), "second task".into())
+            .await;
         wait_for_text(&transport, "A second answer.").await;
 
         let requests = provider.recorded_requests();
@@ -1729,7 +1893,11 @@ mod tests {
         let b_dir = root.join("users/mock-user_b/.amparo/sessions/mock-user_b");
         let a_files: Vec<_> = std::fs::read_dir(&a_dir).unwrap().flatten().collect();
         let b_files: Vec<_> = std::fs::read_dir(&b_dir).unwrap().flatten().collect();
-        assert_eq!(a_files.len(), 2, "both of user_a's tasks checkpointed: {a_files:?}");
+        assert_eq!(
+            a_files.len(),
+            2,
+            "both of user_a's tasks checkpointed: {a_files:?}"
+        );
         assert_eq!(b_files.len(), 1, "user_b's task checkpointed: {b_files:?}");
         let _ = std::fs::remove_dir_all(&root);
     }

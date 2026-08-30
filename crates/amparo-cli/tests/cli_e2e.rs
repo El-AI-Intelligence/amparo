@@ -7,7 +7,7 @@
 //! restore what they touched — `AMPARO_WORKSPACE` is process-wide state and
 //! the mock env must be visible to child processes only while they run.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -145,7 +145,9 @@ impl MockLlm {
     async fn start(scripts: Vec<Script>) -> MockLlm {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
         let addr = listener.local_addr().unwrap();
         let scripts = Arc::new(tokio::sync::Mutex::new(scripts));
         let complete_requests: Arc<tokio::sync::Mutex<Vec<Value>>> =
@@ -156,7 +158,9 @@ impl MockLlm {
         let streamed = Arc::clone(&stream_requests);
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let scripts = Arc::clone(&scripts);
                 let complete_requests = Arc::clone(&recorded);
                 let stream_requests = Arc::clone(&streamed);
@@ -277,7 +281,10 @@ impl MockLlm {
     fn env(&self) -> Vec<(String, String)> {
         vec![
             ("AMPARO_INFERENCE_URL".to_string(), self.url()),
-            ("AMPARO_INFERENCE_MODEL".to_string(), "mock-model".to_string()),
+            (
+                "AMPARO_INFERENCE_MODEL".to_string(),
+                "mock-model".to_string(),
+            ),
         ]
     }
 }
@@ -367,7 +374,10 @@ async fn mock_env(mock: &MockLlm) -> (EnvGuard, Option<String>) {
 
 #[test]
 fn version_prints_name_and_version() {
-    let out = std::process::Command::new(bin()).arg("version").output().unwrap();
+    let out = std::process::Command::new(bin())
+        .arg("version")
+        .output()
+        .unwrap();
     assert!(out.status.success());
     assert_eq!(
         stdout(&out).trim(),
@@ -377,9 +387,16 @@ fn version_prints_name_and_version() {
 
 #[test]
 fn unknown_subcommand_exits_2() {
-    let out = std::process::Command::new(bin()).arg("frobnicate").output().unwrap();
+    let out = std::process::Command::new(bin())
+        .arg("frobnicate")
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("unknown subcommand frobnicate"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown subcommand frobnicate"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[tokio::test]
@@ -403,12 +420,19 @@ fn run_unknown_flag_exits_2() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("unknown flag --nonsense"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown flag --nonsense"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
 fn run_missing_task_exits_2() {
-    let out = std::process::Command::new(bin()).arg("run").output().unwrap();
+    let out = std::process::Command::new(bin())
+        .arg("run")
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("requires a task"), "{}", stderr(&out));
 }
@@ -420,17 +444,31 @@ fn run_approval_conflict_exits_2() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("mutually exclusive"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("mutually exclusive"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
 fn run_policy_conflict_exits_2() {
     let out = std::process::Command::new(bin())
-        .args(["run", "--policy-url", "http://p.test", "--allow-all", "task"])
+        .args([
+            "run",
+            "--policy-url",
+            "http://p.test",
+            "--allow-all",
+            "task",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("mutually exclusive"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("mutually exclusive"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
@@ -476,8 +514,14 @@ async fn mcp_serve_subcommand_smoke_allow_all() {
         .find(|c| c.block_type == "text")
         .map(|c| c.text.as_str())
         .unwrap_or_default();
-    assert!(!result.isError, "list_dir should run under --allow-all: {text}");
-    assert!(text.contains("marker.txt"), "the real tool ran against the real workspace: {text}");
+    assert!(
+        !result.isError,
+        "list_dir should run under --allow-all: {text}"
+    );
+    assert!(
+        text.contains("marker.txt"),
+        "the real tool ran against the real workspace: {text}"
+    );
 
     restore_workspace_env(prior);
 }
@@ -495,7 +539,11 @@ async fn run_completes_against_mock_llm() {
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert_eq!(stdout(&out).trim(), "Hello from the mock.");
-    assert!(stderr(&out).contains("[report] complete"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[report] complete"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[tokio::test]
@@ -516,8 +564,14 @@ async fn run_executes_approved_tool_end_to_end() {
 
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
-    assert!(err.contains("[approval] granted"), "the human said yes: {err}");
-    assert!(err.contains("[exec] run_command"), "the approved tool ran: {err}");
+    assert!(
+        err.contains("[approval] granted"),
+        "the human said yes: {err}"
+    );
+    assert!(
+        err.contains("[exec] run_command"),
+        "the approved tool ran: {err}"
+    );
     assert_eq!(stdout(&out).trim(), "Done.");
 }
 
@@ -591,8 +645,103 @@ async fn run_auto_approve_skips_stdin_entirely() {
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
     assert!(err.contains("[approval] granted"), "{err}");
     assert!(err.contains("[exec] run_command"), "{err}");
-    assert!(!err.contains("approve? [y/N]"), "no prompt may be printed: {err}");
+    assert!(
+        !err.contains("approve? [y/N]"),
+        "no prompt may be printed: {err}"
+    );
     assert_eq!(stdout(&out).trim(), "Done.");
+}
+
+#[tokio::test]
+async fn run_spawns_a_child_under_the_shared_gate_and_stamps_both_chains() {
+    let _guard = LOCK.lock().await;
+    std::fs::remove_dir_all(workspace().join(".amparo")).ok();
+    // Five turns on one FIFO queue: the parent fetches (an observational
+    // call that never asks a human), spawns a child, the child runs a
+    // gated command through the same gate, then both answer.
+    let mock = MockLlm::start(vec![
+        tool_script("fetch_url", r#"{"url":"http://127.0.0.1:1/parent"}"#),
+        tool_script("spawn_agent", r#"{"task":"run the child command"}"#),
+        tool_call_script("echo child-side-effect"),
+        vec![content_frame("child done")],
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+
+    // Two approvals: the spawn itself, then the child's gated command.
+    let out = run_with_stdin(&["run", "--allow-all", "delegate the fetch"], b"y\ny\n").await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // The ledger names both chains: the parent row, then the child row
+    // chained off it (M8 W4 — the shared sink stamps each row from the
+    // frame of the agent whose call executed).
+    let ledger = workspace().join(".amparo/privacy/ledger.jsonl");
+    let text = std::fs::read_to_string(&ledger).expect("ledger exists");
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one ledger row per line"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "one row per network tool, spawn writes none: {text}"
+    );
+    let parent = rows[0]["task_id"]
+        .as_str()
+        .expect("parent task id")
+        .to_string();
+    assert!(parent.starts_with("sess-"), "host-generated id: {text}");
+    assert!(
+        rows[0].get("parent_task_id").is_none(),
+        "a top-level task has no parent: {text}"
+    );
+    let child = rows[1]["task_id"]
+        .as_str()
+        .expect("child task id")
+        .to_string();
+    assert_eq!(
+        child,
+        format!("{parent}.1"),
+        "the child chains off the parent: {text}"
+    );
+    assert_eq!(
+        rows[1]["parent_task_id"].as_str(),
+        Some(parent.as_str()),
+        "{text}"
+    );
+
+    // The approval copy names the sub-agent chain (M8 W2) and the
+    // preflight labels the spawn's blast radius (M8 W4).
+    assert!(
+        err.contains(&format!(
+            "[session] sub-agent {child} of task {parent} wants to run:"
+        )),
+        "{err}"
+    );
+    assert!(err.contains("[preflight] blast radius: sub_agent"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "[spawn] {child} under {parent}: run the child command"
+        )),
+        "{err}"
+    );
+
+    // The observatory: the swarm line names the child and totals every
+    // tool call (the parent's two plus the child's one).
+    assert!(
+        err.contains(&format!(
+            "[swarm] swarm: 1 sub-agent(s) ({child}), 3 tool calls"
+        )),
+        "{err}"
+    );
+    assert!(err.contains("[report]"), "{err}");
 }
 
 #[tokio::test]
@@ -617,7 +766,10 @@ async fn run_executes_approved_eval_wasm_with_read_only_radius() {
     // read_only even though the tier is an external effector.
     assert!(err.contains("[preflight] blast radius: read_only"), "{err}");
     assert!(err.contains("[approval] granted"), "{err}");
-    assert!(err.contains("[exec] eval_wasm"), "the approved module ran: {err}");
+    assert!(
+        err.contains("[exec] eval_wasm"),
+        "the approved module ran: {err}"
+    );
     assert_eq!(stdout(&out).trim(), "Done.");
 
     // The sandbox contract reaches the model: the first request carries
@@ -625,7 +777,10 @@ async fn run_executes_approved_eval_wasm_with_read_only_radius() {
     // after execution — carries the module's output. The result feeds
     // the loop.
     let streams = mock.stream_requests().await;
-    assert!(streams.len() >= 2, "tool call, then post-execution turn: {streams:?}");
+    assert!(
+        streams.len() >= 2,
+        "tool call, then post-execution turn: {streams:?}"
+    );
     assert!(
         streams[0].to_string().contains("10M fuel"),
         "the schema states the limits: {}",
@@ -641,7 +796,10 @@ async fn run_executes_approved_eval_wasm_with_read_only_radius() {
     // because the sink opens at task start) holds no eval_wasm row.
     let ledger = workspace().join(".amparo/privacy/ledger.jsonl");
     let text = std::fs::read_to_string(&ledger).unwrap_or_default();
-    assert!(!text.contains("eval_wasm"), "eval_wasm never leaves the machine: {text}");
+    assert!(
+        !text.contains("eval_wasm"),
+        "eval_wasm never leaves the machine: {text}"
+    );
 }
 
 #[tokio::test]
@@ -667,7 +825,10 @@ async fn run_denied_eval_wasm_executes_nothing_and_writes_no_row() {
     assert!(err.contains("[preflight] blast radius: read_only"), "{err}");
     assert!(err.contains("no input (EOF) — denying"), "{err}");
     assert!(err.contains("[approval] denied"), "{err}");
-    assert!(!err.contains("[exec] eval_wasm"), "a denied module never runs: {err}");
+    assert!(
+        !err.contains("[exec] eval_wasm"),
+        "a denied module never runs: {err}"
+    );
     assert_eq!(stdout(&out).trim(), "Done.");
 
     // And unlike a denied network tool, the denial writes no ledger row:
@@ -700,18 +861,24 @@ async fn run_growth_writes_a_pii_stripped_run_record() {
 
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
-    assert!(err.contains("[growth] recording PII-stripped run records"), "{err}");
+    assert!(
+        err.contains("[growth] recording PII-stripped run records"),
+        "{err}"
+    );
 
     let records = workspace().join(".amparo/notebook/records.jsonl");
     let text = std::fs::read_to_string(&records).expect("records file exists");
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 1, "exactly one record: {text}");
-    assert!(!text.contains("user@example.com"), "raw email persisted: {text}");
+    assert!(
+        !text.contains("user@example.com"),
+        "raw email persisted: {text}"
+    );
 
     // One MemoryEntry per line; the entry's content is the RunRecord JSON.
     let entry: Value = serde_json::from_str(lines[0]).expect("line is JSON");
-    let record: Value = serde_json::from_str(entry["content"].as_str().expect("content"))
-        .expect("record JSON");
+    let record: Value =
+        serde_json::from_str(entry["content"].as_str().expect("content")).expect("record JSON");
     assert_eq!(record["tenant_id"], "cli");
     assert!(
         record["task_text"]
@@ -745,7 +912,10 @@ async fn run_without_growth_creates_no_records_file() {
 
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
-    assert!(!err.contains("[growth]"), "no growth line without the flag: {err}");
+    assert!(
+        !err.contains("[growth]"),
+        "no growth line without the flag: {err}"
+    );
     assert!(
         !workspace().join(".amparo/notebook/records.jsonl").exists(),
         "no flag means no records file"
@@ -773,7 +943,11 @@ async fn run_growth_retrieves_prior_cases_into_verification() {
     drop(env);
 
     let requests = mock.complete_requests().await;
-    assert_eq!(requests.len(), 2, "one verification call per run: {requests:?}");
+    assert_eq!(
+        requests.len(),
+        2,
+        "one verification call per run: {requests:?}"
+    );
     let prompt = |request: &Value| {
         request["messages"][0]["content"]
             .as_str()
@@ -853,17 +1027,29 @@ async fn skill_surface_usage_errors_exit_2() {
     let _guard = LOCK.lock().await;
     let out = run_with(&["skill"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
-    assert!(stderr(&out).contains("missing subcommand"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("missing subcommand"),
+        "{}",
+        stderr(&out)
+    );
     let out = run_with(&["skill", "frobnicate"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     let out = run_with(&["skill", "add"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
-    assert!(stderr(&out).contains("exactly one candidate file"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("exactly one candidate file"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
 fn skill_help_exits_0() {
-    let out = std::process::Command::new(bin()).arg("skill").arg("--help").output().unwrap();
+    let out = std::process::Command::new(bin())
+        .arg("skill")
+        .arg("--help")
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = stdout(&out);
     assert!(stdout.contains("amparo skill"), "{}", stdout);
@@ -882,7 +1068,9 @@ async fn skill_add_validates_and_writes_the_candidate() {
     let out = run_with(&["skill", "add", bad.to_str().unwrap()]).await;
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     assert!(stderr(&out).contains("no_such_tool"), "{}", stderr(&out));
-    assert!(!workspace().join(".amparo/skills/candidates/bad-skill.toml").exists());
+    assert!(!workspace()
+        .join(".amparo/skills/candidates/bad-skill.toml")
+        .exists());
 
     // The valid candidate lands in candidates/ — not adopted.
     let candidate = workspace().join("e2e-greet.toml");
@@ -908,7 +1096,10 @@ async fn skill_adopt_deny_all_refuses_without_policy() {
     assert_eq!(added.status.code(), Some(0), "stderr: {}", stderr(&added));
     let err = stderr(&adopted);
     assert_eq!(adopted.status.code(), Some(1), "stderr: {err}");
-    assert!(err.contains("no policy configured"), "deny-all reason surfaces: {err}");
+    assert!(
+        err.contains("no policy configured"),
+        "deny-all reason surfaces: {err}"
+    );
     assert!(!workspace().join(".amparo/skills/adopted.jsonl").exists());
     restore_workspace_env(prior);
 }
@@ -920,11 +1111,14 @@ async fn skill_adopt_allow_all_auto_approve_writes_the_audit_log() {
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
     let err = stderr(&adopted);
     assert_eq!(adopted.status.code(), Some(0), "stderr: {err}");
-    assert!(err.contains("[skills] adopted e2e-greet for tenant cli"), "{err}");
+    assert!(
+        err.contains("[skills] adopted e2e-greet for tenant cli"),
+        "{err}"
+    );
     let log = workspace().join(".amparo/skills/adopted.jsonl");
     let text = std::fs::read_to_string(&log).expect("audit log exists");
-    let record: Value = serde_json::from_str(text.lines().next().expect("one line"))
-        .expect("line is JSON");
+    let record: Value =
+        serde_json::from_str(text.lines().next().expect("one line")).expect("line is JSON");
     assert_eq!(record["event"], "adopt");
     assert_eq!(record["tenant_id"], "cli");
     assert_eq!(record["name"], "e2e-greet");
@@ -949,12 +1143,20 @@ async fn skill_list_and_show_render_the_adopted_skill() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     let out = run_with(&["skill", "list"]).await;
     let out_stdout = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    assert!(out_stdout.contains("e2e-greet — writes the e2e skill marker"), "{out_stdout}");
+    assert!(
+        out_stdout.contains("e2e-greet — writes the e2e skill marker"),
+        "{out_stdout}"
+    );
 
     let out = run_with(&["skill", "show", "e2e-greet"]).await;
     let out_stdout = stdout(&out);
@@ -977,7 +1179,12 @@ async fn run_growth_executes_an_adopted_skill_with_step_records() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     let mock = MockLlm::start(vec![
         use_skill_script("e2e-greet"),
@@ -993,7 +1200,10 @@ async fn run_growth_executes_an_adopted_skill_with_step_records() {
 
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
-    assert!(err.contains("[growth] skills: 1 adopted for tenant cli"), "{err}");
+    assert!(
+        err.contains("[growth] skills: 1 adopted for tenant cli"),
+        "{err}"
+    );
     assert!(
         workspace().join("skill-marker.txt").exists(),
         "the skill's write_file step ran in the workspace"
@@ -1004,8 +1214,7 @@ async fn run_growth_executes_an_adopted_skill_with_step_records() {
     let text = std::fs::read_to_string(workspace().join(".amparo/notebook/records.jsonl"))
         .expect("records exist");
     let record: Value = serde_json::from_str(
-        serde_json::from_str::<Value>(text.lines().next().unwrap())
-            .unwrap()["content"]
+        serde_json::from_str::<Value>(text.lines().next().unwrap()).unwrap()["content"]
             .as_str()
             .unwrap(),
     )
@@ -1048,7 +1257,12 @@ async fn run_without_growth_never_registers_use_skill() {
     // this test proves no step runs, so the marker must not pre-exist.
     std::fs::remove_file(workspace().join("skill-marker.txt")).ok();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     let mock = MockLlm::start(vec![
         use_skill_script("e2e-greet"),
@@ -1092,7 +1306,14 @@ async fn skill_propose_distills_recurring_verified_sequences() {
         ])
         .await;
         let (env, prior) = mock_env(&mock).await;
-        let out = run_with(&["run", "--allow-all", "--auto-approve", "--growth", "list the workspace"]).await;
+        let out = run_with(&[
+            "run",
+            "--allow-all",
+            "--auto-approve",
+            "--growth",
+            "list the workspace",
+        ])
+        .await;
         restore_workspace_env(prior);
         drop(env);
         assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -1104,10 +1325,22 @@ async fn skill_propose_distills_recurring_verified_sequences() {
     let out_stdout = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
     assert!(err.contains("[skills] 1 proposal(s)"), "{err}");
-    assert!(out_stdout.contains("list-dir"), "suggested name: {out_stdout}");
-    assert!(out_stdout.contains("origin = \"distilled\""), "{out_stdout}");
-    assert!(out_stdout.contains("arguments = {}"), "inert skeleton: {out_stdout}");
-    assert!(out_stdout.contains("3 run(s), 3 VERIFIED"), "evidence: {out_stdout}");
+    assert!(
+        out_stdout.contains("list-dir"),
+        "suggested name: {out_stdout}"
+    );
+    assert!(
+        out_stdout.contains("origin = \"distilled\""),
+        "{out_stdout}"
+    );
+    assert!(
+        out_stdout.contains("arguments = {}"),
+        "inert skeleton: {out_stdout}"
+    );
+    assert!(
+        out_stdout.contains("3 run(s), 3 VERIFIED"),
+        "evidence: {out_stdout}"
+    );
     let proposals = workspace().join(".amparo/skills/proposals.jsonl");
     assert_eq!(
         std::fs::read_to_string(&proposals).unwrap().lines().count(),
@@ -1165,24 +1398,22 @@ fn seed_step(call_id: &str, tool: &str) -> Value {
 /// one with the legacy compact-JSON target. Callers hold `LOCK` and have
 /// adopted the skill.
 fn seed_use_records() {
-    let record = |started_at: &str,
-                  calls: Vec<Value>,
-                  status: &str,
-                  verification: Option<&str>| -> Value {
-        json!({
-            "version": 1,
-            "tenant_id": "cli",
-            "started_at": started_at,
-            "duration_ms": 10,
-            "task_text": "use the e2e skill",
-            "tool_sequence_hash": "seeded",
-            "tool_calls": calls,
-            "verification": verification.map(|d| json!({"decision": d, "feedback": null})),
-            "status": status,
-            "final_answer": null,
-            "token_cost_estimate": 1
-        })
-    };
+    let record =
+        |started_at: &str, calls: Vec<Value>, status: &str, verification: Option<&str>| -> Value {
+            json!({
+                "version": 1,
+                "tenant_id": "cli",
+                "started_at": started_at,
+                "duration_ms": 10,
+                "task_text": "use the e2e skill",
+                "tool_sequence_hash": "seeded",
+                "tool_calls": calls,
+                "verification": verification.map(|d| json!({"decision": d, "feedback": null})),
+                "status": status,
+                "final_answer": null,
+                "token_cost_estimate": 1
+            })
+        };
     let rows = [
         record(
             "2026-08-29T00:00:01Z",
@@ -1232,7 +1463,12 @@ async fn skill_retire_refuses_unknown() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     let out = run_with(&["skill", "retire", "no-such-skill"]).await;
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
@@ -1249,7 +1485,12 @@ async fn skill_retire_writes_event_list_hides_show_keeps_history() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     let out = run_with(&["skill", "retire", "e2e-greet"]).await;
     let err = stderr(&out);
@@ -1296,7 +1537,12 @@ async fn skill_check_dry_run_writes_nothing() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     // No policy flags → DenyAll: drift fires, but --dry-run reports only.
     let out = run_with(&["skill", "check", "--dry-run"]).await;
@@ -1323,7 +1569,12 @@ async fn skill_check_retires_on_performance() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
     seed_use_records();
 
     // 1 VERIFIED of 3 uses → 33% < 0.5, over the window with the 3-use
@@ -1359,13 +1610,19 @@ async fn skill_check_retires_on_performance() {
     let out_stdout = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(out_stdout.contains("uses: 3"), "{out_stdout}");
-    assert!(out_stdout.contains("VERIFIED rate: 33% (1/3)"), "{out_stdout}");
+    assert!(
+        out_stdout.contains("VERIFIED rate: 33% (1/3)"),
+        "{out_stdout}"
+    );
     assert!(out_stdout.contains("mean steps: 1.00"), "{out_stdout}");
     assert!(
         out_stdout.contains("last policy re-check: "),
         "{out_stdout}"
     );
-    assert!(out_stdout.contains("(performance, retired)"), "{out_stdout}");
+    assert!(
+        out_stdout.contains("(performance, retired)"),
+        "{out_stdout}"
+    );
     assert!(out_stdout.contains("retirement history:"), "{out_stdout}");
     restore_workspace_env(prior);
 }
@@ -1375,7 +1632,12 @@ async fn skill_check_allow_all_with_no_records_is_ok() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     // No records → no uses → below the 3-use floor: nothing retires.
     let out = run_with(&["skill", "check", "--allow-all"]).await;
@@ -1407,7 +1669,12 @@ async fn skill_check_drift_retires_under_deny_all() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     // No policy flags → DenyAll: the step plan would no longer pass.
     let out = run_with(&["skill", "check"]).await;
@@ -1440,7 +1707,12 @@ async fn run_growth_retires_a_drifted_skill_before_registration() {
     let _guard = LOCK.lock().await;
     let prior = set_workspace_env();
     let (_, adopted) = seed_skill(&["--allow-all", "--auto-approve"]).await;
-    assert_eq!(adopted.status.code(), Some(0), "stderr: {}", stderr(&adopted));
+    assert_eq!(
+        adopted.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&adopted)
+    );
 
     // The task runs without --allow-all: DenyAll policy → the startup
     // drift check retires the skill before use_skill is ever registered.
@@ -1457,7 +1729,10 @@ async fn run_growth_retires_a_drifted_skill_before_registration() {
         ),
         "{err}"
     );
-    assert!(!err.contains("[growth] skills:"), "no survivors registered: {err}");
+    assert!(
+        !err.contains("[growth] skills:"),
+        "no survivors registered: {err}"
+    );
 
     // The retire event landed…
     let log = std::fs::read_to_string(workspace().join(".amparo/skills/adopted.jsonl")).unwrap();
@@ -1526,7 +1801,11 @@ async fn notebook_surface_usage_errors_exit_2() {
     let _guard = LOCK.lock().await;
     let out = run_with(&["notebook"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
-    assert!(stderr(&out).contains("missing subcommand"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("missing subcommand"),
+        "{}",
+        stderr(&out)
+    );
     let out = run_with(&["notebook", "bogus"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(
@@ -1536,7 +1815,11 @@ async fn notebook_surface_usage_errors_exit_2() {
     );
     let out = run_with(&["notebook", "promote"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
-    assert!(stderr(&out).contains("requires a record id"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("requires a record id"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[tokio::test]
@@ -1551,7 +1834,14 @@ async fn growth_promotes_the_cold_tail_into_hot() {
     let (env, prior) = mock_env(&mock).await;
     std::fs::remove_dir_all(workspace().join(".amparo")).ok();
 
-    let out = run_with(&["run", "--allow-all", "--auto-approve", "--growth", "run the echo"]).await;
+    let out = run_with(&[
+        "run",
+        "--allow-all",
+        "--auto-approve",
+        "--growth",
+        "run the echo",
+    ])
+    .await;
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
 
@@ -1567,7 +1857,8 @@ async fn growth_promotes_the_cold_tail_into_hot() {
     let rollup_err = stderr(&rollup);
     assert_eq!(rollup.status.code(), Some(0), "stderr: {rollup_err}");
     assert!(
-        rollup_err.contains("[notebook] rollup: promoted 1, folded 0, kept 0 record(s) in the hot layer"),
+        rollup_err
+            .contains("[notebook] rollup: promoted 1, folded 0, kept 0 record(s) in the hot layer"),
         "{rollup_err}"
     );
 
@@ -1594,7 +1885,11 @@ async fn growth_promotes_the_cold_tail_into_hot() {
     );
     // The cold archive is the record: the rollup never touches it.
     let cold_after = std::fs::read_to_string(&cold_path).expect("cold archive still there");
-    assert_eq!(cold_after.lines().count(), 1, "cold unchanged: {cold_after}");
+    assert_eq!(
+        cold_after.lines().count(),
+        1,
+        "cold unchanged: {cold_after}"
+    );
 
     restore_workspace_env(prior);
     drop(env);
@@ -1609,11 +1904,23 @@ async fn growth_promotion_dedupes_by_sequence_hash() {
 
     // Two different text-only tasks share the empty tool-sequence hash:
     // the second is a dedupe duplicate of the first.
-    let out_a =
-        run_with(&["run", "--allow-all", "--auto-approve", "--growth", "first task"]).await;
+    let out_a = run_with(&[
+        "run",
+        "--allow-all",
+        "--auto-approve",
+        "--growth",
+        "first task",
+    ])
+    .await;
     assert_eq!(out_a.status.code(), Some(0), "stderr: {}", stderr(&out_a));
-    let out_b =
-        run_with(&["run", "--allow-all", "--auto-approve", "--growth", "second task"]).await;
+    let out_b = run_with(&[
+        "run",
+        "--allow-all",
+        "--auto-approve",
+        "--growth",
+        "second task",
+    ])
+    .await;
     let err_b = stderr(&out_b);
     assert_eq!(out_b.status.code(), Some(0), "stderr: {err_b}");
     // Run B's start promoted run A's record from the cold tail.
@@ -1626,12 +1933,15 @@ async fn growth_promotion_dedupes_by_sequence_hash() {
     let rollup = run_with(&["notebook", "rollup"]).await;
     let rollup_err = stderr(&rollup);
     assert_eq!(rollup.status.code(), Some(0), "stderr: {rollup_err}");
-    assert!(rollup_err.contains("promoted 0, folded 0, kept 1"), "{rollup_err}");
+    assert!(
+        rollup_err.contains("promoted 0, folded 0, kept 1"),
+        "{rollup_err}"
+    );
     let cold = std::fs::read_to_string(workspace().join(".amparo/notebook/records.jsonl"))
         .expect("cold archive");
     assert_eq!(cold.lines().count(), 2, "two cold records: {cold}");
-    let hot = std::fs::read_to_string(workspace().join(".amparo/notebook/hot.jsonl"))
-        .expect("hot layer");
+    let hot =
+        std::fs::read_to_string(workspace().join(".amparo/notebook/hot.jsonl")).expect("hot layer");
     assert_eq!(hot.lines().count(), 1, "one deduped hot row: {hot}");
     let hashes = std::fs::read_to_string(workspace().join(".amparo/notebook/hot-hashes.jsonl"))
         .expect("hash sidecar");
@@ -1656,7 +1966,10 @@ async fn notebook_promote_keeps_a_case_through_fold() {
     let out = run_with(&["notebook", "promote", "rec-a"]).await;
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
-    assert!(err.contains("[notebook] promoted rec-a to the hot layer"), "{err}");
+    assert!(
+        err.contains("[notebook] promoted rec-a to the hot layer"),
+        "{err}"
+    );
 
     // The forced rollup folds old rows — the promoted one is exempt, and
     // its hash row already represents the duplicate, so hot keeps only the
@@ -1664,9 +1977,12 @@ async fn notebook_promote_keeps_a_case_through_fold() {
     let rollup = run_with(&["notebook", "rollup"]).await;
     let rollup_err = stderr(&rollup);
     assert_eq!(rollup.status.code(), Some(0), "stderr: {rollup_err}");
-    assert!(rollup_err.contains("promoted 0, folded 0, kept 1"), "{rollup_err}");
-    let hot = std::fs::read_to_string(workspace().join(".amparo/notebook/hot.jsonl"))
-        .expect("hot layer");
+    assert!(
+        rollup_err.contains("promoted 0, folded 0, kept 1"),
+        "{rollup_err}"
+    );
+    let hot =
+        std::fs::read_to_string(workspace().join(".amparo/notebook/hot.jsonl")).expect("hot layer");
     let rows: Vec<&str> = hot.lines().collect();
     assert_eq!(rows.len(), 1, "only the promoted row survives: {hot}");
     let entry: Value = serde_json::from_str(rows[0]).expect("hot row is JSON");
@@ -1686,7 +2002,11 @@ async fn notebook_promote_already_promoted_exits_0() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let out = run_with(&["notebook", "promote", "rec-a"]).await;
     let err = stderr(&out);
-    assert_eq!(out.status.code(), Some(0), "idempotent promotion exits 0: {err}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "idempotent promotion exits 0: {err}"
+    );
     assert!(
         err.contains("[notebook] rec-a is already promoted to the hot layer"),
         "{err}"
@@ -1703,7 +2023,11 @@ async fn notebook_promote_unknown_id_exits_1() {
 
     let out = run_with(&["notebook", "promote", "rec-404"]).await;
     let err = stderr(&out);
-    assert_eq!(out.status.code(), Some(1), "unknown id is a runtime failure: {err}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "unknown id is a runtime failure: {err}"
+    );
     assert!(err.contains("unknown record id rec-404"), "{err}");
     restore_workspace_env(prior);
 }
@@ -1730,7 +2054,9 @@ async fn notebook_rollup_dry_run_writes_nothing() {
         "dry-run writes no hot rows"
     );
     assert!(
-        !workspace().join(".amparo/notebook/hot-hashes.jsonl").exists(),
+        !workspace()
+            .join(".amparo/notebook/hot-hashes.jsonl")
+            .exists(),
         "dry-run writes no hash rows"
     );
     assert!(
@@ -1793,10 +2119,18 @@ async fn privacy_surface_usage_errors_exit_2() {
     let _guard = LOCK.lock().await;
     let out = run_with(&["privacy", "--nonsense"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
-    assert!(stderr(&out).contains("unknown flag --nonsense"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown flag --nonsense"),
+        "{}",
+        stderr(&out)
+    );
     let out = run_with(&["privacy", "--last", "0"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
-    assert!(stderr(&out).contains("positive integer"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("positive integer"),
+        "{}",
+        stderr(&out)
+    );
     let out = run_with(&["privacy", "positional"]).await;
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(
@@ -1849,12 +2183,21 @@ async fn privacy_subcommand_reports_ledger_after_run() {
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
 
     let ledger = workspace().join(".amparo/privacy/ledger.jsonl");
-    assert!(ledger.exists(), "the always-on ledger exists without --growth");
+    assert!(
+        ledger.exists(),
+        "the always-on ledger exists without --growth"
+    );
     let text = std::fs::read_to_string(&ledger).expect("ledger exists");
     assert!(text.contains("fetch_url"), "tool recorded: {text}");
     assert!(text.contains("http://127.0.0.1:1"), "host kept: {text}");
-    assert!(!text.contains("supersecret"), "query never reaches the ledger: {text}");
-    assert!(!text.contains("/path"), "path never reaches the ledger: {text}");
+    assert!(
+        !text.contains("supersecret"),
+        "query never reaches the ledger: {text}"
+    );
+    assert!(
+        !text.contains("/path"),
+        "path never reaches the ledger: {text}"
+    );
 
     // The reviewer surface: summary + tail, host only — no query.
     let out = run_with(&["privacy"]).await;
@@ -1868,8 +2211,14 @@ async fn privacy_subcommand_reports_ledger_after_run() {
         out_stdout.contains("http://127.0.0.1:1"),
         "the row shows the host: {out_stdout}"
     );
-    assert!(!out_stdout.contains("supersecret"), "query never shown: {out_stdout}");
-    assert!(!out_stdout.contains("/path"), "path never shown: {out_stdout}");
+    assert!(
+        !out_stdout.contains("supersecret"),
+        "query never shown: {out_stdout}"
+    );
+    assert!(
+        !out_stdout.contains("/path"),
+        "path never shown: {out_stdout}"
+    );
 
     restore_workspace_env(prior);
     drop(env);
@@ -1883,7 +2232,12 @@ async fn run_with_tiny_ledger_quota_rotates_and_privacy_reports_it() {
     // row + previous marker — steady state is [newest row, marker
     // recording dropped 2], ~270 bytes.
     let mut scripts: Vec<Script> = (1..=8)
-        .map(|n| tool_script("fetch_url", &format!("{{\"url\":\"http://127.0.0.1:1/{n}\"}}")))
+        .map(|n| {
+            tool_script(
+                "fetch_url",
+                &format!("{{\"url\":\"http://127.0.0.1:1/{n}\"}}"),
+            )
+        })
         .collect();
     scripts.push(vec![content_frame("Done.")]);
     let mock = MockLlm::start(scripts).await;
@@ -1907,12 +2261,17 @@ async fn run_with_tiny_ledger_quota_rotates_and_privacy_reports_it() {
     let text = std::fs::read_to_string(&ledger).expect("ledger exists");
     let row_count = text.matches(r#""kind":"network_call""#).count();
     assert_eq!(row_count, 1, "rotation keeps one surviving row: {text}");
-    assert!(text.contains(r#""kind":"rotated""#), "marker row present: {text}");
+    assert!(
+        text.contains(r#""kind":"rotated""#),
+        "marker row present: {text}"
+    );
     assert!(
         text.contains(r#""dropped_rows":2"#),
         "steady state drops the previous row + previous marker: {text}"
     );
-    let bytes = std::fs::metadata(&ledger).map(|m| m.len()).unwrap_or(u64::MAX);
+    let bytes = std::fs::metadata(&ledger)
+        .map(|m| m.len())
+        .unwrap_or(u64::MAX);
     assert!(
         bytes < 600,
         "the bounded ledger stays well under a kilobyte: {bytes} bytes"
@@ -1934,7 +2293,10 @@ async fn run_with_tiny_ledger_quota_rotates_and_privacy_reports_it() {
     assert!(out_stdout.contains("quota 250"), "{out_stdout}");
     assert!(out_stdout.contains("rotations: 1"), "{out_stdout}");
     assert!(out_stdout.contains("rows dropped 2"), "{out_stdout}");
-    assert!(out_stdout.contains("rotated  dropped 2 rows"), "{out_stdout}");
+    assert!(
+        out_stdout.contains("rotated  dropped 2 rows"),
+        "{out_stdout}"
+    );
 
     restore_workspace_env(prior);
     drop(env);
@@ -1977,7 +2339,10 @@ async fn run_with_unwritable_ledger_warns_and_continues() {
 
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
-    assert!(err.contains("[ledger] unavailable"), "open failure warns: {err}");
+    assert!(
+        err.contains("[ledger] unavailable"),
+        "open failure warns: {err}"
+    );
     assert!(
         err.contains("checkpoint save failed"),
         "the checkpoint store's failure also warns, never fatal: {err}"
@@ -2096,7 +2461,10 @@ async fn resume_replays_a_checkpoint_to_completion() {
     // one in place — same file, now complete.
     let saved: Value = serde_json::from_str(
         &std::fs::read_to_string(
-            ws.join(".amparo").join("sessions").join("cli").join("sess-1.json"),
+            ws.join(".amparo")
+                .join("sessions")
+                .join("cli")
+                .join("sess-1.json"),
         )
         .unwrap(),
     )
@@ -2128,7 +2496,10 @@ async fn resume_skips_a_stale_checkpoint_with_a_warn() {
     // The stale checkpoint is untouched — still Running, still one file.
     let saved: Value = serde_json::from_str(
         &std::fs::read_to_string(
-            ws.join(".amparo").join("sessions").join("cli").join("sess-old.json"),
+            ws.join(".amparo")
+                .join("sessions")
+                .join("cli")
+                .join("sess-old.json"),
         )
         .unwrap(),
     )
@@ -2150,11 +2521,20 @@ async fn resume_lands_ledger_growth_and_checkpoint_together() {
     ])
     .await;
     let env_pairs = mock.env();
-    let vars: Vec<(&str, &str)> =
-        env_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let vars: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let env = set_env(&vars, &[]);
     let prior = set_workspace_env_to(&ws);
-    let out = run_with(&["run", "--resume", "--allow-all", "--auto-approve", "--growth"]).await;
+    let out = run_with(&[
+        "run",
+        "--resume",
+        "--allow-all",
+        "--auto-approve",
+        "--growth",
+    ])
+    .await;
     restore_workspace_env(prior);
     drop(env);
 
@@ -2227,5 +2607,8 @@ async fn destructive_call_denied_shows_radius_and_lands_a_human_denied_row() {
     assert!(text.contains(r#""gate":"human_denied""#), "{text}");
     assert!(text.contains(r#""outcome":"denied""#), "{text}");
     assert!(text.contains(r#""tool":"run_command""#), "{text}");
-    assert!(!text.contains("rm -rf"), "the command never reaches the ledger: {text}");
+    assert!(
+        !text.contains("rm -rf"),
+        "the command never reaches the ledger: {text}"
+    );
 }

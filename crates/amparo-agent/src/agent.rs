@@ -24,6 +24,7 @@ use crate::cases::{evidence_section, CaseLibrary};
 use crate::events::{truncate, AgentEvent, EventSink, InMemoryEventSink};
 use crate::preflight::classify;
 use crate::session::{Checkpoint, CheckpointStore, LoopState, SessionStatus};
+use crate::spawn::SpawnAgentTool;
 use crate::sse::accumulate_turn;
 use crate::tokens::estimate_tokens;
 use amparo_inference::{
@@ -33,11 +34,12 @@ use amparo_inference::{
 use amparo_policy::{PolicyEngine, PolicyVerdict};
 use amparo_privacy::{DataCategory, PiiPlaceholder};
 use amparo_tools::{
-    PathPolicy, SkillLibrary, ToolCall, ToolRegistry, ToolResult, ToolTrustTier, USE_SKILL,
+    PathPolicy, SkillLibrary, ToolCall, ToolExecutor, ToolRegistry, ToolResult, ToolTrustTier,
+    USE_SKILL,
 };
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Keep the system prompt plus the last 30 messages.
 const MAX_CONVERSATION_TAIL: usize = 30;
@@ -683,6 +685,32 @@ impl Agent {
             checkpoint_tenant: self.checkpoint_tenant.clone(),
             config: self.config.clone(),
         }
+    }
+
+    /// Register `spawn_agent` for this task (M8 W4) and return the tool
+    /// for the host's swarm report. The tool captures the agent's parts
+    /// with the registry as it stands **before** the tool joins it, so
+    /// each child's registry starts spawn-free and re-registers a
+    /// child-flavored spawn tool of its own — the tool never holds an
+    /// `Arc` back to its own agent.
+    ///
+    /// `parent_task_id` also becomes this agent's task id (the
+    /// [`Agent::with_task_id`] equivalent), so children chain as
+    /// `{parent}.{n}` off the parent's real id. `budget` is the
+    /// swarm-wide remaining-spawns counter — keep the `Arc` to read what
+    /// remains (and hand the same value to a resume).
+    pub fn with_spawn_agent(
+        mut self,
+        parent_task_id: impl Into<String>,
+        budget: Arc<Mutex<usize>>,
+        max_sub_agents: usize,
+    ) -> (Self, Arc<SpawnAgentTool>) {
+        let parent_task_id = parent_task_id.into();
+        self.task_id = Some(parent_task_id.clone());
+        let tool = Arc::new(SpawnAgentTool::new(&self, parent_task_id, budget, max_sub_agents));
+        self.registry
+            .register(Arc::clone(&tool) as Arc<dyn ToolExecutor>);
+        (self, tool)
     }
 
     /// Registry schemas as wire-ready OpenAI tool definitions.

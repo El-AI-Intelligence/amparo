@@ -16,21 +16,22 @@
 //! stdout carries the final answer only; the report goes to stderr.
 
 use amparo_agent::{
-    Agent, AgentConfig, AgentReport, ApprovalGate, AutoApprove, AutoDeny, CaseLibrary,
-    CheckpointStore, EventSink, FanoutSink, JsonCheckpointStore, LedgerSink, TaskStatus,
+    format_cost_line, Agent, AgentConfig, AgentReport, ApprovalGate, AutoApprove, AutoDeny,
+    CaseLibrary, CheckpointStore, EventSink, FanoutSink, JsonCheckpointStore, LedgerSink,
+    SpawnAgentTool, TaskStatus,
 };
 use amparo_inference::{InferenceConfig, MAX_TIMEOUT_SECS};
 use amparo_notebook::{
-    CaseRetriever, HOT_FILE, JsonlStore, NotebookSink, SkillLogEvent, SkillSet, append_event,
-    auto_rollup, check_skill_drift, notebook_dir, skills_dir,
+    append_event, auto_rollup, check_skill_drift, notebook_dir, skills_dir, CaseRetriever,
+    JsonlStore, NotebookSink, SkillLogEvent, SkillSet, HOT_FILE,
 };
 use amparo_policy::{
-    AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, wire::WirePolicyEngine,
+    wire::WirePolicyEngine, AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine,
 };
-use amparo_privacy::{LedgerQuota, LedgerStore, privacy_dir};
+use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore};
 use amparo_sandbox::EvalWasmTool;
-use amparo_tools::{PathPolicy, SkillLibrary, ToolTrustTier, UseSkillTool, default_registry};
-use std::sync::Arc;
+use amparo_tools::{default_registry, PathPolicy, SkillLibrary, ToolTrustTier, UseSkillTool};
+use std::sync::{Arc, Mutex};
 
 use crate::approve::InteractiveApprovalGate;
 use crate::events::PrintingSink;
@@ -51,6 +52,8 @@ FLAGS:
   --trust-ceiling T   observational | local_mutating |
                       external_effector | system_control (default)
   --max-steps N       maximum loop iterations (default 12)
+  --max-sub-agents N  swarm budget: at most N sub-agents per task
+                      (default 4; 0 turns spawn_agent off)
   --model M           override AMPARO_INFERENCE_MODEL for this run
   --timeout SECS      per-request timeout in seconds (clamped 1-3600)
   --workspace DIR     working directory the tools are confined to
@@ -80,7 +83,12 @@ default — growth never happens unless asked for — and the last
 the prompt comes from the checkpoint, and the loop re-judges every tool
 call through the current flags' gate chain. A checkpoint older than 7
 days is skipped (never resumed) — its gate decisions are too old to
-trust.";
+trust.
+
+--max-sub-agents bounds the swarm (M8): the parent registers spawn_agent,
+every spawn asks for approval like any external-effector call, and the
+report states what the swarm burned — the sub-agent count and chain ids,
+the tool-call total and the cost estimate with its method attached.";
 
 /// Parsed `amparo run` flags.
 #[derive(Debug, Clone)]
@@ -101,6 +109,9 @@ pub struct RunFlags {
     /// Bound the privacy ledger file in bytes; when it would grow past
     /// this, the oldest rows rotate off (M7b). `None` = unbounded.
     pub ledger_max_bytes: Option<u64>,
+    /// Swarm budget (M8): at most this many sub-agents per task.
+    /// `0` turns `spawn_agent` off.
+    pub max_sub_agents: usize,
     /// The task — joined positional arguments (empty when resuming).
     pub task: String,
 }
@@ -120,6 +131,7 @@ impl Default for RunFlags {
             growth: false,
             resume: false,
             ledger_max_bytes: None,
+            max_sub_agents: 4,
             task: String::new(),
         }
     }
@@ -195,13 +207,9 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
                     "local_mutating" => flags.trust_ceiling = ToolTrustTier::LocalMutating,
                     "external_effector" => flags.trust_ceiling = ToolTrustTier::ExternalEffector,
                     "system_control" => flags.trust_ceiling = ToolTrustTier::SystemControl,
-                    other => {
-                        return ParseRunResult::Error(format!("unknown trust tier {other}"))
-                    }
+                    other => return ParseRunResult::Error(format!("unknown trust tier {other}")),
                 },
-                None => {
-                    return ParseRunResult::Error("--trust-ceiling requires a tier".into())
-                }
+                None => return ParseRunResult::Error("--trust-ceiling requires a tier".into()),
             },
             "--max-steps" => match args.next() {
                 Some(n) => match n.parse::<usize>() {
@@ -212,9 +220,20 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
                         ))
                     }
                 },
-                None => {
-                    return ParseRunResult::Error("--max-steps requires a number".into())
-                }
+                None => return ParseRunResult::Error("--max-steps requires a number".into()),
+            },
+            "--max-sub-agents" => match args.next() {
+                // `0` is allowed — it turns swarms off; anything that
+                // is not a non-negative integer is a usage error (exit 2).
+                Some(n) => match n.parse::<usize>() {
+                    Ok(max) => flags.max_sub_agents = max,
+                    Err(_) => {
+                        return ParseRunResult::Error(format!(
+                            "--max-sub-agents must be a non-negative integer, got '{n}'"
+                        ))
+                    }
+                },
+                None => return ParseRunResult::Error("--max-sub-agents requires a number".into()),
             },
             "--model" => match args.next() {
                 Some(model) => flags.model = Some(model),
@@ -240,9 +259,7 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
                     Ok(bytes) => flags.ledger_max_bytes = Some(bytes),
                     Err(message) => return ParseRunResult::Error(message),
                 },
-                None => {
-                    return ParseRunResult::Error("--ledger-max-bytes requires a size".into())
-                }
+                None => return ParseRunResult::Error("--ledger-max-bytes requires a size".into()),
             },
             "--help" | "-h" => return ParseRunResult::Help,
             other if other.starts_with('-') => {
@@ -255,9 +272,7 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
     }
 
     if flags.policy_url.is_some() && flags.allow_all {
-        return ParseRunResult::Error(
-            "--policy-url and --allow-all are mutually exclusive".into(),
-        );
+        return ParseRunResult::Error("--policy-url and --allow-all are mutually exclusive".into());
     }
     if flags.auto_approve && flags.auto_deny {
         return ParseRunResult::Error(
@@ -305,9 +320,9 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     // AMPARO_WORKSPACE must be set before the tools capture the path
     // policy at construction — see [`wire`].
     apply_workspace(&flags);
-    let wired = wire(&flags).await?;
+    let wired = wire(&flags, new_task_id()).await?;
     let report = wired.agent.run(flags.task.clone()).await;
-    finish(wired.notebook, report).await
+    finish(wired.notebook, wired.spawn_tool, wired.cost_rate, report).await
 }
 
 /// Apply `--workspace` to the process env before anything reads it: the
@@ -352,24 +367,43 @@ async fn execute_resume(flags: &RunFlags) -> Result<(), String> {
         return Err("no resumable checkpoint".into());
     }
     // `wire` attaches the checkpoint store (both paths — a resumed task
-    // writes its terminal snapshot through the same store).
-    let wired = wire(flags).await?;
+    // writes its terminal snapshot through the same store). The resumed
+    // task id is the parent id for the spawn tool: children chain off
+    // the same id the checkpoint stores.
+    let wired = wire(flags, checkpoint.task_id.clone()).await?;
     let report = wired.agent.resume(checkpoint).await;
-    finish(wired.notebook, report).await
+    finish(wired.notebook, wired.spawn_tool, wired.cost_rate, report).await
+}
+
+/// The task id for a fresh run — the same `sess-<nanos>-<pid>` shape the
+/// agent generates when the host names none, so a parent's children
+/// chain as `{parent}.{n}` off the same id the checkpoint stores.
+fn new_task_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("sess-{nanos}-{}", std::process::id())
 }
 
 /// Everything the loop needs once the flags are parsed: the built agent,
-/// plus the growth notebook sink that must be flushed after the task.
+/// plus the growth notebook sink that must be flushed after the task,
+/// the swarm tool (when the budget is above zero) for the terminal
+/// report, and the cost rate the report lines use.
 struct WiredRun {
     agent: Agent,
     notebook: Option<Arc<NotebookSink>>,
+    spawn_tool: Option<Arc<SpawnAgentTool>>,
+    cost_rate: Option<f64>,
 }
 
 /// Wire the gate chain from flags: provider, policy, approval, sinks
 /// (printing + optional growth notebook + always-on privacy ledger) and
 /// the agent. Shared by a fresh run and a resume — a resumed task is the
 /// same loop and the same gates; only the starting state differs.
-async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
+/// `parent_task_id` names the task (fresh: [`new_task_id`]; resume: the
+/// checkpoint's id), so children chain as `{parent}.{n}`.
+async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, String> {
     let mut config = InferenceConfig::from_env().map_err(|e| {
         format!(
             "{e}\nset AMPARO_INFERENCE_URL and AMPARO_INFERENCE_MODEL — see the README \
@@ -415,6 +449,9 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
     }
     agent_config.trust_ceiling = flags.trust_ceiling;
     agent_config.model = flags.model.clone();
+    // The report's cost lines (M8 W1 + W4) use the same rate the loop
+    // carried — captured before the config moves into the agent.
+    let cost_rate = agent_config.cost_per_million_tokens;
 
     // The lab notebook: with --growth, records flow to a local append-only
     // store next to the printing sink; without it, printing exactly as
@@ -435,7 +472,10 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
             JsonlStore::open(&cold_path)
                 .map_err(|e| format!("cannot open the growth notebook: {e}"))?,
         );
-        eprintln!("[growth] recording PII-stripped run records to {}", cold_path.display());
+        eprintln!(
+            "[growth] recording PII-stripped run records to {}",
+            cold_path.display()
+        );
         // Rollup and archival (M6e): promote the cold tail into the hot
         // layer — folding it daily — before retrieval, so the case
         // library reads this workspace's hot copy too. Observational: a
@@ -460,10 +500,7 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
                 .map_err(|e| format!("cannot open the notebook hot layer: {e}"))?,
         );
         eprintln!("[growth] retrieval: prior cli cases (hot layer) inform self-verification");
-        case_library = Some(Arc::new(CaseRetriever::new(
-            Arc::clone(&hot_store),
-            "cli",
-        )));
+        case_library = Some(Arc::new(CaseRetriever::new(Arc::clone(&hot_store), "cli")));
         // Gated skills (M6c + M6d): adopted skills register `use_skill`
         // and the loop expands it step by step through the gate chain.
         // Startup drift re-check (M6d): a skill whose step plan this
@@ -477,10 +514,11 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
         if !adopted_names.is_empty() {
             let now = chrono::Utc::now().to_rfc3339();
             for name in &adopted_names {
-                let Some(spec) = skill_set.get(name) else { continue; };
+                let Some(spec) = skill_set.get(name) else {
+                    continue;
+                };
                 if let Some(reason) =
-                    check_skill_drift(&spec, &registry, flags.trust_ceiling, policy.as_ref())
-                        .await
+                    check_skill_drift(&spec, &registry, flags.trust_ceiling, policy.as_ref()).await
                 {
                     if let Err(e) = append_event(
                         &skills_path,
@@ -511,16 +549,22 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
     // instrument recording every network-tool execution attempt and PII
     // strip, readable via `amparo privacy`. An open failure warns and the
     // run continues without the ledger; a write failure warns once per
-    // task inside the sink itself.
+    // task inside the sink itself. The parent's task id is the sink's
+    // stamp for this task's own rows; a spawned child pushes its own
+    // frame off the event stream (M8 W4), so every row names whose call
+    // it was.
     let ledger: Option<Arc<LedgerSink>> = match LedgerStore::open_with_quota(
         privacy_dir(&workspace_root).join("ledger.jsonl"),
         flags.ledger_max_bytes.map(LedgerQuota::new),
     ) {
-        Ok(store) => Some(Arc::new(LedgerSink::new(store, "cli", None, None))),
+        Ok(store) => Some(Arc::new(LedgerSink::new(
+            store,
+            "cli",
+            Some(parent_task_id.clone()),
+            None,
+        ))),
         Err(e) => {
-            eprintln!(
-                "[ledger] unavailable — the run continues without the privacy ledger: {e}"
-            );
+            eprintln!("[ledger] unavailable — the run continues without the privacy ledger: {e}");
             None
         }
     };
@@ -549,6 +593,10 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
         // snapshots its loop so a crash can be resumed. The store roots
         // at the same workspace as the ledger and notebook.
         .with_checkpoints(Arc::new(JsonCheckpointStore::new(&workspace_root)), "cli")
+        // The host names the task (M8): the checkpoint and the swarm
+        // chain share one id, so children chain off the parent's real
+        // session id.
+        .with_task_id(parent_task_id.clone())
         .with_config(agent_config);
     if let Some(library) = case_library {
         agent = agent.with_case_library(library);
@@ -556,8 +604,27 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
     if let Some(library) = skills {
         agent = agent.with_skills(library);
     }
+    // The swarm (M8): with the budget above zero the parent registers
+    // `spawn_agent` — the tool captures this agent's parts as they now
+    // stand (a registry without itself), and every child runs the same
+    // loop under the same gate chain. The shared budget counter fails
+    // closed at the limit.
+    let spawn_tool = if flags.max_sub_agents > 0 {
+        let budget = Arc::new(Mutex::new(flags.max_sub_agents));
+        let (swarming, tool) =
+            agent.with_spawn_agent(parent_task_id, Arc::clone(&budget), flags.max_sub_agents);
+        agent = swarming;
+        Some(tool)
+    } else {
+        None
+    };
 
-    Ok(WiredRun { agent, notebook })
+    Ok(WiredRun {
+        agent,
+        notebook,
+        spawn_tool,
+        cost_rate,
+    })
 }
 
 /// The shared terminal for a fresh run and a resume: flush the growth
@@ -566,10 +633,27 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
 /// too) — then map the report to stdout/stderr and the exit code.
 async fn finish(
     notebook: Option<Arc<NotebookSink>>,
+    spawn_tool: Option<Arc<SpawnAgentTool>>,
+    cost_rate: Option<f64>,
     report: AgentReport,
 ) -> Result<(), String> {
     if let Some(nb) = &notebook {
         nb.flush().await;
+    }
+    // The observatory (M8 W1 + W4): the cost line with its method
+    // attached, then the swarm breakdown when sub-agents ran — the
+    // parent's own tool calls and tokens included in the total.
+    if let Some(line) = format_cost_line(report.tokens_estimated, cost_rate) {
+        eprintln!("[report] {line}");
+    }
+    if let Some(tool) = &spawn_tool {
+        let reports = tool.reports();
+        if !reports.is_empty() {
+            eprintln!(
+                "[swarm] {}",
+                tool.summary_line(report.tool_calls, report.tokens_estimated, cost_rate)
+            );
+        }
     }
     match report.status {
         TaskStatus::Complete => {
@@ -589,7 +673,9 @@ async fn finish(
             eprintln!("[report] failed — {} step(s)", report.steps_used);
             Err(format!(
                 "task failed: {}",
-                report.final_answer.unwrap_or_else(|| "no final answer".into())
+                report
+                    .final_answer
+                    .unwrap_or_else(|| "no final answer".into())
             ))
         }
     }
@@ -627,13 +713,21 @@ mod tests {
     #[test]
     fn parses_every_flag_with_defaults_for_the_rest() {
         let f = flags(parse(&[
-            "--policy-url", "http://policy.test",
+            "--policy-url",
+            "http://policy.test",
             "--auto-approve",
-            "--trust-ceiling", "observational",
-            "--max-steps", "5",
-            "--model", "qwen2.5:14b",
-            "--timeout", "30",
-            "--workspace", "/tmp/ws",
+            "--trust-ceiling",
+            "observational",
+            "--max-steps",
+            "5",
+            "--max-sub-agents",
+            "7",
+            "--model",
+            "qwen2.5:14b",
+            "--timeout",
+            "30",
+            "--workspace",
+            "/tmp/ws",
             "--growth",
             "task",
         ]));
@@ -643,6 +737,7 @@ mod tests {
         assert!(!f.allow_all);
         assert_eq!(f.trust_ceiling, ToolTrustTier::Observational);
         assert_eq!(f.max_steps, Some(5));
+        assert_eq!(f.max_sub_agents, 7);
         assert_eq!(f.model.as_deref(), Some("qwen2.5:14b"));
         assert_eq!(f.timeout_secs, Some(30));
         assert_eq!(f.workspace.as_deref(), Some("/tmp/ws"));
@@ -662,9 +757,18 @@ mod tests {
             error(parse(&["--nonsense", "task"])),
             "unknown flag --nonsense; see `amparo run --help`"
         );
-        assert_eq!(error(parse(&["--policy-url"])), "--policy-url requires a URL");
-        assert_eq!(error(parse(&["--trust-ceiling"])), "--trust-ceiling requires a tier");
-        assert_eq!(error(parse(&["--trust-ceiling", "nonsense", "task"])), "unknown trust tier nonsense");
+        assert_eq!(
+            error(parse(&["--policy-url"])),
+            "--policy-url requires a URL"
+        );
+        assert_eq!(
+            error(parse(&["--trust-ceiling"])),
+            "--trust-ceiling requires a tier"
+        );
+        assert_eq!(
+            error(parse(&["--trust-ceiling", "nonsense", "task"])),
+            "unknown trust tier nonsense"
+        );
         assert_eq!(
             error(parse(&["--max-steps", "zero", "task"])),
             "--max-steps must be a positive integer, got 'zero'"
@@ -682,7 +786,12 @@ mod tests {
     #[test]
     fn rejects_conflicting_modes_and_a_missing_task() {
         assert_eq!(
-            error(parse(&["--policy-url", "http://p.test", "--allow-all", "task"])),
+            error(parse(&[
+                "--policy-url",
+                "http://p.test",
+                "--allow-all",
+                "task"
+            ])),
             "--policy-url and --allow-all are mutually exclusive"
         );
         assert_eq!(
@@ -747,7 +856,17 @@ mod tests {
 
     #[test]
     fn ledger_max_bytes_rejects_garbage() {
-        for raw in ["", "K", "0", "4KB", "4.5K", "12 K", "-1", "18446744073709551615G", "M3"] {
+        for raw in [
+            "",
+            "K",
+            "0",
+            "4KB",
+            "4.5K",
+            "12 K",
+            "-1",
+            "18446744073709551615G",
+            "M3",
+        ] {
             assert!(parse_bytes(raw).is_err(), "'{raw}' must be rejected");
         }
     }
@@ -759,5 +878,30 @@ mod tests {
         assert_eq!(f.ledger_max_bytes, Some(65_536));
         assert!(error(parse(&["--ledger-max-bytes", "banana", "task"])).contains("64K"));
         assert!(error(parse(&["--ledger-max-bytes"])).contains("requires a size"));
+    }
+
+    #[test]
+    fn max_sub_agents_defaults_to_four_with_zero_disabling_swarms() {
+        assert_eq!(flags(parse(&["task"])).max_sub_agents, 4);
+        assert_eq!(
+            flags(parse(&["--max-sub-agents", "2", "task"])).max_sub_agents,
+            2
+        );
+        assert_eq!(
+            flags(parse(&["--max-sub-agents", "0", "task"])).max_sub_agents,
+            0
+        );
+        assert_eq!(
+            error(parse(&["--max-sub-agents", "-1", "task"])),
+            "--max-sub-agents must be a non-negative integer, got '-1'"
+        );
+        assert_eq!(
+            error(parse(&["--max-sub-agents", "many", "task"])),
+            "--max-sub-agents must be a non-negative integer, got 'many'"
+        );
+        assert_eq!(
+            error(parse(&["--max-sub-agents"])),
+            "--max-sub-agents requires a number"
+        );
     }
 }
