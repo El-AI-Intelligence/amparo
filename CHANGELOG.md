@@ -8,6 +8,77 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-29
+
+M7's two deliberate exclusions, landed: the WASM eval sandbox and the
+ledger quota lever (see `docs/m7b-sandbox-quota.md`).
+
+### Added
+
+- **`amparo-sandbox`** (new crate): `SandboxRuntime` — fuel-metered,
+  deterministic WASM execution (10M fuel, 4 MB module, 4 MB memory,
+  30 s wall clock, 4 concurrent; all `with_*` builders), with
+  `SandboxError` (invalid wasm, base64, execution, fuel, memory,
+  module-too-large, compile, timeout, import-rejection) and
+  `SandboxResult` (output, elapsed, fuel consumed, memory used).
+  **No imports and no WASI**: a module with any import is rejected at
+  compile time, so there is no host surface to escape through. The
+  ABI: the module exports `memory` and `axiom_eval(i32 input_ptr, i32
+  input_len, i32 output_ptr, i32 output_cap) -> i32`; the input JSON
+  is written at offset 0 (input region `0 .. OUTPUT_BASE`, 256 KB) and
+  the module writes its JSON output at `output_ptr` (output region
+  `OUTPUT_BASE .. OUTPUT_BASE + OUTPUT_CAP`, 256 KB — the two regions
+  never overlap), returning bytes written (≥ 0) or −1. New deps:
+  `wasmtime` 16 (cranelift only, scoped to this crate), `base64`;
+  `wat` dev-only.
+- **`eval_wasm` — the tool** (`EvalWasmTool`): `wasm_base64` (required;
+  modules arrive base64-encoded — LLMs cannot emit raw bytes) and
+  `input` (optional, default `{}`). Trust tier `ExternalEffector`, so
+  executing untrusted code always asks a human even though the sandbox
+  keeps the reach small. Every failure path returns a failed
+  `ToolResult` with an explanatory message, never a panic. Hosts
+  register the tool themselves (the `use_skill` precedent): `amparo
+  run`, the chat driver's per-task registry, `amparo chat dispatch`,
+  and MCP serve (auto-deny there until an operator allows). The
+  default registry stays wasmtime-free — pinned at its 17 tools by a
+  test.
+- **Preflight honesty for the sandbox**: a static override in
+  `classify` labels `eval_wasm` `read_only` despite its
+  ExternalEffector tier — a pure, bounded computation that observes
+  and modifies nothing outside its own sandbox. Display-only (I1):
+  the tier, the gate and the approval all stay exactly as they were.
+- **`eval_wasm` writes no ledger row** — it never leaves the machine;
+  the `LedgerSink`'s "what left the machine" contract is pinned by a
+  test.
+- **The ledger quota lever** in `amparo-privacy`: `LedgerQuota` and
+  `LedgerStore::open_with_quota` (the existing `open` = unbounded,
+  unchanged). After write + flush, an over-quota file rotates: the
+  oldest rows drop until the file is ~`max_bytes / 2` (one rotation
+  per burst, not per append), the rewrite is atomic (tmp + rename),
+  and a **rotation marker row** — `LedgerKind::Rotated` with
+  `dropped_rows` — is appended as the newest row, so it survives the
+  rotation it describes: the reviewer sees exactly what was lost and
+  why (I3). The newest data row is always kept. `LedgerSummary` gains
+  `rotations` and `rows_dropped`.
+- **The quota sidecar**: the enforced bound lives in
+  `<privacy>/quota` beside the ledger — a bounded open writes it, an
+  unbounded open removes it, so the reviewer surface never reports a
+  bound that is not currently enforced. New free functions
+  `recorded_quota` and `read_ledger`: `amparo privacy` reads through
+  them and never opens a store, so reading never creates, rewrites or
+  rotates the ledger.
+- **`--ledger-max-bytes N` on `amparo run`** — plain bytes or
+  `K`/`M`/`G` suffixes (1024-based); zero, garbage or overflow → usage
+  error, exit 2. `amparo privacy` reports the bound:
+  `ledger: <bytes> bytes (quota <N> | unbounded)` and, when rotations
+  exist, `rotations: <n> (rows dropped <m>)`; the tail renders marker
+  rows as `rotated  dropped <m> rows`.
+- **Per-tenant chat quotas**: `UserProfile.ledger_max_bytes:
+  Option<u64>` in the TOML chat config (zero rejected at load — `None`
+  is how a profile says "unbounded"). The driver opens each tenant's
+  ledger with the quota; tenants rotate independently, and allowlist
+  mode stays unbounded.
+
 ## [0.5.0] — 2026-08-29
 
 Instrumentation & hardening (M7): the always-on privacy ledger, session

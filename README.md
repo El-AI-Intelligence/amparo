@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M7 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed
+## Status: pre-alpha, M7b landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -67,6 +67,11 @@ approval copy.
 - **`amparo-tools`** (M2c) — the registry and the portable tool set (web,
   filesystem, shell, git, tests, build, memory), each with a trust tier that
   drives the approval gate.
+- **`amparo-sandbox`** (M7b) — the WASM eval sandbox: a fuel-metered,
+  deterministic `SandboxRuntime` (10M fuel, 4 MB module, 4 MB memory,
+  30 s wall clock, no imports, no WASI) and the `eval_wasm` tool that
+  runs a base64 module against it. Hosts register the tool themselves
+  (the `use_skill` precedent) — the default registry stays wasmtime-free.
 - **`amparo-memory`** (M2a) — the memory interface with a built-in default
   store. Engram is the recommended backend; it is never a dependency.
 - **`amparo-privacy`** (M2a, M7) — privacy policy evaluation, blocked/allowed
@@ -81,12 +86,14 @@ approval copy.
   `ChatApprovalGate` (inline Approve/Deny buttons, 60 s auto-deny), and
   hand-rolled transports for **Telegram** (long polling), **Discord**
   (gateway websocket) and **Slack** (Socket Mode).
-- **`amparo-cli`** (M3, M4, M7) — the one binary: `amparo run "task"` drives
-  the loop end-to-end (fail-closed BYO-LLM env, interactive terminal
+- **`amparo-cli`** (M3, M4, M7, M7b) — the one binary: `amparo run "task"`
+  drives the loop end-to-end (fail-closed BYO-LLM env, interactive terminal
   approval with a `[preflight] blast radius` line, `--auto-approve`/
-  `--auto-deny` overrides), `amparo run --resume` resumes the newest
+  `--auto-deny` overrides, `--ledger-max-bytes` bounds the privacy
+  ledger), `amparo run --resume` resumes the newest
   incomplete checkpoint for tenant `cli`, `amparo privacy` reads the
-  ledger (summary + tail), `amparo mcp-serve`
+  ledger (summary + tail, incl. quota and rotation counts),
+  `amparo mcp-serve`
   reuses the same implementation as the standalone `amparo-mcp-serve`
   binary (same help, errors, exit codes), `amparo chat
   telegram|discord|slack` serves the agent over a messaging platform,
@@ -293,6 +300,38 @@ renders as a `[preflight] blast radius: …` line in CLI approvals and
 the same line in chat approval messages: the human approves a concrete
 consequence, not an abstraction.
 
+## WASM sandbox + ledger quota
+
+M7b adds the two features M7 deliberately excluded (see
+`docs/m7b-sandbox-quota.md`).
+
+**The `eval_wasm` tool** executes an untrusted WebAssembly module the
+model produced, inside a fuel-metered sandbox (10M fuel, 4 MB module,
+4 MB memory, 30 s wall clock; no imports, no WASI — a module that
+passes validation can compute, and nothing else). The module arrives
+base64-encoded and obeys a fixed ABI: export `memory` and
+`axiom_eval(i32, i32, i32, i32) -> i32`, read the input at offset 0,
+write JSON output to the given `output_ptr`, return bytes written or
+−1. Trust tier is `ExternalEffector`, so executing untrusted code
+always asks a human — and the preflight label is honestly
+`read_only` (a pure, bounded computation; the sandbox observes and
+modifies nothing outside itself). `eval_wasm` never leaves the
+machine, so it writes no privacy-ledger row. Hosts register the tool
+themselves: `amparo run`, `amparo chat`, `amparo chat dispatch`, and
+MCP serve (auto-deny there until allowed).
+
+**The ledger quota lever** bounds the always-on privacy ledger when the
+operator asks for it: `--ledger-max-bytes N` on `amparo run` (plain
+bytes or `K`/`M`/`G` suffixes; garbage → exit 2), or
+`ledger_max_bytes` on a chat-config profile (per-tenant). When an
+append would push the file past the quota, the oldest rows rotate off
+and a marker row — newest in the file — records exactly how many rows
+were dropped: the loss of audit completeness is itself an audited
+event, and it only happens because the operator set the quota. The
+default stays unbounded, so the M7 audit guarantee is unchanged for
+anyone who didn't opt in. `amparo privacy` reports the bound, the file
+size, rotations and dropped rows.
+
 ## What Amparo is meant to be
 
 An agent that runs a real tool-use loop — shell, files, git, web, tests — where
@@ -332,6 +371,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 5 | Multi-tenant identity and per-user policy | ✅ done — TOML tenant directory, per-user ceilings/workspaces, attributed approvals |
 | 6 | Controlled self-improvement | ✅ done — M6a + M6b + M6c + M6d + M6e landed: the lab notebook (`--growth`, PII-stripped run records), the verification case library (same-tenant evidence in the verification prompt only), gated skills (adopted procedures executed step-by-step through the gate chain), metrics + retirement (running per-skill records, startup drift re-checks, `amparo skill check|retire`), and rollup + archival (the hot layer over the cold archive, `amparo notebook list|promote|rollup`) |
 | 7 | Instrumentation & hardening | ✅ landed — the always-on privacy ledger (every network-touching execution attempt and human denial, every PII strip as counts; `amparo privacy`), session persistence (`amparo run --resume` for crashed runs, per-tenant chat continuity from completed tasks), and preflight blast-radius classification (display-only labels in the approval copy) |
+| 8 | WASM eval sandbox + ledger quota | ✅ landed — the `eval_wasm` tool (fuel-metered, deterministic, approval-gated sandbox for untrusted computation; honestly labeled `read_only` in preflight) and the opt-in ledger quota lever (`--ledger-max-bytes`, per-tenant chat quotas; rotation marker rows record exactly what was dropped) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant
