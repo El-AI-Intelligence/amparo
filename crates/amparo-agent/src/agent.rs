@@ -36,7 +36,7 @@ use amparo_tools::{
     PathPolicy, SkillLibrary, ToolCall, ToolRegistry, ToolResult, ToolTrustTier, USE_SKILL,
 };
 use futures_util::future::join_all;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Keep the system prompt plus the last 30 messages.
@@ -50,7 +50,7 @@ const HARD_SAME_TOOL_LIMIT: u32 = 3;
 const DEFAULT_MAX_STEPS: usize = 12;
 
 /// How a task ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// The task finished with a final answer.
@@ -165,7 +165,11 @@ enum GateOutcome {
     /// A gate blocked the call; the caller records the failed `result`
     /// (for model calls, via [`Agent::block_call`] — for skill steps, into
     /// the expansion record).
-    Blocked { result: ToolResult, decision: String, reasons: Vec<String> },
+    Blocked {
+        result: ToolResult,
+        decision: String,
+        reasons: Vec<String>,
+    },
 }
 
 /// The dry-run core of [`Agent::gate_call`], shared with [`dry_run_gate`]:
@@ -183,10 +187,18 @@ enum GateOutcomeCore {
     /// A gate blocked the call; `result` is the fully built failed
     /// [`ToolResult`] the caller records (the error strings live here —
     /// callers must not reconstruct them).
-    Blocked { result: ToolResult, decision: String, reasons: Vec<String> },
+    Blocked {
+        result: ToolResult,
+        decision: String,
+        reasons: Vec<String>,
+    },
     /// The call may execute once the approval gate (tool tier ≥
     /// [`ToolTrustTier::ExternalEffector`] or a policy Escalate) has run.
-    Ready { reasons: Vec<String>, escalate_pending: bool, tier: ToolTrustTier },
+    Ready {
+        reasons: Vec<String>,
+        escalate_pending: bool,
+        tier: ToolTrustTier,
+    },
 }
 
 /// The shared gate core: registry lookup → trust ceiling → policy engine.
@@ -263,8 +275,10 @@ async fn gate_check(
     } else {
         extract_target(call)
     };
-    let param_refs: Vec<(&str, &str)> =
-        params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let param_refs: Vec<(&str, &str)> = params
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let decision = policy.judge_tool(&call.name, &target, &param_refs).await;
     let mut escalate_pending = false;
     let reasons: Vec<String> = match decision.verdict {
@@ -309,7 +323,11 @@ async fn gate_check(
         .unwrap_or(ToolTrustTier::Observational);
     GateCheck {
         target,
-        outcome: GateOutcomeCore::Ready { reasons, escalate_pending, tier },
+        outcome: GateOutcomeCore::Ready {
+            reasons,
+            escalate_pending,
+            tier,
+        },
     }
 }
 
@@ -347,14 +365,20 @@ pub async fn dry_run_gate(
 ) -> DryRunVerdict {
     let check = gate_check(registry, ceiling, policy, call).await;
     match check.outcome {
-        GateOutcomeCore::Blocked { decision, reasons, .. } => DryRunVerdict {
+        GateOutcomeCore::Blocked {
+            decision, reasons, ..
+        } => DryRunVerdict {
             decision,
             reasons,
             would_block: true,
             approval_required: false,
             target: check.target,
         },
-        GateOutcomeCore::Ready { reasons, escalate_pending, tier } => DryRunVerdict {
+        GateOutcomeCore::Ready {
+            reasons,
+            escalate_pending,
+            tier,
+        } => DryRunVerdict {
             decision: "allowed".to_string(),
             reasons,
             would_block: false,
@@ -467,6 +491,41 @@ impl LoopVars {
             tool_calls: 0,
         }
     }
+}
+
+/// Everything a spawned sub-agent inherits from its parent (M8 W3): the
+/// same inference provider, registry, gate chain, event sink and optional
+/// instruments. A child runs the same loop under the same gates — the one
+/// rule. `skills` and `cases` are deliberately NOT carried: a child
+/// inherits no adopted skills and no case evidence (a `use_skill` call in
+/// the child hits the registry's defensive executor, which fails loudly).
+#[derive(Clone)]
+pub(crate) struct SwarmParts {
+    /// The shared model — child turns interleave on the same provider.
+    pub inference: Arc<dyn InferenceProvider>,
+    /// The parent's tool set; the child's registry is this clone with
+    /// `spawn_agent` re-registered for the child's own chain id.
+    pub registry: ToolRegistry,
+    /// The deny-by-default engine — the child's calls are judged by it.
+    pub policy: Arc<dyn PolicyEngine>,
+    /// The human-approval gate — the child asks the same human.
+    pub approval: Arc<dyn ApprovalGate>,
+    /// The shared event sink — child events interleave into the one stream.
+    pub events: Arc<dyn EventSink>,
+    /// The privacy policy, when the parent had one: the child's prompt is
+    /// stripped before inference exactly like the parent's (I6 — the child
+    /// persists its own prompt in checkpoints).
+    pub privacy: Option<Arc<amparo_privacy::PrivacyPolicy>>,
+    /// The workspace path policy, when the parent had one: the child's
+    /// preflight labels work identically (display-only, I1).
+    pub path_policy: Option<Arc<PathPolicy>>,
+    /// The checkpoint store and tenant, when the parent attached them:
+    /// the child checkpoints into the same store under the same tenant.
+    pub checkpoints: Option<Arc<dyn CheckpointStore>>,
+    /// The tenant paired with `checkpoints` — `None` only when the store is.
+    pub checkpoint_tenant: Option<String>,
+    /// The loop configuration the child inherits (rate knob included).
+    pub config: AgentConfig,
 }
 
 impl Agent {
@@ -605,6 +664,27 @@ impl Agent {
         &self.config
     }
 
+    /// The inheritance a spawned sub-agent receives (M8 W3): the same
+    /// provider, gate chain, sink and optional instruments, with the
+    /// child's registry rooted at `registry` (the host passes the parent's
+    /// tool set *without* `spawn_agent` registered — the spawn tool itself
+    /// re-registers it for each child, and the base must stay spawn-free so
+    /// the tool never holds an `Arc` back to itself).
+    pub(crate) fn swarm_parts(&self, registry: ToolRegistry) -> SwarmParts {
+        SwarmParts {
+            inference: Arc::clone(&self.inference),
+            registry,
+            policy: Arc::clone(&self.policy),
+            approval: Arc::clone(&self.approval),
+            events: Arc::clone(&self.events),
+            privacy: self.privacy.clone(),
+            path_policy: self.path_policy.clone(),
+            checkpoints: self.checkpoints.clone(),
+            checkpoint_tenant: self.checkpoint_tenant.clone(),
+            config: self.config.clone(),
+        }
+    }
+
     /// Registry schemas as wire-ready OpenAI tool definitions.
     fn openai_tools(&self) -> Vec<Tool> {
         self.registry
@@ -623,12 +703,16 @@ impl Agent {
         }
         let mut categories: Vec<(String, usize)> = Vec::new();
         for placeholder in pii_map {
-            match categories.iter_mut().find(|(category, _)| category == &placeholder.category) {
+            match categories
+                .iter_mut()
+                .find(|(category, _)| category == &placeholder.category)
+            {
                 Some((_, count)) => *count += 1,
                 None => categories.push((placeholder.category.clone(), 1)),
             }
         }
-        self.events.emit(&AgentEvent::PrivacyStripped { categories });
+        self.events
+            .emit(&AgentEvent::PrivacyStripped { categories });
     }
 
     /// Run the loop to completion: every gate decision, tool execution and
@@ -636,7 +720,13 @@ impl Agent {
     /// the [`EventSink`].
     pub async fn run(&self, prompt: impl Into<String>) -> AgentReport {
         let prompt = prompt.into();
-        self.events.emit(&AgentEvent::TaskStarted { prompt: prompt.clone() });
+        self.events.emit(&AgentEvent::TaskStarted {
+            prompt: prompt.clone(),
+            // The host-fixed id, when one exists (M8) — a sub-agent's
+            // chain id names the `[task]` line. `None` for an unhosted
+            // run keeps the v0.6.0 plain tag.
+            task_id: self.task_id.clone(),
+        });
 
         // The prompt appears in nudge and verification messages sent to the
         // model — strip it once so the original never leaks there.
@@ -665,15 +755,23 @@ impl Agent {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         let session = SessionHandle {
-            task_id: self.task_id.clone().unwrap_or_else(|| {
-                format!("sess-{}-{}", now.as_nanos(), std::process::id())
-            }),
+            task_id: self
+                .task_id
+                .clone()
+                .unwrap_or_else(|| format!("sess-{}-{}", now.as_nanos(), std::process::id())),
             parent_task_id: self.parent_task_id.clone(),
             tenant: self.checkpoint_tenant.clone(),
             started_at: now.as_secs(),
         };
-        self.run_loop(prompt, safe_prompt, conversation, LoopVars::fresh(), session, 0)
-            .await
+        self.run_loop(
+            prompt,
+            safe_prompt,
+            conversation,
+            LoopVars::fresh(),
+            session,
+            0,
+        )
+        .await
     }
 
     /// Resume a checkpointed task (M7): restore the conversation and loop
@@ -798,13 +896,15 @@ impl Agent {
 
             // ── Privacy check ───────────────────────────────────────────────
             if let Some(policy) = &self.privacy {
-                let decision =
-                    amparo_privacy::evaluate(policy, None, DataCategory::Chat, None);
+                let decision = amparo_privacy::evaluate(policy, None, DataCategory::Chat, None);
                 if !decision.allowed {
-                    let message =
-                        format!("Privacy policy blocked inference: {}", decision.reason);
-                    steps.push(AgentStep::Error { message: message.clone() });
-                    self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+                    let message = format!("Privacy policy blocked inference: {}", decision.reason);
+                    steps.push(AgentStep::Error {
+                        message: message.clone(),
+                    });
+                    self.events.emit(&AgentEvent::TaskFailed {
+                        message: message.clone(),
+                    });
                     self.persist_checkpoint(
                         &session,
                         SessionStatus::Failed,
@@ -868,8 +968,12 @@ impl Agent {
                     Ok(turn) => turn,
                     Err(e) => {
                         let message = format!("Inference stream failed: {}", e);
-                        steps.push(AgentStep::Error { message: message.clone() });
-                        self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+                        steps.push(AgentStep::Error {
+                            message: message.clone(),
+                        });
+                        self.events.emit(&AgentEvent::TaskFailed {
+                            message: message.clone(),
+                        });
                         self.persist_checkpoint(
                             &session,
                             SessionStatus::Failed,
@@ -898,8 +1002,12 @@ impl Agent {
                 },
                 Err(e) => {
                     let message = format!("Inference request failed: {}", e);
-                    steps.push(AgentStep::Error { message: message.clone() });
-                    self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+                    steps.push(AgentStep::Error {
+                        message: message.clone(),
+                    });
+                    self.events.emit(&AgentEvent::TaskFailed {
+                        message: message.clone(),
+                    });
                     self.persist_checkpoint(
                         &session,
                         SessionStatus::Failed,
@@ -958,9 +1066,16 @@ impl Agent {
                         "Task completed. Based on the actions performed: {}",
                         summary
                     );
-                    steps.push(AgentStep::FinalAnswer { content: content.clone() });
-                    self.events.emit(&AgentEvent::FinalAnswer { content: content.clone() });
-                    self.events.emit(&AgentEvent::TaskComplete { final_answer: content.clone() });
+                    steps.push(AgentStep::FinalAnswer {
+                        content: content.clone(),
+                    });
+                    self.events.emit(&AgentEvent::FinalAnswer {
+                        content: content.clone(),
+                    });
+                    self.events.emit(&AgentEvent::TaskComplete {
+                        final_answer: content.clone(),
+                        task_id: self.task_id.clone(),
+                    });
                     self.persist_checkpoint(
                         &session,
                         SessionStatus::Complete,
@@ -992,8 +1107,12 @@ impl Agent {
                 let message = "The model produced no output after a retry, and no prior tool \
                                results were available to finalize from"
                     .to_string();
-                steps.push(AgentStep::Error { message: message.clone() });
-                self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+                steps.push(AgentStep::Error {
+                    message: message.clone(),
+                });
+                self.events.emit(&AgentEvent::TaskFailed {
+                    message: message.clone(),
+                });
                 self.persist_checkpoint(
                     &session,
                     SessionStatus::Failed,
@@ -1066,7 +1185,8 @@ impl Agent {
 
                 for call in &calls {
                     steps.push(AgentStep::ToolCall(call.clone()));
-                    self.events.emit(&AgentEvent::ToolCallRequested { call: call.clone() });
+                    self.events
+                        .emit(&AgentEvent::ToolCallRequested { call: call.clone() });
                     if !used_tool_names.contains(&call.name) {
                         used_tool_names.push(call.name.clone());
                     }
@@ -1083,7 +1203,11 @@ impl Agent {
 
                 for call in &calls {
                     match self.gate_call(call, session_label.as_deref()).await {
-                        GateOutcome::Blocked { result, decision, reasons } => {
+                        GateOutcome::Blocked {
+                            result,
+                            decision,
+                            reasons,
+                        } => {
                             self.block_call(
                                 &result,
                                 &decision,
@@ -1171,11 +1295,20 @@ impl Agent {
                         .join(". ");
                     for result in exec_results {
                         steps.push(AgentStep::ToolResult(result.clone()));
-                        self.events.emit(&AgentEvent::ToolExecuted { result: result.clone() });
+                        self.events.emit(&AgentEvent::ToolExecuted {
+                            result: result.clone(),
+                        });
                     }
-                    steps.push(AgentStep::FinalAnswer { content: summary.clone() });
-                    self.events.emit(&AgentEvent::FinalAnswer { content: summary.clone() });
-                    self.events.emit(&AgentEvent::TaskComplete { final_answer: summary.clone() });
+                    steps.push(AgentStep::FinalAnswer {
+                        content: summary.clone(),
+                    });
+                    self.events.emit(&AgentEvent::FinalAnswer {
+                        content: summary.clone(),
+                    });
+                    self.events.emit(&AgentEvent::TaskComplete {
+                        final_answer: summary.clone(),
+                        task_id: self.task_id.clone(),
+                    });
                     self.persist_checkpoint(
                         &session,
                         SessionStatus::Complete,
@@ -1209,7 +1342,9 @@ impl Agent {
                 for result in &exec_results {
                     let result_step = AgentStep::ToolResult(result.clone());
                     steps.push(result_step);
-                    self.events.emit(&AgentEvent::ToolExecuted { result: result.clone() });
+                    self.events.emit(&AgentEvent::ToolExecuted {
+                        result: result.clone(),
+                    });
                     tool_messages.push(ChatMessage::tool(
                         result.tool_call_id.clone(),
                         serde_json::to_string(&result.output).unwrap_or_default(),
@@ -1285,8 +1420,12 @@ impl Agent {
 
             // ── Final answer + self-verification ────────────────────────────
             final_answer = Some(assistant_content.clone());
-            steps.push(AgentStep::FinalAnswer { content: assistant_content.clone() });
-            self.events.emit(&AgentEvent::FinalAnswer { content: assistant_content.clone() });
+            steps.push(AgentStep::FinalAnswer {
+                content: assistant_content.clone(),
+            });
+            self.events.emit(&AgentEvent::FinalAnswer {
+                content: assistant_content.clone(),
+            });
 
             // One extra turn at near-zero cost: ask the model whether its
             // answer fully addresses the original request. INCOMPLETE
@@ -1309,9 +1448,7 @@ impl Agent {
             // appended to the verification prompt only. An empty result
             // leaves the prompt byte-identical to the no-library build.
             if let Some(library) = &self.cases {
-                let cases = library
-                    .retrieve(&safe_prompt, &used_tool_names, 3)
-                    .await;
+                let cases = library.retrieve(&safe_prompt, &used_tool_names, 3).await;
                 if let Some(section) = evidence_section(&cases) {
                     verify_prompt.push('\n');
                     verify_prompt.push('\n');
@@ -1330,8 +1467,7 @@ impl Agent {
 
             // The verification completion is billed like any call — count
             // the prompt up front, the reply when it arrives.
-            tokens_estimated =
-                tokens_estimated.saturating_add(estimate_tokens(&verify_prompt));
+            tokens_estimated = tokens_estimated.saturating_add(estimate_tokens(&verify_prompt));
 
             let verify_text = match self
                 .inference
@@ -1395,7 +1531,10 @@ impl Agent {
             // VERIFIED — the task is complete.
             conversation.push(ChatMessage::assistant("VERIFIED"));
             let content = final_answer.take().unwrap_or_default();
-            self.events.emit(&AgentEvent::TaskComplete { final_answer: content.clone() });
+            self.events.emit(&AgentEvent::TaskComplete {
+                final_answer: content.clone(),
+                task_id: self.task_id.clone(),
+            });
             self.persist_checkpoint(
                 &session,
                 SessionStatus::Complete,
@@ -1424,8 +1563,12 @@ impl Agent {
 
         // Exhausted max steps — fail honestly.
         let message = "Max steps reached".to_string();
-        steps.push(AgentStep::Error { message: message.clone() });
-        self.events.emit(&AgentEvent::TaskFailed { message: message.clone() });
+        steps.push(AgentStep::Error {
+            message: message.clone(),
+        });
+        self.events.emit(&AgentEvent::TaskFailed {
+            message: message.clone(),
+        });
         self.persist_checkpoint(
             &session,
             SessionStatus::Failed,
@@ -1483,8 +1626,7 @@ impl Agent {
                 .filter(|message| message.role != "system")
                 .map(|message| ChatMessage {
                     role: message.role.clone(),
-                    content: amparo_privacy::secure_minions_strip(&message.content)
-                        .sanitised_text,
+                    content: amparo_privacy::secure_minions_strip(&message.content).sanitised_text,
                     // Tool-call arguments are user data too (I6) — strip
                     // them like any other persisted field.
                     tool_calls: message.tool_calls.as_ref().map(|calls| {
@@ -1581,12 +1723,22 @@ impl Agent {
         )
         .await;
         let (reasons, escalate_pending, tier) = match check.outcome {
-            GateOutcomeCore::Blocked { result, decision, reasons } => {
-                return GateOutcome::Blocked { result, decision, reasons };
+            GateOutcomeCore::Blocked {
+                result,
+                decision,
+                reasons,
+            } => {
+                return GateOutcome::Blocked {
+                    result,
+                    decision,
+                    reasons,
+                };
             }
-            GateOutcomeCore::Ready { reasons, escalate_pending, tier } => {
-                (reasons, escalate_pending, tier)
-            }
+            GateOutcomeCore::Ready {
+                reasons,
+                escalate_pending,
+                tier,
+            } => (reasons, escalate_pending, tier),
         };
 
         // Preflight (M7): classify the call's blast radius for the
@@ -1738,9 +1890,15 @@ impl Agent {
             if !step_tools.contains(&step_call.name) {
                 step_tools.push(step_call.name.clone());
             }
-            self.events.emit(&AgentEvent::ToolCallRequested { call: step_call.clone() });
+            self.events.emit(&AgentEvent::ToolCallRequested {
+                call: step_call.clone(),
+            });
             match self.gate_call(&step_call, session_label).await {
-                GateOutcome::Blocked { result, decision, reasons } => {
+                GateOutcome::Blocked {
+                    result,
+                    decision,
+                    reasons,
+                } => {
                     self.events.emit(&AgentEvent::ToolGate {
                         call_id: step_call.id.clone(),
                         tool_name: step_call.name.clone(),
@@ -1855,7 +2013,10 @@ pub fn extract_target(call: &ToolCall) -> (String, Vec<(String, String)>) {
                 .unwrap_or_default();
             (target, params)
         }
-        None => (serde_json::to_string(&call.arguments).unwrap_or_default(), Vec::new()),
+        None => (
+            serde_json::to_string(&call.arguments).unwrap_or_default(),
+            Vec::new(),
+        ),
     }
 }
 
@@ -1938,201 +2099,20 @@ fn interpret_verification(verify_text: &str) -> VerificationDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::{ApprovalGate, AutoApprove};
+    use crate::approval::AutoApprove;
     use amparo_inference::InferenceError;
     use amparo_policy::PolicyDecision;
-    use amparo_tools::{
-        SkillLibrary, SkillOrigin, SkillSpec, SkillStep, ToolExecutor, ToolParam, ToolSchema,
-        UseSkillTool,
-    };
+    use amparo_tools::{SkillLibrary, SkillOrigin, SkillSpec, SkillStep, UseSkillTool};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ── Test doubles ─────────────────────────────────────────────────────────
 
-    /// Scripted provider: pops one SSE script per chat turn (a Vec of frames),
-    /// then a final-answer script when exhausted. `complete()` (used by
-    /// self-verification) pops from a separate queue. Every chat request and
-    /// every completion request is recorded for assertions.
-    struct ScriptedProvider {
-        chat_scripts: std::sync::Mutex<std::collections::VecDeque<Vec<String>>>,
-        complete_scripts: std::sync::Mutex<std::collections::VecDeque<String>>,
-        chat_requests: std::sync::Mutex<Vec<ChatRequest>>,
-        complete_requests: std::sync::Mutex<Vec<InferenceRequest>>,
-    }
-
-    impl ScriptedProvider {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                chat_scripts: std::sync::Mutex::new(Default::default()),
-                complete_scripts: std::sync::Mutex::new(Default::default()),
-                chat_requests: std::sync::Mutex::new(Vec::new()),
-                complete_requests: std::sync::Mutex::new(Vec::new()),
-            })
-        }
-
-        fn push_chat(&self, script: Vec<String>) {
-            self.chat_scripts.lock().unwrap().push_back(script);
-        }
-
-        fn push_verify(&self, reply: &str) {
-            self.complete_scripts.lock().unwrap().push_back(reply.to_string());
-        }
-
-        fn recorded_requests(&self) -> Vec<ChatRequest> {
-            self.chat_requests.lock().unwrap().clone()
-        }
-
-        fn recorded_complete_requests(&self) -> Vec<InferenceRequest> {
-            self.complete_requests.lock().unwrap().clone()
-        }
-    }
-
-    fn content_delta(text: &str) -> String {
-        serde_json::json!({"choices": [{"delta": {"content": text}}]}).to_string()
-    }
-
-    fn tool_call_frame(id: &str, name: &str, arguments: &str) -> String {
-        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
-            "index": 0, "id": id, "type": "function",
-            "function": {"name": name, "arguments": arguments}
-        }]}}]})
-        .to_string()
-    }
-
-    fn done() -> String {
-        "[DONE]".to_string()
-    }
-
-    /// One full turn: a single tool call, then [DONE].
-    fn turn_tool_call(id: &str, name: &str, arguments: &str) -> Vec<String> {
-        vec![tool_call_frame(id, name, arguments), done()]
-    }
-
-    /// One full turn: plain text, then [DONE].
-    fn turn_text(text: &str) -> Vec<String> {
-        vec![content_delta(text), done()]
-    }
-
-    fn sse_stream(frames: &[String]) -> amparo_inference::InferenceStream {
-        use futures_util::stream;
-        let events: Vec<std::result::Result<bytes::Bytes, InferenceError>> = frames
-            .iter()
-            .map(|f| Ok(bytes::Bytes::from(format!("data: {}\n\n", f))))
-            .collect();
-        Box::pin(stream::iter(events))
-    }
-
-    #[async_trait]
-    impl InferenceProvider for ScriptedProvider {
-        async fn complete(
-            &self,
-            request: InferenceRequest,
-        ) -> Result<amparo_inference::InferenceResponse, InferenceError> {
-            self.complete_requests.lock().unwrap().push(request);
-            let reply = self
-                .complete_scripts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| "VERIFIED".to_string());
-            Ok(amparo_inference::InferenceResponse {
-                text: reply,
-                tokens: 1,
-                finish_reason: "stop".into(),
-            })
-        }
-
-        async fn complete_chat_stream(
-            &self,
-            request: ChatRequest,
-        ) -> Result<amparo_inference::InferenceStream, InferenceError> {
-            self.chat_requests.lock().unwrap().push(request);
-            let script = self
-                .chat_scripts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| turn_text("Done."));
-            Ok(sse_stream(&script))
-        }
-
-        async fn embed(&self, _text: &str) -> Result<Vec<f64>, InferenceError> {
-            Ok(vec![])
-        }
-
-        async fn list_models(&self) -> Result<Vec<String>, InferenceError> {
-            Ok(vec![])
-        }
-
-        fn default_model(&self) -> String {
-            "test-model".into()
-        }
-    }
-
-    /// A stub tool that counts its executions and echoes `message`.
-    struct EchoTool {
-        calls: Arc<AtomicUsize>,
-        tier: ToolTrustTier,
-    }
-
-    impl EchoTool {
-        fn new(tier: ToolTrustTier) -> (Self, Arc<AtomicUsize>) {
-            let calls = Arc::new(AtomicUsize::new(0));
-            (Self { calls: calls.clone(), tier }, calls)
-        }
-    }
-
-    #[async_trait]
-    impl ToolExecutor for EchoTool {
-        fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                name: "echo".to_string(),
-                description: "echo the message".to_string(),
-                parameters: vec![ToolParam {
-                    name: "message".to_string(),
-                    description: "text to echo".to_string(),
-                    param_type: "string".to_string(),
-                    enum_values: None,
-                    required: true,
-                }],
-                trust_tier: self.tier,
-            }
-        }
-
-        async fn execute(&self, call: &ToolCall) -> ToolResult {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            ToolResult {
-                tool_call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                success: true,
-                output: serde_json::json!({"echoed": call.arg_str("message").unwrap_or("")}),
-                display_summary: format!("echoed: {}", call.arg_str("message").unwrap_or("")),
-                duration_ms: 0,
-            }
-        }
-    }
-
-    fn registry_with(executor: Arc<dyn ToolExecutor>) -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        registry.register(executor);
-        registry
-    }
-
-    /// Allow everything, record nothing.
-    struct AllowAllPolicy;
-    #[async_trait]
-    impl PolicyEngine for AllowAllPolicy {
-        async fn judge_tool(
-            &self,
-            _tool: &str,
-            _target: &str,
-            _params: &[(&str, &str)],
-        ) -> PolicyDecision {
-            PolicyDecision::allow()
-        }
-    }
+    use crate::test_support::{
+        registry_with, turn_text, turn_tool_call, AllowAllPolicy, EchoTool, RecordingGate,
+        ScriptedProvider,
+    };
 
     /// Returns a configured verdict per tool name and records what it saw.
     struct RecordingPolicy {
@@ -2163,44 +2143,18 @@ mod tests {
             target: &str,
             _params: &[(&str, &str)],
         ) -> PolicyDecision {
-            self.seen.lock().unwrap().push((tool.to_string(), target.to_string()));
+            self.seen
+                .lock()
+                .unwrap()
+                .push((tool.to_string(), target.to_string()));
             match self.verdicts.lock().unwrap().get(tool) {
                 Some(PolicyVerdict::Allow) => PolicyDecision::allow(),
-                Some(PolicyVerdict::Deny) => {
-                    PolicyDecision::deny(format!("test deny {}", tool))
-                }
+                Some(PolicyVerdict::Deny) => PolicyDecision::deny(format!("test deny {}", tool)),
                 Some(PolicyVerdict::Escalate) => {
                     PolicyDecision::escalate(format!("test escalate {}", tool))
                 }
                 None => PolicyDecision::allow(),
             }
-        }
-    }
-
-    /// Records approval requests and answers with a fixed verdict.
-    struct RecordingGate {
-        requests: std::sync::Mutex<Vec<ApprovalRequest>>,
-        answer: bool,
-    }
-
-    impl RecordingGate {
-        fn new(answer: bool) -> Arc<Self> {
-            Arc::new(Self {
-                requests: std::sync::Mutex::new(Vec::new()),
-                answer,
-            })
-        }
-
-        fn requests(&self) -> Vec<ApprovalRequest> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl ApprovalGate for RecordingGate {
-        async fn request(&self, request: &ApprovalRequest) -> bool {
-            self.requests.lock().unwrap().push(request.clone());
-            self.answer
         }
     }
 
@@ -2268,7 +2222,10 @@ mod tests {
         let chat_requests = provider.recorded_requests();
         assert_eq!(chat_requests.len(), 2);
         for req in &chat_requests {
-            add(&mut expected, &serde_json::to_string(&req.messages).unwrap());
+            add(
+                &mut expected,
+                &serde_json::to_string(&req.messages).unwrap(),
+            );
         }
         // Turn 1: empty content (zero), plus the tool call reconstructed
         // exactly as the SSE accumulator assembles it.
@@ -2432,7 +2389,11 @@ mod tests {
             seen[0].0
         );
         assert!(!seen[0].0.contains("user@example.com"));
-        assert_eq!(seen[0].1, vec!["echo".to_string()], "tool names reach retrieval");
+        assert_eq!(
+            seen[0].1,
+            vec!["echo".to_string()],
+            "tool names reach retrieval"
+        );
     }
 
     #[tokio::test]
@@ -2504,7 +2465,11 @@ mod tests {
     #[tokio::test]
     async fn skill_expansion_runs_every_step_and_answers_once() {
         let provider = ScriptedProvider::new();
-        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            USE_SKILL,
+            r#"{"skill_name":"greet"}"#,
+        ));
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
 
@@ -2552,7 +2517,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_skill_fails_naming_available_skills() {
         let provider = ScriptedProvider::new();
-        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"nope"}"#));
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            USE_SKILL,
+            r#"{"skill_name":"nope"}"#,
+        ));
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
 
@@ -2574,13 +2543,20 @@ mod tests {
         assert!(!skill_result.success);
         let error = skill_result.output["error"].as_str().unwrap();
         assert!(error.contains("Unknown skill: nope"), "got: {error}");
-        assert!(error.contains("greet"), "must list available skills: {error}");
+        assert!(
+            error.contains("greet"),
+            "must list available skills: {error}"
+        );
     }
 
     #[tokio::test]
     async fn blocked_step_aborts_skill_and_skips_the_rest() {
         let provider = ScriptedProvider::new();
-        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            USE_SKILL,
+            r#"{"skill_name":"greet"}"#,
+        ));
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
 
@@ -2612,7 +2588,9 @@ mod tests {
         assert_eq!(steps[0]["decision"], "policy_denied");
         assert_eq!(skill_result.output["skipped"], 2, "remaining steps skipped");
         assert!(
-            skill_result.display_summary.contains("blocked at step 1 of 3"),
+            skill_result
+                .display_summary
+                .contains("blocked at step 1 of 3"),
             "got: {}",
             skill_result.display_summary
         );
@@ -2627,7 +2605,11 @@ mod tests {
     #[tokio::test]
     async fn skill_steps_emit_the_standard_event_trio() {
         let provider = ScriptedProvider::new();
-        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            USE_SKILL,
+            r#"{"skill_name":"greet"}"#,
+        ));
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
 
@@ -2658,7 +2640,11 @@ mod tests {
     #[tokio::test]
     async fn use_skill_policy_target_is_the_skill_name() {
         let provider = ScriptedProvider::new();
-        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            USE_SKILL,
+            r#"{"skill_name":"greet"}"#,
+        ));
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
 
@@ -2671,14 +2657,21 @@ mod tests {
         agent.run("greet me").await;
         // The use_skill check judged the skill name (not the JSON fallback);
         // the echo step then got its own check with the echo target.
-        assert_eq!(policy.seen()[0], ("use_skill".to_string(), "greet".to_string()));
+        assert_eq!(
+            policy.seen()[0],
+            ("use_skill".to_string(), "greet".to_string())
+        );
         assert!(policy.seen().iter().any(|(tool, _)| tool == "echo"));
     }
 
     #[tokio::test]
     async fn same_tool_steps_do_not_trip_the_loop_guard() {
         let provider = ScriptedProvider::new();
-        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            USE_SKILL,
+            r#"{"skill_name":"greet"}"#,
+        ));
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
 
@@ -2709,15 +2702,26 @@ mod tests {
     #[tokio::test]
     async fn policy_deny_on_use_skill_blocks_before_expansion() {
         let provider = ScriptedProvider::new();
-        provider.push_chat(turn_tool_call("call_1", USE_SKILL, r#"{"skill_name":"greet"}"#));
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            USE_SKILL,
+            r#"{"skill_name":"greet"}"#,
+        ));
 
         let (registry, calls, library) = skill_registry(vec![skill_spec("greet", 2)]);
         let policy = RecordingPolicy::new(&[("use_skill", PolicyVerdict::Deny)]);
         let agent = Agent::new(provider.clone(), registry, policy).with_skills(library);
 
         let report = agent.run("greet me").await;
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "denied skill must not expand");
-        assert!(report.steps.iter().any(|s| matches!(s, AgentStep::ToolResult(r)
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "denied skill must not expand"
+        );
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| matches!(s, AgentStep::ToolResult(r)
             if r.tool_name == "use_skill" && !r.success
                 && r.output["error"].as_str().unwrap_or("").contains("Policy denied use_skill"))));
 
@@ -2741,8 +2745,15 @@ mod tests {
         let report = agent.run("do a thing").await;
         // The engine judged the call: no primary argument key, so the
         // compact JSON of the arguments was the target.
-        assert_eq!(policy.seen(), vec![("echo".to_string(), "{\"message\":\"hi\"}".to_string())]);
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "denied tool must not execute");
+        assert_eq!(
+            policy.seen(),
+            vec![("echo".to_string(), "{\"message\":\"hi\"}".to_string())]
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "denied tool must not execute"
+        );
         assert!(report
             .steps
             .iter()
@@ -2805,7 +2816,11 @@ mod tests {
         let agent = Agent::new(provider.clone(), registry, policy).with_approval(gate.clone());
 
         let report = agent.run("do a thing").await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "approved escalated call executes");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "approved escalated call executes"
+        );
         assert_eq!(gate.requests().len(), 1);
         assert_eq!(report.status, TaskStatus::Complete);
     }
@@ -2825,7 +2840,10 @@ mod tests {
         let report = agent.run("do a thing").await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let request = &gate.requests()[0];
-        assert!(request.reasons.iter().any(|r| r.contains("requires human approval")));
+        assert!(request
+            .reasons
+            .iter()
+            .any(|r| r.contains("requires human approval")));
         assert!(report
             .steps
             .iter()
@@ -2868,12 +2886,15 @@ mod tests {
             trust_ceiling: ToolTrustTier::Observational,
             ..Default::default()
         };
-        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
-            .with_config(config);
+        let agent =
+            Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy)).with_config(config);
 
         let report = agent.run("do a thing").await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(report.steps.iter().any(|s| matches!(s, AgentStep::ToolResult(r)
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| matches!(s, AgentStep::ToolResult(r)
             if r.output["error"].as_str().unwrap_or("").contains("trust ceiling"))));
     }
 
@@ -2886,7 +2907,10 @@ mod tests {
         let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy));
 
         let report = agent.run("do a thing").await;
-        assert!(report.steps.iter().any(|s| matches!(s, AgentStep::ToolResult(r)
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| matches!(s, AgentStep::ToolResult(r)
             if r.output["error"].as_str().unwrap_or("").contains("Unknown tool"))));
 
         let requests = provider.recorded_requests();
@@ -2898,7 +2922,11 @@ mod tests {
     #[tokio::test]
     async fn one_shot_shortcut_completes_without_further_turns() {
         let provider = ScriptedProvider::new();
-        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"pod bay doors"}"#));
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            "echo",
+            r#"{"message":"pod bay doors"}"#,
+        ));
         // A second script must never be consumed.
         provider.push_chat(turn_text("should not be used"));
 
@@ -2914,8 +2942,15 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("echoed: pod bay doors"));
-        assert_eq!(provider.recorded_requests().len(), 1, "one-shot made a single LLM turn");
-        assert!(report.verification.is_none(), "one-shot skips self-verification");
+        assert_eq!(
+            provider.recorded_requests().len(),
+            1,
+            "one-shot made a single LLM turn"
+        );
+        assert!(
+            report.verification.is_none(),
+            "one-shot skips self-verification"
+        );
     }
 
     #[tokio::test]
@@ -2934,7 +2969,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // The loop continued past the first batch: more than one chat turn.
         assert!(provider.recorded_requests().len() >= 2);
-        assert_eq!(report.final_answer.as_deref(), Some("And then the second thing."));
+        assert_eq!(
+            report.final_answer.as_deref(),
+            Some("And then the second thing.")
+        );
     }
 
     #[tokio::test]
@@ -2952,8 +2990,14 @@ mod tests {
         assert_eq!(report.status, TaskStatus::Complete);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let answer = report.final_answer.as_deref().unwrap_or("");
-        assert!(answer.contains("Task completed"), "finalized from real work: {answer}");
-        assert!(answer.contains("echoed: hi"), "finalized from real work: {answer}");
+        assert!(
+            answer.contains("Task completed"),
+            "finalized from real work: {answer}"
+        );
+        assert!(
+            answer.contains("echoed: hi"),
+            "finalized from real work: {answer}"
+        );
     }
 
     #[tokio::test]
@@ -2967,7 +3011,10 @@ mod tests {
 
         let report = agent.run("do a thing").await;
         assert_eq!(report.status, TaskStatus::Failed);
-        assert!(report.steps.iter().any(|s| matches!(s, AgentStep::Error { message }
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| matches!(s, AgentStep::Error { message }
             if message.contains("no output after a retry"))));
     }
 
@@ -2975,7 +3022,11 @@ mod tests {
     async fn same_tool_loop_gets_hard_stop_nudge() {
         let provider = ScriptedProvider::new();
         for i in 0..3 {
-            provider.push_chat(turn_tool_call(&format!("call_{}", i), "echo", r#"{"message":"x"}"#));
+            provider.push_chat(turn_tool_call(
+                &format!("call_{}", i),
+                "echo",
+                r#"{"message":"x"}"#,
+            ));
         }
 
         let (registry, calls) = echo_registry();
@@ -2988,9 +3039,11 @@ mod tests {
 
         let requests = provider.recorded_requests();
         let nudge_seen = requests.iter().any(|r| {
-            r.messages.iter().any(|m| m.role == "user"
-                && m.content.contains("times in a row")
-                && m.content.contains("answer NOW"))
+            r.messages.iter().any(|m| {
+                m.role == "user"
+                    && m.content.contains("times in a row")
+                    && m.content.contains("answer NOW")
+            })
         });
         assert!(nudge_seen, "hard-stop nudge must reach the model");
     }
@@ -3008,7 +3061,10 @@ mod tests {
 
         let report = agent.run("explain it fully").await;
         assert_eq!(report.status, TaskStatus::Complete);
-        assert_eq!(report.final_answer.as_deref(), Some("Revised answer with details."));
+        assert_eq!(
+            report.final_answer.as_deref(),
+            Some("Revised answer with details.")
+        );
         assert_eq!(
             report
                 .steps
@@ -3041,18 +3097,28 @@ mod tests {
     async fn max_steps_reached_fails_with_error_step() {
         let provider = ScriptedProvider::new();
         for i in 0..10 {
-            provider.push_chat(turn_tool_call(&format!("call_{}", i), "echo", r#"{"message":"x"}"#));
+            provider.push_chat(turn_tool_call(
+                &format!("call_{}", i),
+                "echo",
+                r#"{"message":"x"}"#,
+            ));
         }
 
         let (registry, _) = echo_registry();
-        let config = AgentConfig { max_steps: 2, ..Default::default() };
+        let config = AgentConfig {
+            max_steps: 2,
+            ..Default::default()
+        };
         let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
             .with_approval(Arc::new(AutoApprove))
             .with_config(config);
 
         let report = agent.run("do a thing").await;
         assert_eq!(report.status, TaskStatus::Failed);
-        assert!(report.steps.iter().any(|s| matches!(s, AgentStep::Error { message }
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| matches!(s, AgentStep::Error { message }
             if message == "Max steps reached")));
         assert_eq!(report.steps_used, 2);
     }
@@ -3115,10 +3181,17 @@ mod tests {
         }
 
         let (registry, _) = echo_registry();
-        let agent = Agent::new(Arc::new(FailingProvider), registry, Arc::new(AllowAllPolicy));
+        let agent = Agent::new(
+            Arc::new(FailingProvider),
+            registry,
+            Arc::new(AllowAllPolicy),
+        );
         let report = agent.run("do a thing").await;
         assert_eq!(report.status, TaskStatus::Failed);
-        assert!(report.steps.iter().any(|s| matches!(s, AgentStep::Error { message }
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| matches!(s, AgentStep::Error { message }
             if message.contains("Inference request failed"))));
     }
 
@@ -3126,9 +3199,18 @@ mod tests {
 
     #[test]
     fn interpret_verification_parses_verified_and_incomplete() {
-        assert_eq!(interpret_verification("VERIFIED"), VerificationDecision::Complete);
-        assert_eq!(interpret_verification("  VERIFIED  "), VerificationDecision::Complete);
-        assert_eq!(interpret_verification("anything else"), VerificationDecision::Complete);
+        assert_eq!(
+            interpret_verification("VERIFIED"),
+            VerificationDecision::Complete
+        );
+        assert_eq!(
+            interpret_verification("  VERIFIED  "),
+            VerificationDecision::Complete
+        );
+        assert_eq!(
+            interpret_verification("anything else"),
+            VerificationDecision::Complete
+        );
         assert_eq!(
             interpret_verification("INCOMPLETE: missing the date"),
             VerificationDecision::Incomplete("missing the date".to_string())
@@ -3185,8 +3267,16 @@ mod tests {
             ChatMessage::user("Email me at c@d.com"),
         ];
         let (stripped, map) = strip_messages(&messages);
-        assert!(stripped[0].content.contains("[M0_EMAIL_1]"), "{}", stripped[0].content);
-        assert!(stripped[1].content.contains("[M1_EMAIL_1]"), "{}", stripped[1].content);
+        assert!(
+            stripped[0].content.contains("[M0_EMAIL_1]"),
+            "{}",
+            stripped[0].content
+        );
+        assert!(
+            stripped[1].content.contains("[M1_EMAIL_1]"),
+            "{}",
+            stripped[1].content
+        );
         assert!(!stripped[0].content.contains("a@b.com"));
         assert!(!stripped[1].content.contains("c@d.com"));
 
@@ -3220,7 +3310,11 @@ mod tests {
     // ── Dry-run gate (M6d) tests ─────────────────────────────────────────────
 
     fn call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
-        ToolCall { id: id.to_string(), name: name.to_string(), arguments }
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments,
+        }
     }
 
     /// An empty skill library — a `use_skill` call can still be gated.
@@ -3374,7 +3468,10 @@ mod tests {
         )
         .await;
         assert!(verdict.approval_required, "the live chain would ask");
-        assert!(gate.requests().is_empty(), "the dry run never asks approval");
+        assert!(
+            gate.requests().is_empty(),
+            "the dry run never asks approval"
+        );
         assert!(
             sink.snapshot()
                 .iter()
@@ -3396,51 +3493,67 @@ mod tests {
             started_at: 100,
             prompt: "echo hi".to_string(),
             status: SessionStatus::Running,
-            conversation: vec![ChatMessage::user("echo hi"), ChatMessage::assistant("working")],
-            loop_state: LoopState { steps_used, ..Default::default() },
+            conversation: vec![
+                ChatMessage::user("echo hi"),
+                ChatMessage::assistant("working"),
+            ],
+            loop_state: LoopState {
+                steps_used,
+                ..Default::default()
+            },
             final_answer: None,
         }
     }
 
     #[tokio::test]
     async fn with_task_id_names_the_checkpoint_file() {
-        let root =
-            std::env::temp_dir().join(format!("amparo-agent-w2-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-agent-w2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
         let provider = ScriptedProvider::new();
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
         let store = Arc::new(JsonCheckpointStore::new(&root));
-        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
-            .with_approval(Arc::new(AutoApprove))
-            .with_checkpoints(store.clone(), "cli")
-            .with_task_id("sess-host-1");
+        let agent = Agent::new(
+            provider,
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove))
+        .with_checkpoints(store.clone(), "cli")
+        .with_task_id("sess-host-1");
         agent.run("echo hi").await;
         // The host's id — not a generated one — named the checkpoint
         // file, so every artifact agrees on the task's identity.
         assert!(crate::session::checkpoint_path(&root, "cli", "sess-host-1").exists());
-        let complete = store.latest_complete("cli").expect("the terminal checkpoint");
+        let complete = store
+            .latest_complete("cli")
+            .expect("the terminal checkpoint");
         assert_eq!(complete.task_id, "sess-host-1");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn run_writes_a_terminal_checkpoint_without_system_messages_or_pii() {
-        let root =
-            std::env::temp_dir().join(format!("amparo-agent-w6-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-agent-w6-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
         let provider = ScriptedProvider::new();
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
         let store = Arc::new(JsonCheckpointStore::new(&root));
-        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
-            .with_approval(Arc::new(AutoApprove))
-            .with_checkpoints(store.clone(), "cli");
+        let agent = Agent::new(
+            provider,
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove))
+        .with_checkpoints(store.clone(), "cli");
         let report = agent.run("email me at alice@example.com please").await;
         assert_eq!(report.status, TaskStatus::Complete);
-        let complete = store.latest_complete("cli").expect("the terminal checkpoint");
+        let complete = store
+            .latest_complete("cli")
+            .expect("the terminal checkpoint");
         assert!(
             store.latest_incomplete("cli").is_none(),
             "Running must transition to Complete at the terminal exit"
@@ -3483,11 +3596,10 @@ mod tests {
         assert_eq!(messages[1].content, "echo hi");
         assert_eq!(messages[2].content, "working");
         // TaskResumed — not TaskStarted — marks the resume.
-        let resumed = events
-            .snapshot()
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TaskResumed { task_id, steps_used }
-                if task_id == "sess-1" && *steps_used == 2));
+        let resumed = events.snapshot().iter().any(|e| {
+            matches!(e, AgentEvent::TaskResumed { task_id, steps_used }
+                if task_id == "sess-1" && *steps_used == 2)
+        });
         assert!(resumed, "the resume emits TaskResumed");
         assert!(
             events
@@ -3523,7 +3635,10 @@ mod tests {
         // 2 + 1 = 3 consecutive — the hard-stop nudge must fire on the
         // next request, exactly as it would have without the restart.
         let nudged = provider.recorded_requests().iter().any(|request| {
-            request.messages.iter().any(|m| m.content.contains("MUST answer NOW"))
+            request
+                .messages
+                .iter()
+                .any(|m| m.content.contains("MUST answer NOW"))
         });
         assert!(nudged, "the hard-stop nudge must fire across a resume");
     }
@@ -3533,7 +3648,10 @@ mod tests {
     struct FailingStore;
     impl CheckpointStore for FailingStore {
         fn save(&self, _checkpoint: &Checkpoint) -> std::io::Result<()> {
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "disk on fire"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "disk on fire",
+            ))
         }
 
         fn latest_incomplete(&self, _tenant: &str) -> Option<Checkpoint> {
@@ -3551,9 +3669,13 @@ mod tests {
         let provider = ScriptedProvider::new();
         provider.push_chat(turn_text("Done."));
         provider.push_verify("VERIFIED");
-        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
-            .with_approval(Arc::new(AutoApprove))
-            .with_checkpoints(Arc::new(FailingStore), "cli");
+        let agent = Agent::new(
+            provider,
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove))
+        .with_checkpoints(Arc::new(FailingStore), "cli");
         let report = agent.run("hi").await;
         assert_eq!(report.status, TaskStatus::Complete);
     }
@@ -3563,18 +3685,21 @@ mod tests {
         let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
         let provider = ScriptedProvider::new();
         let events = Arc::new(InMemoryEventSink::new());
-        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
-            .with_approval(Arc::new(AutoApprove))
-            .with_events(events.clone());
+        let agent = Agent::new(
+            provider,
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove))
+        .with_events(events.clone());
         // steps_used == max_steps: no iterations remain.
-        let report = agent.resume(running_checkpoint("sess-3", DEFAULT_MAX_STEPS)).await;
+        let report = agent
+            .resume(running_checkpoint("sess-3", DEFAULT_MAX_STEPS))
+            .await;
         assert_eq!(report.status, TaskStatus::Failed);
-        assert!(
-            events
-                .snapshot()
-                .iter()
-                .any(|e| matches!(e, AgentEvent::TaskFailed { message } if message == "Max steps reached"))
-        );
+        assert!(events.snapshot().iter().any(
+            |e| matches!(e, AgentEvent::TaskFailed { message } if message == "Max steps reached")
+        ));
     }
 
     // ── M7 W8: chat continuity ─────────────────────────────────────────────
@@ -3606,8 +3731,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoints_strip_the_tool_summary_and_final_answer_too() {
-        let root =
-            std::env::temp_dir().join(format!("amparo-agent-w8-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-agent-w8-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
         let provider = ScriptedProvider::new();
@@ -3615,16 +3739,26 @@ mod tests {
         // Turns 2+3: empty — the loop finalizes from the last good
         // summary, which means both the summary AND the final answer
         // hold the email.
-        provider.push_chat(turn_tool_call("c1", "echo", r#"{"message": "mail alice@example.com"}"#));
+        provider.push_chat(turn_tool_call(
+            "c1",
+            "echo",
+            r#"{"message": "mail alice@example.com"}"#,
+        ));
         provider.push_chat(vec![]);
         provider.push_chat(vec![]);
         let store = Arc::new(JsonCheckpointStore::new(&root));
-        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
-            .with_approval(Arc::new(AutoApprove))
-            .with_checkpoints(store.clone(), "cli");
+        let agent = Agent::new(
+            provider,
+            registry_with(Arc::new(echo)),
+            Arc::new(AllowAllPolicy),
+        )
+        .with_approval(Arc::new(AutoApprove))
+        .with_checkpoints(store.clone(), "cli");
         let report = agent.run("echo the message").await;
         assert_eq!(report.status, TaskStatus::Complete);
-        let complete = store.latest_complete("cli").expect("the terminal checkpoint");
+        let complete = store
+            .latest_complete("cli")
+            .expect("the terminal checkpoint");
         // I6: the summary and the final answer are stripped at write —
         // continuity reads both, so neither may carry a live PII string.
         assert!(

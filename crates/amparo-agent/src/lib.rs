@@ -66,8 +66,12 @@ pub mod events;
 pub mod ledger_sink;
 pub mod preflight;
 pub mod session;
+pub mod spawn;
 pub mod tokens;
 mod sse;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use agent::{
     dry_run_gate, extract_target, Agent, AgentConfig, AgentReport, AgentStep, DryRunVerdict,
@@ -82,4 +86,5 @@ pub use session::{
     continuity_context, Checkpoint, CheckpointStore, JsonCheckpointStore, LoopState,
     SessionStatus, CONTINUITY_TAIL,
 };
+pub use spawn::{SpawnAgentTool, SubAgentSummary, SPAWN_AGENT};
 pub use tokens::{estimate_tokens, format_cost_line};

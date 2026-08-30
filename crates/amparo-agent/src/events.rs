@@ -19,6 +19,12 @@ pub enum AgentEvent {
     TaskStarted {
         /// The original prompt.
         prompt: String,
+        /// The task's id when the host fixed one (M8) — a sub-agent's
+        /// chain id like `sess-123.1` — so the `[task]` line names the
+        /// delegation chain. `None` for a host that let the agent
+        /// generate the id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     /// One LLM turn arrived (content plus how many tool calls it made).
     AssistantTurn {
@@ -87,10 +93,27 @@ pub enum AgentEvent {
         /// The model's feedback, when incomplete.
         feedback: Option<String>,
     },
+    /// A sub-agent was spawned (M8): the child's chain id, its parent
+    /// task, and the sub-task prompt it was given. Emitted by the
+    /// `spawn_agent` tool after the budget check — a budget-exhausted
+    /// spawn emits nothing, because no agent exists.
+    SubAgentSpawned {
+        /// The child's task id — `{parent}.{n}`.
+        task_id: String,
+        /// The parent task's id.
+        parent_task_id: String,
+        /// The sub-task prompt.
+        prompt: String,
+    },
     /// The task completed with this final answer.
     TaskComplete {
         /// The final answer text.
         final_answer: String,
+        /// The task's id when the host fixed one (M8) — mirrors
+        /// [`AgentEvent::TaskStarted::task_id`] so the `[complete]` line
+        /// names the same chain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     /// The task failed.
     TaskFailed {
@@ -197,7 +220,10 @@ pub fn truncate(s: &str) -> String {
 /// prints it to stderr and chat adapters forward it to the chat.
 pub fn format_event(event: &AgentEvent) -> String {
     match event {
-        AgentEvent::TaskStarted { prompt } => format!("[task] {}", truncate(prompt)),
+        AgentEvent::TaskStarted { prompt, task_id } => match task_id {
+            Some(id) => format!("[task {id}] {}", truncate(prompt)),
+            None => format!("[task] {}", truncate(prompt)),
+        },
         AgentEvent::AssistantTurn { step, content, tool_calls } => {
             let calls = if *tool_calls > 0 {
                 format!(" ({tool_calls} tool call(s))")
@@ -245,8 +271,12 @@ pub fn format_event(event: &AgentEvent) -> String {
                 .unwrap_or_default();
             format!("[verify] {decision}{detail}")
         }
-        AgentEvent::TaskComplete { final_answer } => {
-            format!("[complete] {}", truncate(final_answer))
+        AgentEvent::SubAgentSpawned { task_id, parent_task_id, prompt } => {
+            format!("[spawn] {task_id} under {parent_task_id}: {}", truncate(prompt))
+        }
+        AgentEvent::TaskComplete { final_answer, task_id } => match task_id {
+            Some(id) => format!("[complete {id}] {}", truncate(final_answer)),
+            None => format!("[complete] {}", truncate(final_answer)),
         }
         AgentEvent::TaskFailed { message } => format!("[failed] {}", truncate(message)),
         AgentEvent::TaskResumed { task_id, steps_used } => {
@@ -274,9 +304,9 @@ mod tests {
     #[test]
     fn snapshot_holds_emitted_events_in_order() {
         let sink = InMemoryEventSink::new();
-        sink.emit(&AgentEvent::TaskStarted { prompt: "hi".into() });
+        sink.emit(&AgentEvent::TaskStarted { prompt: "hi".into(), task_id: None });
         sink.emit(&AgentEvent::ToolExecuted { result: result("read_file") });
-        sink.emit(&AgentEvent::TaskComplete { final_answer: "done".into() });
+        sink.emit(&AgentEvent::TaskComplete { final_answer: "done".into(), task_id: None });
         let events = sink.snapshot();
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], AgentEvent::TaskStarted { .. }));
@@ -288,7 +318,7 @@ mod tests {
     fn broadcast_fans_out_to_subscribers() {
         let sink = InMemoryEventSink::new();
         let mut rx = sink.subscribe();
-        sink.emit(&AgentEvent::TaskStarted { prompt: "hi".into() });
+        sink.emit(&AgentEvent::TaskStarted { prompt: "hi".into(), task_id: None });
         // The channel holds the event even if no one awaited it yet.
         let received = rx.blocking_recv().unwrap();
         assert!(matches!(received, AgentEvent::TaskStarted { .. }));
@@ -330,7 +360,7 @@ mod tests {
     #[test]
     fn every_variant_renders_as_one_tagged_line() {
         let cases: Vec<(&str, String)> = vec![
-            ("[task]", format_event(&AgentEvent::TaskStarted { prompt: "p".into() })),
+            ("[task]", format_event(&AgentEvent::TaskStarted { prompt: "p".into(), task_id: None })),
             (
                 "[turn",
                 format_event(&AgentEvent::AssistantTurn {
@@ -376,7 +406,29 @@ mod tests {
                     feedback: Some("f".into()),
                 }),
             ),
-            ("[complete]", format_event(&AgentEvent::TaskComplete { final_answer: "a".into() })),
+            (
+                "[task sess-123.1]",
+                format_event(&AgentEvent::TaskStarted {
+                    prompt: "p".into(),
+                    task_id: Some("sess-123.1".into()),
+                }),
+            ),
+            (
+                "[spawn]",
+                format_event(&AgentEvent::SubAgentSpawned {
+                    task_id: "sess-123.1".into(),
+                    parent_task_id: "sess-123".into(),
+                    prompt: "research X".into(),
+                }),
+            ),
+            ("[complete]", format_event(&AgentEvent::TaskComplete { final_answer: "a".into(), task_id: None })),
+            (
+                "[complete sess-123.1]",
+                format_event(&AgentEvent::TaskComplete {
+                    final_answer: "a".into(),
+                    task_id: Some("sess-123.1".into()),
+                }),
+            ),
             ("[failed]", format_event(&AgentEvent::TaskFailed { message: "m".into() })),
             (
                 "[session] resumed",
@@ -407,6 +459,36 @@ mod tests {
     }
 
     #[test]
+    fn task_ids_name_the_chain_and_absent_ids_keep_the_plain_tag() {
+        assert_eq!(
+            format_event(&AgentEvent::TaskStarted { prompt: "p".into(), task_id: None }),
+            "[task] p"
+        );
+        assert_eq!(
+            format_event(&AgentEvent::TaskStarted {
+                prompt: "p".into(),
+                task_id: Some("sess-123.1".into())
+            }),
+            "[task sess-123.1] p"
+        );
+        assert_eq!(
+            format_event(&AgentEvent::TaskComplete {
+                final_answer: "a".into(),
+                task_id: Some("sess-123.1".into())
+            }),
+            "[complete sess-123.1] a"
+        );
+        assert_eq!(
+            format_event(&AgentEvent::SubAgentSpawned {
+                task_id: "sess-123.1".into(),
+                parent_task_id: "sess-123".into(),
+                prompt: "research X".into(),
+            }),
+            "[spawn] sess-123.1 under sess-123: research X"
+        );
+    }
+
+    #[test]
     fn fanout_delivers_every_event_to_every_sink() {
         let a = Arc::new(InMemoryEventSink::new());
         let b = Arc::new(InMemoryEventSink::new());
@@ -414,8 +496,8 @@ mod tests {
             a.clone() as Arc<dyn EventSink>,
             b.clone() as Arc<dyn EventSink>,
         ]);
-        fanout.emit(&AgentEvent::TaskStarted { prompt: "hi".into() });
-        fanout.emit(&AgentEvent::TaskComplete { final_answer: "done".into() });
+        fanout.emit(&AgentEvent::TaskStarted { prompt: "hi".into(), task_id: None });
+        fanout.emit(&AgentEvent::TaskComplete { final_answer: "done".into(), task_id: None });
         // Both sinks saw both events, in order.
         assert_eq!(a.snapshot().len(), 2);
         assert_eq!(b.snapshot().len(), 2);

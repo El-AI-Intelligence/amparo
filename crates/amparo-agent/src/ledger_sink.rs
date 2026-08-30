@@ -220,7 +220,7 @@ mod tests {
     fn fetch_url_execution_writes_a_row_with_host_only_site() {
         let dir = temp_dir();
         let sink = sink(&dir);
-        sink.emit(&AgentEvent::TaskStarted { prompt: "fetch it".into() });
+        sink.emit(&AgentEvent::TaskStarted { prompt: "fetch it".into(), task_id: None });
         request(
             &sink,
             "c1",

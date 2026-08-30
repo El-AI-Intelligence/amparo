@@ -8,6 +8,12 @@
 //! `ToolExecuted` (success, summary, duration), `Verification` (the
 //! self-check) and `TaskComplete`/`TaskFailed` (the terminal event that
 //! finalizes the record). This crate therefore changes nothing in the loop.
+//!
+//! Sub-agent tasks (M8) share the parent's sink, so their events
+//! interleave: a child's `TaskStarted` can arrive while the parent's
+//! record is still buffering. The in-flight states therefore live on a
+//! stack — every `TaskStarted` pushes, per-call events feed the top,
+//! and the terminal event pops and finalizes that task's own record.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -60,8 +66,11 @@ struct SinkState {
 pub struct NotebookSink {
     store: Arc<dyn Memory>,
     tenant_id: String,
-    state: Mutex<Option<SinkState>>,
-    pending: Mutex<Option<JoinHandle<()>>>,
+    /// The in-flight task states, outermost first: a sub-agent's
+    /// `TaskStarted` pushes on top of its parent's still-buffering state,
+    /// so interleaved events feed the task they belong to (M8).
+    state: Mutex<Vec<SinkState>>,
+    pending: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl NotebookSink {
@@ -73,16 +82,17 @@ impl NotebookSink {
         Self {
             store,
             tenant_id: tenant_id.into(),
-            state: Mutex::new(None),
-            pending: Mutex::new(None),
+            state: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
         }
     }
 
-    /// Await the pending record write, if any. Idempotent — after the
-    /// terminal event the record exists on disk once this returns.
+    /// Await every pending record write. Idempotent — after the terminal
+    /// events the records exist on disk once this returns.
     pub async fn flush(&self) {
-        let handle = self.pending.lock().unwrap().take();
-        if let Some(handle) = handle {
+        let handles: Vec<JoinHandle<()>> =
+            std::mem::take(&mut *self.pending.lock().unwrap());
+        for handle in handles {
             let _ = handle.await;
         }
     }
@@ -137,7 +147,7 @@ impl NotebookSink {
                 eprintln!("[notebook] run record failed to persist: {error}");
             }
         });
-        *self.pending.lock().unwrap() = Some(handle);
+        self.pending.lock().unwrap().push(handle);
     }
 }
 
@@ -145,8 +155,10 @@ impl EventSink for NotebookSink {
     fn emit(&self, event: &AgentEvent) {
         let mut slot = self.state.lock().unwrap();
         match event {
-            AgentEvent::TaskStarted { prompt } => {
-                *slot = Some(SinkState {
+            AgentEvent::TaskStarted { prompt, .. } => {
+                // Push, not replace: a sub-agent (M8) starts on top of
+                // its parent's still-buffering record.
+                slot.push(SinkState {
                     started_at: chrono::Utc::now().to_rfc3339(),
                     started_instant: Instant::now(),
                     task_text: prompt.clone(),
@@ -156,7 +168,7 @@ impl EventSink for NotebookSink {
                 });
             }
             AgentEvent::ToolCallRequested { call } => {
-                if let Some(state) = slot.as_mut() {
+                if let Some(state) = slot.last_mut() {
                     // `use_skill` records the skill name as its target —
                     // the engine judges the skill name, mirroring the gate
                     // chain; every other call extracts its target.
@@ -180,7 +192,7 @@ impl EventSink for NotebookSink {
                 reasons,
                 ..
             } => {
-                if let Some(state) = slot.as_mut() {
+                if let Some(state) = slot.last_mut() {
                     if let Some(call) = state.calls.get_mut(call_id) {
                         call.decision = Some(decision.clone());
                         call.reasons = reasons.clone();
@@ -188,21 +200,21 @@ impl EventSink for NotebookSink {
                 }
             }
             AgentEvent::ApprovalRequested { call_id, .. } => {
-                if let Some(state) = slot.as_mut() {
+                if let Some(state) = slot.last_mut() {
                     if let Some(call) = state.calls.get_mut(call_id) {
                         call.escalated = true;
                     }
                 }
             }
             AgentEvent::ApprovalResolved { call_id, approved } => {
-                if let Some(state) = slot.as_mut() {
+                if let Some(state) = slot.last_mut() {
                     if let Some(call) = state.calls.get_mut(call_id) {
                         call.approved = Some(*approved);
                     }
                 }
             }
             AgentEvent::ToolExecuted { result } => {
-                if let Some(state) = slot.as_mut() {
+                if let Some(state) = slot.last_mut() {
                     if let Some(call) = state.calls.get_mut(&result.tool_call_id) {
                         call.success = Some(result.success);
                         call.summary = Some(result.display_summary.clone());
@@ -211,7 +223,7 @@ impl EventSink for NotebookSink {
                 }
             }
             AgentEvent::Verification { decision, feedback } => {
-                if let Some(state) = slot.as_mut() {
+                if let Some(state) = slot.last_mut() {
                     state.verification = Some(VerificationRecord {
                         decision: decision.clone(),
                         feedback: feedback
@@ -220,13 +232,13 @@ impl EventSink for NotebookSink {
                     });
                 }
             }
-            AgentEvent::TaskComplete { final_answer } => {
-                if let Some(state) = slot.take() {
+            AgentEvent::TaskComplete { final_answer, .. } => {
+                if let Some(state) = slot.pop() {
                     self.finalize(state, "complete", Some(final_answer));
                 }
             }
             AgentEvent::TaskFailed { message } => {
-                if let Some(state) = slot.take() {
+                if let Some(state) = slot.pop() {
                     self.finalize(state, "failed", Some(message));
                 }
             }
@@ -235,10 +247,13 @@ impl EventSink for NotebookSink {
             // ledger's instrument (M7) — recorded there, not in the notebook.
             // TaskResumed (M7): a resume opens no new record here — the
             // checkpoint is the session trail, and a resumed run's events
-            // still reach the formatter.
+            // still reach the formatter. SubAgentSpawned (M8): the child's
+            // own TaskStarted/TaskComplete already opened and closed its
+            // record on the stack above.
             AgentEvent::AssistantTurn { .. }
             | AgentEvent::FinalAnswer { .. }
             | AgentEvent::PrivacyStripped { .. }
+            | AgentEvent::SubAgentSpawned { .. }
             | AgentEvent::TaskResumed { .. } => {}
         }
     }
@@ -273,6 +288,7 @@ mod tests {
     fn start(sink: &NotebookSink, prompt: &str) {
         sink.emit(&AgentEvent::TaskStarted {
             prompt: prompt.to_string(),
+            task_id: None,
         });
     }
 
@@ -326,6 +342,7 @@ mod tests {
         });
         sink.emit(&AgentEvent::TaskComplete {
             final_answer: "the directory has 3 entries".into(),
+            task_id: None,
         });
         sink.flush().await;
 
@@ -411,6 +428,7 @@ mod tests {
         });
         sink.emit(&AgentEvent::TaskComplete {
             final_answer: "sent to alice@example.com".into(),
+            task_id: None,
         });
         sink.flush().await;
 
@@ -474,6 +492,7 @@ mod tests {
         result(&sink, "call_1", "read_file", true, "read 2 lines");
         sink.emit(&AgentEvent::TaskComplete {
             final_answer: "opened".into(),
+            task_id: None,
         });
         sink.flush().await;
 
@@ -489,6 +508,7 @@ mod tests {
         start(&sink, &long_prompt);
         sink.emit(&AgentEvent::TaskComplete {
             final_answer: "y".repeat(900),
+            task_id: None,
         });
         sink.flush().await;
 
@@ -507,6 +527,7 @@ mod tests {
         // Terminal events with no task buffered must not persist anything.
         sink.emit(&AgentEvent::TaskComplete {
             final_answer: "orphan".into(),
+            task_id: None,
         });
         sink.flush().await;
         assert!(stored_records(&store).await.is_empty());
@@ -518,6 +539,7 @@ mod tests {
         start(&sink, "first");
         sink.emit(&AgentEvent::TaskComplete {
             final_answer: "one".into(),
+            task_id: None,
         });
         start(&sink, "second");
         sink.emit(&AgentEvent::TaskFailed {
@@ -552,9 +574,51 @@ mod tests {
         start(&sink, "task");
         sink.emit(&AgentEvent::TaskComplete {
             final_answer: "done".into(),
+            task_id: None,
         });
         sink.flush().await;
         // Reached here: the failure did not panic; the task itself is done.
+    }
+
+    #[tokio::test]
+    async fn interleaved_sub_agent_events_finalize_two_records() {
+        // M8: the child's events interleave through the shared sink — its
+        // TaskStarted must push a new state above the parent's buffered
+        // record, and its TaskComplete must finalize the CHILD record,
+        // leaving the parent's state intact for its own calls.
+        let (sink, store) = sink("cli");
+        start(&sink, "parent task");
+        request(&sink, "p1", "run_command", json!({"command": "ls"}));
+        sink.emit(&AgentEvent::TaskStarted {
+            prompt: "child task".into(),
+            task_id: Some("sess-123.1".into()),
+        });
+        request(&sink, "c1", "read_file", json!({"path": "a.txt"}));
+        sink.emit(&AgentEvent::TaskComplete {
+            final_answer: "child done".into(),
+            task_id: Some("sess-123.1".into()),
+        });
+        // Back on the parent's frame: its call completes, then its record.
+        result(&sink, "p1", "run_command", true, "listed");
+        sink.emit(&AgentEvent::TaskComplete {
+            final_answer: "parent done".into(),
+            task_id: None,
+        });
+        sink.flush().await;
+
+        let records = stored_records(&store).await;
+        assert_eq!(records.len(), 2, "one record per task: {records:?}");
+        let parent = records.iter().find(|r| r.task_text == "parent task").unwrap();
+        let child = records.iter().find(|r| r.task_text == "child task").unwrap();
+        assert_eq!(parent.status, "complete");
+        assert_eq!(parent.final_answer.as_deref(), Some("parent done"));
+        assert_eq!(parent.tool_calls.len(), 1);
+        assert_eq!(parent.tool_calls[0].tool_name, "run_command");
+        assert_eq!(parent.tool_calls[0].success, Some(true));
+        assert_eq!(child.status, "complete");
+        assert_eq!(child.final_answer.as_deref(), Some("child done"));
+        assert_eq!(child.tool_calls.len(), 1);
+        assert_eq!(child.tool_calls[0].tool_name, "read_file");
     }
 
     #[tokio::test]
