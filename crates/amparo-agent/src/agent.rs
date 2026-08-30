@@ -707,10 +707,25 @@ impl Agent {
     ) -> (Self, Arc<SpawnAgentTool>) {
         let parent_task_id = parent_task_id.into();
         self.task_id = Some(parent_task_id.clone());
-        let tool = Arc::new(SpawnAgentTool::new(&self, parent_task_id, budget, max_sub_agents));
+        let tool = Arc::new(SpawnAgentTool::new(
+            &self,
+            parent_task_id,
+            budget,
+            max_sub_agents,
+        ));
         self.registry
             .register(Arc::clone(&tool) as Arc<dyn ToolExecutor>);
         (self, tool)
+    }
+
+    /// Register one more tool for this task (M8 W5).
+    ///
+    /// Call it *after* [`Agent::with_spawn_agent`]: the spawn tool captured
+    /// the agent's parts — registry included — before this tool joins it,
+    /// so each child's registry starts without it and never inherits it.
+    pub fn with_tool(mut self, tool: Arc<dyn ToolExecutor>) -> Self {
+        self.registry.register(tool);
+        self
     }
 
     /// Registry schemas as wire-ready OpenAI tool definitions.

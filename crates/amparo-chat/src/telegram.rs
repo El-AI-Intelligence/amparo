@@ -102,7 +102,9 @@ impl TelegramTransport {
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or("no description");
-            Err(ChatError::Telegram(format!("{method}: API error: {description}")))
+            Err(ChatError::Telegram(format!(
+                "{method}: API error: {description}"
+            )))
         }
     }
 
@@ -200,10 +202,14 @@ impl ChatTransport for TelegramTransport {
         use crate::transport::{preflight_line, session_line};
         let text = truncate(&format!(
             "{}Approval needed — {}: {}\n{}{}",
-            session_line(request).map(|line| format!("{line}\n")).unwrap_or_default(),
+            session_line(request)
+                .map(|line| format!("{line}\n"))
+                .unwrap_or_default(),
             request.tool_name,
             request.arguments,
-            preflight_line(request).map(|line| format!("{line}\n")).unwrap_or_default(),
+            preflight_line(request)
+                .map(|line| format!("{line}\n"))
+                .unwrap_or_default(),
             request.reasons.join("; ")
         ));
         let keyboard = keyboard.to_string();
@@ -217,11 +223,12 @@ impl ChatTransport for TelegramTransport {
         let message_id = result
             .get("message_id")
             .and_then(Value::as_i64)
-            .ok_or_else(|| {
-                ChatError::Telegram("sendMessage: result missing message_id".into())
-            })?
+            .ok_or_else(|| ChatError::Telegram("sendMessage: result missing message_id".into()))?
             .to_string();
-        Ok(ApprovalMessage { chat_id: chat.chat_id.clone(), message_id })
+        Ok(ApprovalMessage {
+            chat_id: chat.chat_id.clone(),
+            message_id,
+        })
     }
 
     async fn edit_approval(&self, msg: &ApprovalMessage, outcome: &str) -> Result<(), ChatError> {
@@ -285,8 +292,9 @@ impl ChatTransport for TelegramTransport {
 
             if !response.ok {
                 let code = response.error_code;
-                let description =
-                    response.description.unwrap_or_else(|| "no description".to_string());
+                let description = response
+                    .description
+                    .unwrap_or_else(|| "no description".to_string());
                 if code == Some(401) || code == Some(409) {
                     // A rejected token — bad credentials or a second process
                     // holding the same bot — is not retryable: exit rather
@@ -411,8 +419,7 @@ const DEFAULT_TELEGRAM_BASE: &str = "https://api.telegram.org";
 /// The Bot API base [`serve`] roots the transport at: the value of
 /// `AMPARO_CHAT_TELEGRAM_BASE`, or [`DEFAULT_TELEGRAM_BASE`] when unset.
 fn telegram_base() -> String {
-    std::env::var("AMPARO_CHAT_TELEGRAM_BASE")
-        .unwrap_or_else(|_| DEFAULT_TELEGRAM_BASE.to_string())
+    std::env::var("AMPARO_CHAT_TELEGRAM_BASE").unwrap_or_else(|_| DEFAULT_TELEGRAM_BASE.to_string())
 }
 
 /// Serve the Telegram adapter: token fail-closed (exit 2), the shared
@@ -456,8 +463,15 @@ mod tests {
         assert!(cut.len() <= MAX_TEXT_CHARS, "cut to {len}", len = cut.len());
         assert!(cut.ends_with('…'));
         let body = cut.trim_end_matches('…');
-        assert!(body.is_char_boundary(body.len()), "the cut lands on a char boundary");
-        assert_eq!(body, &"é".repeat(body.chars().count()), "no partial characters");
+        assert!(
+            body.is_char_boundary(body.len()),
+            "the cut lands on a char boundary"
+        );
+        assert_eq!(
+            body,
+            &"é".repeat(body.chars().count()),
+            "no partial characters"
+        );
     }
 
     #[test]

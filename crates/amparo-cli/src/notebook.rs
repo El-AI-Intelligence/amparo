@@ -145,28 +145,19 @@ fn parse_flags(
             "--limit" if extras == NotebookFlagExtras::List => match iter.next() {
                 Some(n) => match n.parse::<usize>() {
                     Ok(limit) if limit > 0 => flags.limit = Some(limit),
-                    _ => {
-                        return Err(format!(
-                            "--limit must be a positive integer, got '{n}'"
-                        ))
-                    }
+                    _ => return Err(format!("--limit must be a positive integer, got '{n}'")),
                 },
                 None => return Err("--limit requires a number".into()),
             },
             "--days" if extras == NotebookFlagExtras::Rollup => match iter.next() {
                 Some(n) => match n.parse::<u64>() {
                     Ok(days) => flags.days = Some(days),
-                    _ => {
-                        return Err(format!(
-                            "--days must be a non-negative integer, got '{n}'"
-                        ))
-                    }
+                    _ => return Err(format!("--days must be a non-negative integer, got '{n}'")),
                 },
                 None => return Err("--days requires a number".into()),
             },
             "--max-bytes"
-                if extras == NotebookFlagExtras::None
-                    || extras == NotebookFlagExtras::Rollup =>
+                if extras == NotebookFlagExtras::None || extras == NotebookFlagExtras::Rollup =>
             {
                 match iter.next() {
                     Some(n) => match n.parse::<usize>() {
@@ -211,24 +202,24 @@ fn parse(args: Vec<String>) -> ParsedNotebook {
                 Err("amparo notebook list takes no positional arguments".into())
             }
         }),
-        "promote" => {
-            parse_flags(rest, NotebookFlagExtras::None).and_then(|(flags, positional)| {
-                match positional.len() {
-                    1 => Ok(NotebookCommand::Promote {
-                        id: positional.into_iter().next().expect("one positional"),
-                        flags,
-                    }),
-                    _ => Err("amparo notebook promote requires a record id".into()),
+        "promote" => parse_flags(rest, NotebookFlagExtras::None).and_then(|(flags, positional)| {
+            match positional.len() {
+                1 => Ok(NotebookCommand::Promote {
+                    id: positional.into_iter().next().expect("one positional"),
+                    flags,
+                }),
+                _ => Err("amparo notebook promote requires a record id".into()),
+            }
+        }),
+        "rollup" => {
+            parse_flags(rest, NotebookFlagExtras::Rollup).and_then(|(flags, positional)| {
+                if positional.is_empty() {
+                    Ok(NotebookCommand::Rollup(flags))
+                } else {
+                    Err("amparo notebook rollup takes no positional arguments".into())
                 }
             })
         }
-        "rollup" => parse_flags(rest, NotebookFlagExtras::Rollup).and_then(|(flags, positional)| {
-            if positional.is_empty() {
-                Ok(NotebookCommand::Rollup(flags))
-            } else {
-                Err("amparo notebook rollup takes no positional arguments".into())
-            }
-        }),
         other => Err(format!(
             "unknown notebook subcommand {other}; see `amparo notebook --help`"
         )),
@@ -284,11 +275,7 @@ fn setup_workspace(flags: &NotebookFlags) -> PathBuf {
 fn list(flags: &NotebookFlags) -> Result<(), String> {
     let workspace = setup_workspace(flags);
     let tenant = flags.tenant();
-    let rows = list_records(
-        &notebook_dir(&workspace),
-        tenant,
-        flags.limit.unwrap_or(20),
-    )?;
+    let rows = list_records(&notebook_dir(&workspace), tenant, flags.limit.unwrap_or(20))?;
     if rows.is_empty() {
         eprintln!(
             "[notebook] no records for tenant {tenant} \
@@ -300,12 +287,7 @@ fn list(flags: &NotebookFlags) -> Result<(), String> {
         let verdict = row.verification.as_deref().unwrap_or("-");
         let mut line = format!(
             "{}  {} {}/{}  {}  {}",
-            row.id,
-            row.started_at,
-            row.status,
-            verdict,
-            row.tool_sequence_hash,
-            row.task_text
+            row.id, row.started_at, row.status, verdict, row.tool_sequence_hash, row.task_text
         );
         if row.promoted {
             line.push_str("  [promoted]");
@@ -324,12 +306,7 @@ fn promote(id: &str, flags: &NotebookFlags) -> Result<(), String> {
         .max_bytes
         .unwrap_or(DEFAULT_MAX_BYTES)
         .max(MAX_BYTES_FLOOR);
-    match promote_record(
-        &notebook_dir(&workspace),
-        id,
-        max_bytes,
-        chrono::Utc::now(),
-    )? {
+    match promote_record(&notebook_dir(&workspace), id, max_bytes, chrono::Utc::now())? {
         PromoteOutcome::Promoted => {
             eprintln!("[notebook] promoted {id} to the hot layer");
         }
@@ -441,8 +418,7 @@ mod tests {
         }
         assert!(parse_error(&["promote"]).contains("requires a record id"));
         assert!(parse_error(&["promote", "a", "b"]).contains("requires a record id"));
-        assert!(parse_error(&["promote", "rec-1", "--max-bytes", "0"])
-            .contains("positive integer"));
+        assert!(parse_error(&["promote", "rec-1", "--max-bytes", "0"]).contains("positive integer"));
         // The rollup-only flags are rejected for promote.
         assert!(parse_error(&["promote", "rec-1", "--dry-run"]).contains("unknown flag --dry-run"));
     }

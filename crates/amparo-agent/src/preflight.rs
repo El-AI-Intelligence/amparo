@@ -25,9 +25,7 @@ use serde::{Deserialize, Serialize};
 /// [`BlastRadius::SubAgent`] < [`BlastRadius::Network`] <
 /// [`BlastRadius::SystemWide`] < [`BlastRadius::Destructive`] (the
 /// discriminants are the rank).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlastRadius {
     /// Observes only — reads and searches, no mutation anywhere.
@@ -86,7 +84,13 @@ impl std::fmt::Display for BlastRadius {
 /// The file tools whose `path` argument gets the workspace-boundary
 /// inspection: an absolute path outside the workspace, `/tmp` and
 /// `/dev/shm` labels the call [`BlastRadius::SystemWide`].
-const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "patch_file", "list_dir"];
+const FILE_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "patch_file",
+    "list_dir",
+];
 
 /// Command tokens that transfer data over the network. Matched as whole
 /// shell words (case-insensitive), so `sync` does not trip `nc`.
@@ -123,6 +127,15 @@ pub fn classify(registry: &ToolRegistry, policy: &PathPolicy, call: &ToolCall) -
         return BlastRadius::SubAgent;
     }
 
+    // Static override (M8 W5): `schedule` records a promise that a fresh
+    // agent will run later — possibly while the requester is absent. The
+    // fire re-enters the full gate chain, but the promise itself is a
+    // deferred autonomous act, so it is labeled the honest worst case:
+    // system-wide. Display-only; the tier is unchanged.
+    if call.name == "schedule" {
+        return BlastRadius::SystemWide;
+    }
+
     let mut radius = match registry.get_tier(&call.name) {
         Some(ToolTrustTier::Observational) => BlastRadius::ReadOnly,
         Some(ToolTrustTier::LocalMutating) => BlastRadius::WorkspaceLocal,
@@ -157,7 +170,11 @@ pub fn classify(registry: &ToolRegistry, policy: &PathPolicy, call: &ToolCall) -
 fn transfers_over_network(command: &str) -> bool {
     command
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|token| NETWORK_COMMANDS.iter().any(|known| token.eq_ignore_ascii_case(known)))
+        .any(|token| {
+            NETWORK_COMMANDS
+                .iter()
+                .any(|known| token.eq_ignore_ascii_case(known))
+        })
 }
 
 /// Is `path` an absolute path outside the workspace and the shared
@@ -183,7 +200,7 @@ fn outside_workspace(path: &str, workspace_root: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amparo_tools::registry::{ToolSchema, ToolExecutor, ToolParam};
+    use amparo_tools::registry::{ToolExecutor, ToolParam, ToolSchema};
     use async_trait::async_trait;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -220,7 +237,10 @@ mod tests {
     fn registry(tools: &[(&'static str, ToolTrustTier)]) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         for (name, tier) in tools {
-            registry.register(Arc::new(StubTool { name: *name, tier: *tier }));
+            registry.register(Arc::new(StubTool {
+                name: *name,
+                tier: *tier,
+            }));
         }
         registry
     }
@@ -230,7 +250,11 @@ mod tests {
     }
 
     fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
-        ToolCall { id: "call_1".to_string(), name: name.to_string(), arguments }
+        ToolCall {
+            id: "call_1".to_string(),
+            name: name.to_string(),
+            arguments,
+        }
     }
 
     #[test]
@@ -257,15 +281,27 @@ mod tests {
 
     #[test]
     fn notes_explain_the_consequence() {
-        assert_eq!(BlastRadius::ReadOnly.note(), "observes only; nothing is modified");
-        assert_eq!(BlastRadius::WorkspaceLocal.note(), "changes stay inside the workspace");
+        assert_eq!(
+            BlastRadius::ReadOnly.note(),
+            "observes only; nothing is modified"
+        );
+        assert_eq!(
+            BlastRadius::WorkspaceLocal.note(),
+            "changes stay inside the workspace"
+        );
         assert_eq!(
             BlastRadius::SubAgent.note(),
             "spawns a sub-agent that acts under the same gate chain"
         );
         assert_eq!(BlastRadius::Network.note(), "reaches the network");
-        assert_eq!(BlastRadius::SystemWide.note(), "touches files outside the workspace");
-        assert_eq!(BlastRadius::Destructive.note(), "matches a blocked destructive pattern");
+        assert_eq!(
+            BlastRadius::SystemWide.note(),
+            "touches files outside the workspace"
+        );
+        assert_eq!(
+            BlastRadius::Destructive.note(),
+            "matches a blocked destructive pattern"
+        );
     }
 
     #[test]
@@ -278,17 +314,33 @@ mod tests {
         ]);
         let policy = policy();
         let bare = serde_json::json!({});
-        assert_eq!(classify(&registry, &policy, &call("observe", bare.clone())), BlastRadius::ReadOnly);
-        assert_eq!(classify(&registry, &policy, &call("mutate", bare.clone())), BlastRadius::WorkspaceLocal);
-        assert_eq!(classify(&registry, &policy, &call("effect", bare.clone())), BlastRadius::Network);
-        assert_eq!(classify(&registry, &policy, &call("control", bare)), BlastRadius::SystemWide);
+        assert_eq!(
+            classify(&registry, &policy, &call("observe", bare.clone())),
+            BlastRadius::ReadOnly
+        );
+        assert_eq!(
+            classify(&registry, &policy, &call("mutate", bare.clone())),
+            BlastRadius::WorkspaceLocal
+        );
+        assert_eq!(
+            classify(&registry, &policy, &call("effect", bare.clone())),
+            BlastRadius::Network
+        );
+        assert_eq!(
+            classify(&registry, &policy, &call("control", bare)),
+            BlastRadius::SystemWide
+        );
     }
 
     #[test]
     fn unknown_tool_is_labeled_system_wide() {
         let registry = registry(&[]);
         assert_eq!(
-            classify(&registry, &policy(), &call("no_such_tool", serde_json::json!({}))),
+            classify(
+                &registry,
+                &policy(),
+                &call("no_such_tool", serde_json::json!({}))
+            ),
             BlastRadius::SystemWide
         );
     }
@@ -297,8 +349,14 @@ mod tests {
     fn destructive_pattern_raises_to_destructive() {
         let registry = registry(&[("run_command", ToolTrustTier::ExternalEffector)]);
         let policy = policy();
-        let destructive = call("run_command", serde_json::json!({"command": "sudo rm -rf /"}));
-        assert_eq!(classify(&registry, &policy, &destructive), BlastRadius::Destructive);
+        let destructive = call(
+            "run_command",
+            serde_json::json!({"command": "sudo rm -rf /"}),
+        );
+        assert_eq!(
+            classify(&registry, &policy, &destructive),
+            BlastRadius::Destructive
+        );
         // Benign commands keep the tier seed.
         let benign = call("run_command", serde_json::json!({"command": "git status"}));
         assert_eq!(classify(&registry, &policy, &benign), BlastRadius::Network);
@@ -311,7 +369,10 @@ mod tests {
         // blocklist, so the network refinement is what fires.
         let registry = registry(&[("run_command", ToolTrustTier::Observational)]);
         let policy = policy();
-        let cmd = call("run_command", serde_json::json!({"command": "ssh deploy@box"}));
+        let cmd = call(
+            "run_command",
+            serde_json::json!({"command": "ssh deploy@box"}),
+        );
         assert_eq!(classify(&registry, &policy, &cmd), BlastRadius::Network);
     }
 
@@ -321,7 +382,10 @@ mod tests {
         // match wins over the network refinement — first raise wins.
         let registry = registry(&[("run_command", ToolTrustTier::Observational)]);
         let policy = policy();
-        let cmd = call("run_command", serde_json::json!({"command": "curl -s http://x"}));
+        let cmd = call(
+            "run_command",
+            serde_json::json!({"command": "curl -s http://x"}),
+        );
         assert_eq!(classify(&registry, &policy, &cmd), BlastRadius::Destructive);
     }
 
@@ -339,15 +403,30 @@ mod tests {
         let registry = registry(&[("write_file", ToolTrustTier::LocalMutating)]);
         let policy = policy();
         let outside = call("write_file", serde_json::json!({"path": "/etc/passwd"}));
-        assert_eq!(classify(&registry, &policy, &outside), BlastRadius::SystemWide);
+        assert_eq!(
+            classify(&registry, &policy, &outside),
+            BlastRadius::SystemWide
+        );
         // The shared scratch dirs and the workspace itself stay local…
         let scratch = call("write_file", serde_json::json!({"path": "/tmp/out.txt"}));
-        assert_eq!(classify(&registry, &policy, &scratch), BlastRadius::WorkspaceLocal);
-        let inside = call("write_file", serde_json::json!({"path": "/tmp/amparo-ws/out.txt"}));
-        assert_eq!(classify(&registry, &policy, &inside), BlastRadius::WorkspaceLocal);
+        assert_eq!(
+            classify(&registry, &policy, &scratch),
+            BlastRadius::WorkspaceLocal
+        );
+        let inside = call(
+            "write_file",
+            serde_json::json!({"path": "/tmp/amparo-ws/out.txt"}),
+        );
+        assert_eq!(
+            classify(&registry, &policy, &inside),
+            BlastRadius::WorkspaceLocal
+        );
         // …and relative paths never leave the workspace.
         let relative = call("write_file", serde_json::json!({"path": "notes.txt"}));
-        assert_eq!(classify(&registry, &policy, &relative), BlastRadius::WorkspaceLocal);
+        assert_eq!(
+            classify(&registry, &policy, &relative),
+            BlastRadius::WorkspaceLocal
+        );
     }
 
     #[test]
@@ -381,11 +460,31 @@ mod tests {
     }
 
     #[test]
+    fn schedule_is_labeled_system_wide_despite_the_effector_tier() {
+        // A schedule promise always asks a human (ExternalEffector), but
+        // its radius is the honest worst case: a deferred autonomous act.
+        let registry = registry(&[("schedule", ToolTrustTier::ExternalEffector)]);
+        let policy = policy();
+        let call = call(
+            "schedule",
+            serde_json::json!({"at": "2026-08-30T17:00:00Z", "task": "summarize"}),
+        );
+        assert_eq!(classify(&registry, &policy, &call), BlastRadius::SystemWide);
+        assert_eq!(
+            registry.get_tier("schedule"),
+            Some(ToolTrustTier::ExternalEffector)
+        );
+    }
+
+    #[test]
     fn non_file_tools_skip_the_path_inspection() {
         // fetch_url takes no "path"; its Network seed stands regardless.
         let registry = registry(&[("fetch_url", ToolTrustTier::ExternalEffector)]);
         let policy = policy();
-        let call = call("fetch_url", serde_json::json!({"url": "http://example.com"}));
+        let call = call(
+            "fetch_url",
+            serde_json::json!({"url": "http://example.com"}),
+        );
         assert_eq!(classify(&registry, &policy, &call), BlastRadius::Network);
     }
 }

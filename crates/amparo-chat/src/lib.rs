@@ -36,22 +36,26 @@
 extern crate self as amparo_chat;
 
 pub mod config;
-pub mod transport;
-pub mod router;
-pub mod gate;
-pub mod sink;
-pub mod driver;
-pub mod dispatch;
-pub mod telegram;
 pub mod discord;
+pub mod dispatch;
+pub mod driver;
+pub mod gate;
+pub mod router;
+pub mod schedule;
+pub mod sink;
 pub mod slack;
+pub mod telegram;
+pub mod transport;
 
 pub use config::{ChatConfig, ConfigError, UserProfile};
+pub use driver::{ChatDriver, PolicySource, Tenants};
+pub use gate::{ChatApprovalGate, TimeoutApprovalGate};
 pub use router::{ApprovalRouter, TakeResult};
+pub use schedule::{
+    schedule_dir, JsonScheduleStore, ScheduleStore, ScheduleTool, ScheduledStatus, ScheduledTask,
+};
+pub use sink::ChatEventSink;
 pub use transport::{
     ApprovalButtonPress, ApprovalMessage, ChatError, ChatRef, ChatTransport, IncomingMessage,
     PressOutcome,
 };
-pub use gate::ChatApprovalGate;
-pub use sink::ChatEventSink;
-pub use driver::{ChatDriver, PolicySource, Tenants};

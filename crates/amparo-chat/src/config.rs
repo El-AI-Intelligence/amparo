@@ -104,7 +104,9 @@ impl ChatConfig {
             }
             if let Some(workspace) = &profile.workspace {
                 if workspace.is_absolute()
-                    || workspace.components().any(|c| matches!(c, Component::ParentDir))
+                    || workspace
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir))
                 {
                     return Err(ConfigError::WorkspacePath {
                         path: path.to_path_buf(),
@@ -229,7 +231,10 @@ mod tests {
 
     #[test]
     fn unknown_field_is_a_parse_error() {
-        let path = write_cfg("unknown_field", "[users.\"telegram:111\"]\nno_such_field = 1\n");
+        let path = write_cfg(
+            "unknown_field",
+            "[users.\"telegram:111\"]\nno_such_field = 1\n",
+        );
         let err = ChatConfig::load(&path).unwrap_err();
         std::fs::remove_file(&path).unwrap();
         match &err {
@@ -361,7 +366,10 @@ mod tests {
 
     #[test]
     fn zero_ledger_quota_is_rejected() {
-        let path = write_cfg("zero_quota", "[users.\"telegram:111\"]\nledger_max_bytes = 0\n");
+        let path = write_cfg(
+            "zero_quota",
+            "[users.\"telegram:111\"]\nledger_max_bytes = 0\n",
+        );
         let err = ChatConfig::load(&path).unwrap_err();
         std::fs::remove_file(&path).unwrap();
         match &err {

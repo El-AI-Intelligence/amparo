@@ -6,8 +6,12 @@
 //! can never take down a receive loop.
 
 use crate::config::{ChatConfig, SwarmProfile, UserProfile};
-use crate::gate::ChatApprovalGate;
+use crate::gate::{ChatApprovalGate, TimeoutApprovalGate};
 use crate::router::{ApprovalRouter, TakeResult};
+use crate::schedule::{
+    due_scan, schedule_dir, JsonScheduleStore, ScheduleStore, ScheduleTool, ScheduledStatus,
+    ScheduledTask,
+};
 use crate::sink::ChatEventSink;
 use crate::transport::{drain_outbox, ApprovalButtonPress, ChatRef, ChatTransport, PressOutcome};
 use amparo_agent::{
@@ -25,6 +29,7 @@ use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore, PrivacyPolicy};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::registry::default_registry_with_policy;
 use amparo_tools::{Memory, PathPolicy, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool};
+use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -33,6 +38,21 @@ use std::sync::{Arc, Mutex};
 /// pending approval — their press is ignored, the buttons stay, and the
 /// requester's own press still routes.
 pub const WRONG_USER_TOAST: &str = "Only the user who started the task can decide.";
+
+/// How often the schedule ticker scans the queue (M8 W5). The ticker
+/// keeps its cadence however long a scan takes (the interval's
+/// `MissedTickBehavior::Delay`).
+pub const SCHEDULE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long after its instant a due promise stays firable — two ticks
+/// (M8 W5). A pending promise whose instant passed further back is
+/// marked missed: fail-closed, never fired late.
+pub const SCHEDULE_GRACE: chrono::Duration = chrono::Duration::seconds(60);
+
+/// How long a scheduled fire's approval may wait in total (M8 W5): the
+/// inner chat gate's own timeout plus a margin — belt-and-braces over a
+/// stalled gate, never a tighter deadline than the gate's own ask.
+pub const SCHEDULE_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// A claim on a chat: while it lives, no second task may start in that
 /// chat. Dropping it — however the task ends — releases the claim, so the
@@ -56,6 +76,19 @@ fn new_task_id() -> String {
 impl Drop for ChatClaim {
     fn drop(&mut self) {
         self.busy.lock().unwrap().remove(&self.chat_id);
+    }
+}
+
+/// Rebuild a [`ChatRef`] for one queued promise (M8 W5). The promise
+/// stored its platform name as a `String`; `ChatRef` carries the
+/// adapter's `&'static str`. The stored name is leaked back into a
+/// static — one small allocation per fire or miss, bounded by the
+/// queue, and the values come from the adapters' own literals.
+fn chat_ref_for(task: &ScheduledTask) -> ChatRef {
+    ChatRef {
+        platform: Box::leak(task.platform.clone().into_boxed_str()),
+        chat_id: task.chat_id.clone(),
+        user_id: task.requester.clone(),
     }
 }
 
@@ -627,7 +660,7 @@ impl ChatDriver {
                 // Checkpoints (M7 W8): every loop iteration snapshots
                 // through the tenant-tagged store; the continuity context
                 // (if any) carries the prior task's tail into this one.
-                .with_checkpoints(checkpoint_store, checkpoint_tenant)
+                .with_checkpoints(checkpoint_store, checkpoint_tenant.clone())
                 .with_continuity(continuity);
             if let Some(privacy) = privacy {
                 agent = agent.with_privacy(privacy);
@@ -658,6 +691,22 @@ impl ChatDriver {
             } else {
                 None
             };
+            // The schedule queue (M8 W5): with the profile's `schedule`
+            // flag on, this task can persist a promise into the
+            // driver-wide queue dir. Registered AFTER `with_spawn_agent`
+            // — the spawn tool captured the agent's parts before this
+            // call — so children never inherit it: only a top-level task
+            // may schedule.
+            if swarm.schedule {
+                let store = Arc::new(JsonScheduleStore::new(schedule_dir(&workspace_root)));
+                agent = agent.with_tool(Arc::new(ScheduleTool::new(
+                    store,
+                    checkpoint_tenant.clone(),
+                    chat.platform,
+                    chat.chat_id.clone(),
+                    chat.user_id.clone(),
+                )));
+            }
 
             // Run inside its own spawn so a panic becomes a JoinError
             // instead of taking down this task — and the receive loop.
@@ -722,6 +771,259 @@ impl ChatDriver {
             TakeResult::WrongUser => PressOutcome::WrongUser,
         }
     }
+
+    /// Start the schedule ticker (M8 W5): scan the queue every
+    /// [`SCHEDULE_TICK`] until the process ends. The first tick is
+    /// immediate, so a promise that became due while the host was down
+    /// fires on startup (within the grace window).
+    pub fn start_scheduler(self: &Arc<Self>) {
+        let driver = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SCHEDULE_TICK);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let scan = driver.scan_schedules(Utc::now()).await;
+                if scan.fired > 0 || scan.missed > 0 {
+                    eprintln!(
+                        "[schedule] tick: fired {}, missed {}",
+                        scan.fired, scan.missed
+                    );
+                }
+            }
+        });
+    }
+
+    /// One scheduler tick (M8 W5): scan the shared queue at `now`, mark
+    /// the missed promises fail-closed, and hand each due promise its
+    /// fire. `now` is a parameter — the clock seam — so tests can drive
+    /// a fire without sleeping.
+    ///
+    /// A due promise whose chat is busy (a live task owns it) stays
+    /// pending: it is retried on the next tick, and past the grace
+    /// window the scan marks it missed. Each fire runs in its own
+    /// spawned future, so a panicking fire can never take down the
+    /// ticker.
+    pub async fn scan_schedules(self: &Arc<Self>, now: DateTime<Utc>) -> ScheduleScan {
+        let store = Arc::new(JsonScheduleStore::new(schedule_dir(&self.workspace_root)));
+        let tasks = store.load_all();
+        let (due, missed) = due_scan(&tasks, now, SCHEDULE_GRACE);
+        let mut fired = 0;
+        for index in due {
+            let task = tasks[index].clone();
+            // The chat claim, exactly like a live message: inserted
+            // synchronously (never held across an await), released by
+            // the fire future's drop guard.
+            {
+                let mut busy = self.busy.lock().unwrap();
+                if busy.contains(&task.chat_id) {
+                    continue; // busy → stays pending, retried next tick
+                }
+                busy.insert(task.chat_id.clone());
+            }
+            fired += 1;
+            let driver = Arc::clone(self);
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                driver.fire_schedule(store, task).await;
+            });
+        }
+        for &index in &missed {
+            let mut task = tasks[index].clone();
+            let chat = chat_ref_for(&task);
+            self.miss(
+                &store,
+                &mut task,
+                &chat,
+                "the instant passed and the promise was never fired. Re-schedule it if it \
+                 still matters.",
+            )
+            .await;
+        }
+        ScheduleScan {
+            fired,
+            missed: missed.len(),
+        }
+    }
+
+    /// Mark a promise missed with a note and tell the requester (M8
+    /// W5). A failed write leaves the promise as it stands — the next
+    /// tick re-marks it.
+    async fn miss(
+        &self,
+        store: &JsonScheduleStore,
+        task: &mut ScheduledTask,
+        chat: &ChatRef,
+        note: &str,
+    ) {
+        task.status = ScheduledStatus::Missed;
+        task.result = Some(note.to_string());
+        if let Err(e) = store.save(task) {
+            eprintln!("[schedule] cannot mark {} missed: {e}", task.id);
+            return;
+        }
+        let _ = self
+            .transport
+            .send_text(chat, &format!("[schedule] {} missed — {note}", task.id))
+            .await;
+    }
+
+    /// Fire one due promise (M8 W5): rebuild the requester's per-task
+    /// parts and run a fresh agent through the full gate chain — the
+    /// same policy engine, human-approval gate, privacy ledger and
+    /// checkpoints a live task gets — then record the outcome on the
+    /// promise and report back to the chat.
+    ///
+    /// The fire is a fresh top-level task, deliberately reduced: no
+    /// skills, case library, sub-agents, scheduling or prior-chat
+    /// continuity — the promise names one concrete task, and the firing
+    /// path stays legible. A fire while nobody is present runs to the
+    /// approval gate and auto-denies on timeout: a scheduled promise
+    /// never executes silently ahead of the gate.
+    async fn fire_schedule(&self, store: Arc<JsonScheduleStore>, mut task: ScheduledTask) {
+        let chat = chat_ref_for(&task);
+        // The claim scan_schedules inserted; dropping it — however the
+        // fire ends — releases the chat.
+        let _claim = ChatClaim {
+            busy: Arc::clone(&self.busy),
+            chat_id: chat.chat_id.clone(),
+        };
+
+        // The requester must still be able to start tasks, and their
+        // parts must still resolve — a promise made under a tenant that
+        // since lost authorization (or a hostile workspace) is never
+        // fired. Fail-closed: marked missed with a note.
+        if !self.allows(&chat) {
+            self.miss(
+                &store,
+                &mut task,
+                &chat,
+                "the requester is no longer authorized to \
+                 start tasks.",
+            )
+            .await;
+            return;
+        }
+        let Some(parts) = self.task_parts(&chat) else {
+            self.miss(
+                &store,
+                &mut task,
+                &chat,
+                "the requester's workspace no longer resolves.",
+            )
+            .await;
+            return;
+        };
+        let TaskParts {
+            policy,
+            registry,
+            trust_ceiling,
+            path_policy,
+            ledger_root,
+            ledger_max_bytes,
+            ..
+        } = parts;
+
+        // Progress events stream through a best-effort outbox, and the
+        // privacy ledger is always-on (an I6 instrument, never fatal) —
+        // both exactly like a live task.
+        let (chat_sink, rx) = ChatEventSink::channel();
+        let ledger_sink: Option<Arc<LedgerSink>> = match LedgerStore::open_with_quota(
+            privacy_dir(&ledger_root).join("ledger.jsonl"),
+            ledger_max_bytes.map(LedgerQuota::new),
+        ) {
+            Ok(store) => Some(Arc::new(LedgerSink::new(
+                store,
+                task.tenant.clone(),
+                Some(new_task_id()),
+                None,
+            ))),
+            Err(e) => {
+                eprintln!(
+                    "[ledger] unavailable — the fire continues without the privacy ledger: {e}"
+                );
+                None
+            }
+        };
+        let mut sinks: Vec<Arc<dyn EventSink>> = vec![chat_sink];
+        if let Some(ledger) = &ledger_sink {
+            sinks.push(Arc::clone(ledger) as Arc<dyn EventSink>);
+        }
+        let sink: Arc<dyn EventSink> = if sinks.len() == 1 {
+            sinks.pop().expect("at least one sink")
+        } else {
+            Arc::new(FanoutSink::new(sinks))
+        };
+        let drain_transport = Arc::clone(&self.transport);
+        let drain_chat = chat.clone();
+        tokio::spawn(async move {
+            let _ = drain_outbox(&drain_transport, drain_chat, rx).await;
+        });
+
+        // The approval gate: the chat gate (buttons, auto-deny on its
+        // own timeout) wrapped in the timeout wrapper — belt and
+        // braces, so a fire with nobody present auto-denies at the
+        // gate, never silently ahead of it.
+        let gate = Arc::new(TimeoutApprovalGate::new(
+            Arc::new(ChatApprovalGate::new(
+                Arc::clone(&self.transport),
+                Arc::clone(&self.router),
+                self.auto_approve,
+                chat.clone(),
+            )),
+            SCHEDULE_APPROVAL_TIMEOUT,
+        ));
+        // Checkpoints are written like any task (one format, both
+        // hosts) but continuity is OFF: the promise names one concrete
+        // fresh task.
+        let checkpoint_store = Arc::new(JsonCheckpointStore::new(&ledger_root));
+        let mut agent = Agent::new(Arc::clone(&self.provider), registry, Arc::clone(&policy))
+            .with_events(sink)
+            .with_approval(gate)
+            .with_path_policy(Arc::clone(&path_policy))
+            .with_checkpoints(checkpoint_store, task.tenant.clone())
+            .with_config(AgentConfig {
+                trust_ceiling,
+                ..AgentConfig::default()
+            });
+        if let Some(privacy) = &self.privacy {
+            agent = agent.with_privacy(Arc::clone(privacy));
+        }
+        // Run inside its own spawn so a panic becomes a JoinError
+        // instead of taking down the ticker. The task text is cloned
+        // before the spawn — the promise record stays intact here.
+        let task_text = task.task.clone();
+        let run = tokio::spawn(async move { agent.run(task_text).await });
+        let answer = match run.await {
+            Ok(report) => report
+                .final_answer
+                .unwrap_or_else(|| "The task failed — no final answer was produced.".to_string()),
+            Err(_) => "The task crashed".to_string(),
+        };
+        task.status = ScheduledStatus::Fired;
+        task.result = Some(answer.clone());
+        if let Err(e) = store.save(&task) {
+            eprintln!(
+                "[schedule] cannot record the fired promise {}: {e}",
+                task.id
+            );
+        }
+        let _ = self
+            .transport
+            .send_text(&chat, &format!("[schedule] {} fired — {answer}", task.id))
+            .await;
+    }
+}
+
+/// One scheduler tick's outcome (M8 W5): how many promises fired and
+/// how many were marked missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleScan {
+    /// Promises handed their fire this tick (busy chats excluded —
+    /// those stay pending and are retried on the next tick).
+    pub fired: usize,
+    /// Promises marked missed this tick — fail-closed, never fired late.
+    pub missed: usize,
 }
 
 #[cfg(test)]
@@ -1899,6 +2201,269 @@ mod tests {
             "both of user_a's tasks checkpointed: {a_files:?}"
         );
         assert_eq!(b_files.len(), 1, "user_b's task checkpointed: {b_files:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─────────────────────────────── M8 W5 schedule queue ────────────────────
+
+    fn swarm_profile(max_sub_agents: usize, schedule: bool) -> SwarmProfile {
+        SwarmProfile {
+            max_sub_agents,
+            schedule,
+        }
+    }
+
+    fn profile_with_swarm(swarm: SwarmProfile) -> UserProfile {
+        UserProfile {
+            swarm: Some(swarm),
+            ..profile()
+        }
+    }
+
+    /// Write one pending promise straight into the queue dir — the
+    /// scheduler tests seed the queue without a live task.
+    fn seed_promise(root: &Path, id: &str, tenant: &str, chat_id: &str, at: &str) {
+        let store = JsonScheduleStore::new(schedule_dir(root));
+        store
+            .save(&ScheduledTask {
+                id: id.to_string(),
+                tenant: tenant.to_string(),
+                platform: "mock".to_string(),
+                chat_id: chat_id.to_string(),
+                requester: "user_1".to_string(),
+                task: "run the standing task".to_string(),
+                at: at.to_string(),
+                status: ScheduledStatus::Pending,
+                result: None,
+            })
+            .unwrap();
+    }
+
+    fn queue_status(root: &Path, id: &str) -> Option<ScheduledStatus> {
+        JsonScheduleStore::new(schedule_dir(root))
+            .load(id)
+            .unwrap()
+            .map(|task| task.status)
+    }
+
+    #[tokio::test]
+    async fn schedule_tool_registers_only_when_the_profile_opens_it() {
+        // Two directory-mode tenants share one driver-wide queue dir:
+        // user_on has `schedule = true`, user_off the default (off).
+        // The same scripted task — one `schedule` call — persists a
+        // promise for user_on; for user_off the tool is unknown and the
+        // call is blocked (the loop answers the model with the failure).
+        let root = std::env::temp_dir().join(format!("amparo-schedule-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        let at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let script = |at: String| {
+            vec![
+                turn_tool_call(
+                    "call_1",
+                    "schedule",
+                    &format!(r#"{{"at":"{at}","task":"summarize the logs"}}"#),
+                ),
+                turn_text("Done."),
+            ]
+        };
+        // Both chats stream the same two-turn script — the FIFO provider
+        // hands one turn per request, in order.
+        let mut scripts = script(at.clone());
+        scripts.extend(script(at));
+        let provider = StubProvider::new(scripts);
+        let mut users = BTreeMap::new();
+        users.insert(
+            "mock:user_on".to_string(),
+            profile_with_swarm(swarm_profile(0, true)),
+        );
+        users.insert("mock:user_off".to_string(), profile());
+        let driver = driver_directory(users, transport.clone(), provider, true, root.clone());
+
+        driver
+            .on_message(chat_for("user_on"), "schedule something".into())
+            .await;
+        wait_until(|| transport.texts().iter().any(|t| t.contains("Done."))).await;
+        driver
+            .on_message(chat_for("user_off"), "schedule something".into())
+            .await;
+        wait_until(|| {
+            transport
+                .texts()
+                .iter()
+                .filter(|t| t.contains("Done."))
+                .count()
+                >= 2
+        })
+        .await;
+
+        // Only user_on's promise persisted — one pending, tenant-tagged
+        // entry in the driver-wide queue.
+        let tasks = JsonScheduleStore::new(schedule_dir(&root)).load_all();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "only user_on's promise persisted: {tasks:?}"
+        );
+        assert_eq!(tasks[0].tenant, "mock:user_on");
+        assert_eq!(tasks[0].status, ScheduledStatus::Pending);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn scheduled_fire_reruns_the_chain_and_reports() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-schedule-fire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![turn_text("Fired answer.")]);
+        let users = BTreeMap::from([("mock:user_1".to_string(), profile())]);
+        let driver = Arc::new(driver_directory(
+            users,
+            transport.clone(),
+            provider.clone(),
+            true,
+            root.clone(),
+        ));
+
+        // A promise 30 s past its instant — within the grace window, so
+        // the scan fires it rather than marking it missed.
+        let at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        seed_promise(&root, "sched-fire-1", "mock:user_1", "chat_user_1", &at);
+
+        let scan = driver.scan_schedules(Utc::now()).await;
+        assert_eq!(
+            scan,
+            ScheduleScan {
+                fired: 1,
+                missed: 0
+            }
+        );
+
+        let line = wait_for_text(&transport, "[schedule] sched-fire-1 fired").await;
+        assert!(line.contains("Fired answer."), "{line}");
+        // The promise is terminal, with the answer recorded on it.
+        let task = JsonScheduleStore::new(schedule_dir(&root))
+            .load("sched-fire-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, ScheduledStatus::Fired);
+        assert_eq!(task.result.as_deref(), Some("Fired answer."));
+        // The fire re-entered the chain: the provider saw one chat call.
+        assert_eq!(provider.recorded_requests().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stale_promise_is_marked_missed_and_never_fired() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-schedule-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![turn_text("Should never run.")]);
+        let users = BTreeMap::from([("mock:user_1".to_string(), profile())]);
+        let driver = Arc::new(driver_directory(
+            users,
+            transport.clone(),
+            provider.clone(),
+            true,
+            root.clone(),
+        ));
+
+        // Two hours past its instant — far beyond the grace window.
+        let at = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        seed_promise(&root, "sched-miss-1", "mock:user_1", "chat_user_1", &at);
+
+        let scan = driver.scan_schedules(Utc::now()).await;
+        assert_eq!(
+            scan,
+            ScheduleScan {
+                fired: 0,
+                missed: 1
+            }
+        );
+
+        let line = wait_for_text(&transport, "[schedule] sched-miss-1 missed").await;
+        assert!(line.contains("never fired"), "{line}");
+        let task = JsonScheduleStore::new(schedule_dir(&root))
+            .load("sched-miss-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, ScheduledStatus::Missed);
+        assert!(
+            task.result.as_deref().unwrap().contains("never fired"),
+            "{task:?}"
+        );
+        // Fail-closed: the promise never re-entered the chain.
+        assert!(
+            provider.recorded_requests().is_empty(),
+            "a missed promise must never run"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn busy_chat_leaves_the_promise_pending_for_the_next_tick() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-schedule-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![turn_text("Fired answer.")]);
+        let users = BTreeMap::from([("mock:user_1".to_string(), profile())]);
+        let driver = Arc::new(driver_directory(
+            users,
+            transport.clone(),
+            provider,
+            true,
+            root.clone(),
+        ));
+
+        let at = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        seed_promise(&root, "sched-busy-1", "mock:user_1", "chat_user_1", &at);
+
+        // A live task owns the chat — the fire must wait, not run
+        // alongside it.
+        driver
+            .busy
+            .lock()
+            .unwrap()
+            .insert("chat_user_1".to_string());
+        let scan = driver.scan_schedules(Utc::now()).await;
+        assert_eq!(
+            scan,
+            ScheduleScan {
+                fired: 0,
+                missed: 0
+            },
+            "busy chats are skipped, not missed"
+        );
+        assert_eq!(
+            queue_status(&root, "sched-busy-1"),
+            Some(ScheduledStatus::Pending),
+            "the promise stays pending while the chat is busy"
+        );
+        assert!(
+            transport.texts().iter().all(|t| !t.contains("[schedule]")),
+            "nothing fires while the chat is busy: {:?}",
+            transport.texts()
+        );
+
+        // The chat frees up — the next tick fires the promise (still
+        // within the grace window).
+        driver.busy.lock().unwrap().remove("chat_user_1");
+        let scan = driver.scan_schedules(Utc::now()).await;
+        assert_eq!(
+            scan,
+            ScheduleScan {
+                fired: 1,
+                missed: 0
+            }
+        );
+        wait_for_text(&transport, "[schedule] sched-busy-1 fired").await;
+        assert_eq!(
+            queue_status(&root, "sched-busy-1"),
+            Some(ScheduledStatus::Fired)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -25,7 +25,7 @@ use crate::driver::{ChatDriver, PolicySource, Tenants};
 use crate::router::ApprovalRouter;
 use crate::transport::ChatTransport;
 use amparo_inference::InferenceConfig;
-use amparo_notebook::{notebook_dir, HOT_FILE, JsonlStore};
+use amparo_notebook::{notebook_dir, JsonlStore, HOT_FILE};
 use amparo_policy::{AllowAllPolicyEngine, DenyAllPolicyEngine};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{default_registry, ToolTrustTier};
@@ -167,7 +167,10 @@ pub struct ChatServeError {
 impl ChatServeError {
     /// A serve failure with `message` and `exit_code`.
     pub fn new(message: impl Into<String>, exit_code: i32) -> Self {
-        Self { message: message.into(), exit_code }
+        Self {
+            message: message.into(),
+            exit_code,
+        }
     }
 }
 
@@ -206,13 +209,9 @@ pub fn parse_chat_flags(args: impl Iterator<Item = String>) -> ParseChatResult {
                     "local_mutating" => flags.trust_ceiling = ToolTrustTier::LocalMutating,
                     "external_effector" => flags.trust_ceiling = ToolTrustTier::ExternalEffector,
                     "system_control" => flags.trust_ceiling = ToolTrustTier::SystemControl,
-                    other => {
-                        return ParseChatResult::Error(format!("unknown trust tier {other}"))
-                    }
+                    other => return ParseChatResult::Error(format!("unknown trust tier {other}")),
                 },
-                None => {
-                    return ParseChatResult::Error("--trust-ceiling requires a tier".into())
-                }
+                None => return ParseChatResult::Error("--trust-ceiling requires a tier".into()),
             },
             "--help" | "-h" => return ParseChatResult::Help,
             other if other.starts_with('-') => {
@@ -279,7 +278,9 @@ pub async fn build_driver(
             1,
         )
     })?;
-    let provider = config.build().map_err(|e| ChatServeError::new(e.to_string(), 1))?;
+    let provider = config
+        .build()
+        .map_err(|e| ChatServeError::new(e.to_string(), 1))?;
 
     let mut registry = default_registry();
     // M7b: the sandbox tool is host-registered, like use_skill. This
@@ -290,7 +291,10 @@ pub async fn build_driver(
     let policy_source = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {
             let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
-            PolicySource::Wire { base_url: url.clone(), api_key }
+            PolicySource::Wire {
+                base_url: url.clone(),
+                api_key,
+            }
         }
         (None, true) => PolicySource::Shared(Arc::new(AllowAllPolicyEngine)),
         (None, false) => PolicySource::Shared(Arc::new(DenyAllPolicyEngine::new(
@@ -305,8 +309,8 @@ pub async fn build_driver(
         .or_else(|| std::env::var("AMPARO_CHAT_CONFIG").ok().map(PathBuf::from))
     {
         Some(path) => {
-            let config = ChatConfig::load(&path)
-                .map_err(|e| ChatServeError::new(e.to_string(), 2))?;
+            let config =
+                ChatConfig::load(&path).map_err(|e| ChatServeError::new(e.to_string(), 2))?;
             if config.is_empty() {
                 eprintln!(
                     "warning: no users in chat config {} — every message will be refused",
@@ -328,8 +332,9 @@ pub async fn build_driver(
     };
 
     let router = Arc::new(ApprovalRouter::new());
-    let workspace_root =
-        std::env::var("AMPARO_WORKSPACE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    let workspace_root = std::env::var("AMPARO_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
     // The growth notebook's directory is resolved before the root moves
     // into the driver; without --growth nothing is opened and nothing is
     // recorded.
@@ -348,9 +353,8 @@ pub async fn build_driver(
     .with_trust_ceiling(flags.trust_ceiling);
     if let Some(nb_dir) = nb_dir {
         let path = nb_dir.join("records.jsonl");
-        let store = JsonlStore::open(&path).map_err(|e| {
-            ChatServeError::new(format!("cannot open the growth notebook: {e}"), 2)
-        })?;
+        let store = JsonlStore::open(&path)
+            .map_err(|e| ChatServeError::new(format!("cannot open the growth notebook: {e}"), 2))?;
         // The hot layer (M6e): the informative subset the case library
         // reads — the tail promoted and the layer folded by the driver at
         // every task start. Read-only by convention: the sink owns the
@@ -358,30 +362,34 @@ pub async fn build_driver(
         let hot_store = JsonlStore::open(nb_dir.join(HOT_FILE)).map_err(|e| {
             ChatServeError::new(format!("cannot open the notebook hot layer: {e}"), 2)
         })?;
-        eprintln!("[growth] recording PII-stripped run records to {}", path.display());
+        eprintln!(
+            "[growth] recording PII-stripped run records to {}",
+            path.display()
+        );
         eprintln!("[growth] retrieval: prior per-user cases (hot layer) inform self-verification");
         eprintln!("[growth] skills: per-tenant adopted skills are available to the loop");
         driver = driver
             .with_growth(Arc::new(store))
             .with_hot_layer(Arc::new(hot_store), nb_dir);
     }
-    Ok(Arc::new(driver))
+    let driver = Arc::new(driver);
+    // The schedule ticker (M8 W5): scan the queue every 30 s from
+    // startup, whichever platform adapter is serving. Promises made by
+    // directory-mode tenants with `schedule = true` fire here.
+    driver.start_scheduler();
+    Ok(driver)
 }
 
 /// Serve `flags.platform` until Ctrl-C or a fatal failure.
 pub async fn serve(flags: &ChatFlags) -> Result<(), ChatServeError> {
     match flags.platform {
         Platform::Telegram => crate::telegram::serve(flags).await,
-        Platform::Discord => {
-            crate::discord::serve(flags)
-                .await
-                .map_err(|e| ChatServeError::new(e.to_string(), 1))
-        }
-        Platform::Slack => {
-            crate::slack::serve(flags)
-                .await
-                .map_err(|e| ChatServeError::new(e.to_string(), 1))
-        }
+        Platform::Discord => crate::discord::serve(flags)
+            .await
+            .map_err(|e| ChatServeError::new(e.to_string(), 1)),
+        Platform::Slack => crate::slack::serve(flags)
+            .await
+            .map_err(|e| ChatServeError::new(e.to_string(), 1)),
     }
 }
 
@@ -477,8 +485,14 @@ mod tests {
             error(parse(&["telegram", "--nonsense"])),
             "unknown flag --nonsense; see `amparo chat --help`"
         );
-        assert_eq!(error(parse(&["telegram", "--policy-url"])), "--policy-url requires a URL");
-        assert_eq!(error(parse(&["--trust-ceiling"])), "--trust-ceiling requires a tier");
+        assert_eq!(
+            error(parse(&["telegram", "--policy-url"])),
+            "--policy-url requires a URL"
+        );
+        assert_eq!(
+            error(parse(&["--trust-ceiling"])),
+            "--trust-ceiling requires a tier"
+        );
         assert_eq!(
             error(parse(&["telegram", "--trust-ceiling", "nonsense"])),
             "unknown trust tier nonsense"
@@ -501,15 +515,27 @@ mod tests {
 
     #[test]
     fn usage_mentions_chat_config() {
-        assert!(CHAT_USAGE.contains("--chat-config"), "usage documents the flag");
-        assert!(CHAT_USAGE.contains("AMPARO_CHAT_CONFIG"), "usage documents the env var");
+        assert!(
+            CHAT_USAGE.contains("--chat-config"),
+            "usage documents the flag"
+        );
+        assert!(
+            CHAT_USAGE.contains("AMPARO_CHAT_CONFIG"),
+            "usage documents the env var"
+        );
     }
 
     #[test]
     fn usage_mentions_growth() {
         assert!(CHAT_USAGE.contains("--growth"), "usage documents the flag");
-        assert!(CHAT_USAGE.contains("--no-growth"), "usage documents the off flag");
-        assert!(CHAT_USAGE.contains("records.jsonl"), "usage documents the record path");
+        assert!(
+            CHAT_USAGE.contains("--no-growth"),
+            "usage documents the off flag"
+        );
+        assert!(
+            CHAT_USAGE.contains("records.jsonl"),
+            "usage documents the record path"
+        );
     }
 
     #[test]
@@ -523,7 +549,12 @@ mod tests {
     #[test]
     fn rejects_conflicting_modes_and_bad_platforms() {
         assert_eq!(
-            error(parse(&["telegram", "--policy-url", "http://p.test", "--allow-all"])),
+            error(parse(&[
+                "telegram",
+                "--policy-url",
+                "http://p.test",
+                "--allow-all"
+            ])),
             "--policy-url and --allow-all are mutually exclusive"
         );
         assert_eq!(
@@ -558,6 +589,9 @@ mod tests {
             HashSet::from(["111".to_string(), "222".to_string()])
         );
         std::env::remove_var("AMPARO_CHAT_ALLOWLIST");
-        assert!(allowlist_from_env().is_empty(), "absent allowlist denies everyone");
+        assert!(
+            allowlist_from_env().is_empty(),
+            "absent allowlist denies everyone"
+        );
     }
 }

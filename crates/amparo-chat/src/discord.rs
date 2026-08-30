@@ -201,7 +201,12 @@ impl DiscordTransport {
     /// Tests point these at mock servers; self-hosted deployments use it
     /// to route through a proxy. The token is used verbatim either way.
     pub fn with_urls(token: String, gateway_url: String, rest_base: String) -> Self {
-        Self { token, http: reqwest::Client::new(), gateway_url, rest_base }
+        Self {
+            token,
+            http: reqwest::Client::new(),
+            gateway_url,
+            rest_base,
+        }
     }
 }
 
@@ -260,7 +265,10 @@ impl ChatTransport for DiscordTransport {
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| ChatError::Discord("message response had no id".into()))?;
-        Ok(ApprovalMessage { chat_id: chat.chat_id.clone(), message_id: message_id.to_string() })
+        Ok(ApprovalMessage {
+            chat_id: chat.chat_id.clone(),
+            message_id: message_id.to_string(),
+        })
     }
 
     async fn edit_approval(&self, msg: &ApprovalMessage, outcome: &str) -> Result<(), ChatError> {
@@ -313,7 +321,10 @@ impl DiscordTransport {
         // HELLO fixes the heartbeat interval.
         let hello = read_until_op(&mut read, OP_HELLO).await?;
         let interval = Duration::from_millis(
-            hello.get("heartbeat_interval").and_then(Value::as_u64).unwrap_or(41_250),
+            hello
+                .get("heartbeat_interval")
+                .and_then(Value::as_u64)
+                .unwrap_or(41_250),
         );
 
         // IDENTIFY or RESUME, depending on whether a session survived the
@@ -325,7 +336,9 @@ impl DiscordTransport {
                     let seq = session.seq;
                     write
                         .send(WsMessage::Text(
-                            resume_payload(&self.token, &session_id, seq).to_string().into(),
+                            resume_payload(&self.token, &session_id, seq)
+                                .to_string()
+                                .into(),
                         ))
                         .await
                         .map_err(|e| ChatError::Ws(format!("gateway send: {e}")))?;
@@ -341,7 +354,9 @@ impl DiscordTransport {
                         )));
                     }
                     write
-                        .send(WsMessage::Text(identify_payload(&self.token).to_string().into()))
+                        .send(WsMessage::Text(
+                            identify_payload(&self.token).to_string().into(),
+                        ))
                         .await
                         .map_err(|e| ChatError::Ws(format!("gateway send: {e}")))?;
                     false
@@ -374,8 +389,7 @@ impl DiscordTransport {
                         let code = frame.as_ref().map(|f| f.code);
                         if code == Some(CloseCode::from(4004)) {
                             break Err(ChatError::Fatal(
-                                "Discord gateway: authentication failed (close code 4004)"
-                                    .into(),
+                                "Discord gateway: authentication failed (close code 4004)".into(),
                             ));
                         }
                         // Close 4009 means the session timed out — a
@@ -442,12 +456,14 @@ impl DiscordTransport {
                             Some("INTERACTION_CREATE") => {
                                 let interaction: InteractionCreate =
                                     serde_json::from_value(frame.d).map_err(|e| {
-                                        ChatError::Discord(format!(
-                                            "bad INTERACTION_CREATE: {e}"
-                                        ))
+                                        ChatError::Discord(format!("bad INTERACTION_CREATE: {e}"))
                                     })?;
-                                let Some(data) = interaction.data else { continue };
-                                let Some(custom_id) = data.custom_id else { continue };
+                                let Some(data) = interaction.data else {
+                                    continue;
+                                };
+                                let Some(custom_id) = data.custom_id else {
+                                    continue;
+                                };
                                 let Some((verb, approval_id)) = custom_id.split_once(':') else {
                                     continue;
                                 };
@@ -471,9 +487,8 @@ impl DiscordTransport {
                                     "/interactions/{}/{}/callback",
                                     interaction.id, interaction.token
                                 );
-                                let _ = self
-                                    .post_json(&callback, json!({ "type": 6 }), false)
-                                    .await;
+                                let _ =
+                                    self.post_json(&callback, json!({ "type": 6 }), false).await;
                                 let channel_id = interaction.channel_id.clone();
                                 let press = ApprovalButtonPress {
                                     chat_id: interaction.channel_id,
@@ -546,10 +561,15 @@ impl DiscordTransport {
         if authorized {
             builder = builder.header("Authorization", format!("Bot {}", self.token));
         }
-        let req = builder.build().map_err(|e| ChatError::Http(e.to_string()))?;
+        let req = builder
+            .build()
+            .map_err(|e| ChatError::Http(e.to_string()))?;
         let response = self.send_with_retry(req).await?;
         if !response.status().is_success() {
-            return Err(ChatError::Discord(format!("POST {path} failed: {}", response.status())));
+            return Err(ChatError::Discord(format!(
+                "POST {path} failed: {}",
+                response.status()
+            )));
         }
         Ok(response)
     }
@@ -566,20 +586,22 @@ impl DiscordTransport {
         if authorized {
             builder = builder.header("Authorization", format!("Bot {}", self.token));
         }
-        let req = builder.build().map_err(|e| ChatError::Http(e.to_string()))?;
+        let req = builder
+            .build()
+            .map_err(|e| ChatError::Http(e.to_string()))?;
         let response = self.send_with_retry(req).await?;
         if !response.status().is_success() {
-            return Err(ChatError::Discord(format!("PATCH {path} failed: {}", response.status())));
+            return Err(ChatError::Discord(format!(
+                "PATCH {path} failed: {}",
+                response.status()
+            )));
         }
         Ok(response)
     }
 
     /// Execute `req`, retrying once on HTTP 429 after sleeping
     /// `retry_after` seconds plus a half-second margin.
-    async fn send_with_retry(
-        &self,
-        req: reqwest::Request,
-    ) -> Result<reqwest::Response, ChatError> {
+    async fn send_with_retry(&self, req: reqwest::Request) -> Result<reqwest::Response, ChatError> {
         let mut attempts = 0;
         loop {
             let next = req
@@ -649,7 +671,11 @@ async fn heartbeat_loop(
             let seq = state.lock().await.seq;
             let frame = heartbeat_payload(seq);
             let mut write = write.lock().await;
-            if write.send(WsMessage::Text(frame.to_string().into())).await.is_err() {
+            if write
+                .send(WsMessage::Text(frame.to_string().into()))
+                .await
+                .is_err()
+            {
                 return; // the socket is gone — the reader handles the reconnect
             }
         }
@@ -726,7 +752,10 @@ mod tests {
 
     #[test]
     fn intents_are_37376() {
-        assert_eq!(INTENTS, 37376, "guild_messages | direct_messages | message_content");
+        assert_eq!(
+            INTENTS, 37376,
+            "guild_messages | direct_messages | message_content"
+        );
     }
 
     #[test]
@@ -767,6 +796,9 @@ mod tests {
             "http://mock".into(),
         );
         let debug = format!("{transport:?}");
-        assert!(!debug.contains("super-secret-token"), "Debug must not leak the token: {debug}");
+        assert!(
+            !debug.contains("super-secret-token"),
+            "Debug must not leak the token: {debug}"
+        );
     }
 }

@@ -14,7 +14,7 @@
 //! runtime failures (an unreadable ledger) exit 1.
 
 use amparo_privacy::{
-    LedgerKind, LedgerRow, LedgerSummary, privacy_dir, read_ledger, recorded_quota,
+    privacy_dir, read_ledger, recorded_quota, LedgerKind, LedgerRow, LedgerSummary,
 };
 use amparo_tools::PathPolicy;
 
@@ -173,7 +173,10 @@ fn execute(flags: &PrivacyFlags) -> Result<(), String> {
         None => println!("ledger: {bytes} bytes (unbounded)"),
     }
     if summary.rotations > 0 {
-        println!("rotations: {} (rows dropped {})", summary.rotations, summary.rows_dropped);
+        println!(
+            "rotations: {} (rows dropped {})",
+            summary.rotations, summary.rows_dropped
+        );
     }
     println!(
         "network calls: {} (approved {}, denied {})",
@@ -233,7 +236,11 @@ fn render_row(row: &LedgerRow) -> String {
             format!("{}  pii-strip  {}", row.ts, counts)
         }
         LedgerKind::Rotated => {
-            format!("{}  rotated  dropped {} rows", row.ts, row.dropped_rows.unwrap_or(0))
+            format!(
+                "{}  rotated  dropped {} rows",
+                row.ts,
+                row.dropped_rows.unwrap_or(0)
+            )
         }
     }
 }
@@ -301,8 +308,6 @@ mod tests {
 
     #[test]
     fn rejects_positional_arguments() {
-        assert!(
-            parse_error(&["list"]).contains("takes no positional arguments, got 'list'")
-        );
+        assert!(parse_error(&["list"]).contains("takes no positional arguments, got 'list'"));
     }
 }

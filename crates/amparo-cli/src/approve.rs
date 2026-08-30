@@ -44,7 +44,10 @@ impl InteractiveApprovalGate {
     /// Build the gate over a specific reader (tests, and embedders piping
     /// a non-terminal input).
     pub fn with_reader(reader: Box<dyn AsyncBufRead + Unpin + Send>) -> Self {
-        Self { timeout: APPROVAL_TIMEOUT, input: Mutex::new(reader) }
+        Self {
+            timeout: APPROVAL_TIMEOUT,
+            input: Mutex::new(reader),
+        }
     }
 
     #[cfg(test)]
@@ -122,7 +125,10 @@ fn prompt_text(request: &ApprovalRequest) -> String {
         serde_json::to_string_pretty(&request.arguments).unwrap_or_default()
     ));
     if let Some(radius) = &request.blast_radius {
-        lines.push(format!("[preflight] blast radius: {radius} — {}", radius.note()));
+        lines.push(format!(
+            "[preflight] blast radius: {radius} — {}",
+            radius.note()
+        ));
     }
     for reason in &request.reasons {
         lines.push(format!("  because: {reason}"));
@@ -188,7 +194,11 @@ mod tests {
     fn no_classification_omits_the_preflight_line() {
         let mut request = request();
         request.blast_radius = None;
-        assert!(!prompt_text(&request).contains("[preflight]"), "{}", prompt_text(&request));
+        assert!(
+            !prompt_text(&request).contains("[preflight]"),
+            "{}",
+            prompt_text(&request)
+        );
     }
 
     #[test]
@@ -201,12 +211,19 @@ mod tests {
         let Some((session, approval)) = session.zip(approval) else {
             panic!("expected both lines, got: {text}");
         };
-        assert!(session < approval, "the session label leads the copy: {text}");
+        assert!(
+            session < approval,
+            "the session label leads the copy: {text}"
+        );
     }
 
     #[test]
     fn no_session_label_omits_the_session_line() {
-        assert!(!prompt_text(&request()).contains("[session]"), "{}", prompt_text(&request()));
+        assert!(
+            !prompt_text(&request()).contains("[session]"),
+            "{}",
+            prompt_text(&request())
+        );
     }
 
     #[tokio::test]
@@ -251,9 +268,8 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_input_times_out_and_denies() {
-        let gate =
-            InteractiveApprovalGate::with_reader(Box::new(Stalled))
-                .with_timeout(std::time::Duration::from_millis(20));
+        let gate = InteractiveApprovalGate::with_reader(Box::new(Stalled))
+            .with_timeout(std::time::Duration::from_millis(20));
         assert!(!gate.request(&request()).await);
     }
 }

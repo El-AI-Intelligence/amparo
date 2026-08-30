@@ -44,8 +44,14 @@ mod tests {
     #[tokio::test]
     async fn emits_render_through_the_channel() {
         let (sink, mut rx) = ChatEventSink::channel();
-        sink.emit(&AgentEvent::TaskStarted { prompt: "hi".into(), task_id: None });
-        sink.emit(&AgentEvent::TaskComplete { final_answer: "done".into(), task_id: None });
+        sink.emit(&AgentEvent::TaskStarted {
+            prompt: "hi".into(),
+            task_id: None,
+        });
+        sink.emit(&AgentEvent::TaskComplete {
+            final_answer: "done".into(),
+            task_id: None,
+        });
         assert_eq!(rx.recv().await.as_deref(), Some("[task] hi"));
         assert_eq!(rx.recv().await.as_deref(), Some("[complete] done"));
     }
@@ -56,7 +62,10 @@ mod tests {
         // One more line than the 64-line buffer: emit is sync, so if it ever
         // blocked this test would hang instead of passing.
         for i in 0..65 {
-            sink.emit(&AgentEvent::TaskStarted { prompt: format!("msg {i}"), task_id: None });
+            sink.emit(&AgentEvent::TaskStarted {
+                prompt: format!("msg {i}"),
+                task_id: None,
+            });
         }
         let mut received = Vec::new();
         while let Ok(line) = rx.try_recv() {

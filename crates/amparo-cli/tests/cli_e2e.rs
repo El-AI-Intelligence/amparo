@@ -7,6 +7,7 @@
 //! restore what they touched — `AMPARO_WORKSPACE` is process-wide state and
 //! the mock env must be visible to child processes only while they run.
 
+use amparo_chat::{schedule_dir, JsonScheduleStore, ScheduleStore, ScheduledStatus, ScheduledTask};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
@@ -2611,4 +2612,140 @@ async fn destructive_call_denied_shows_radius_and_lands_a_human_denied_row() {
         !text.contains("rm -rf"),
         "the command never reaches the ledger: {text}"
     );
+}
+
+// ── Schedule queue (M8 W5) ───────────────────────────────────────────────────
+
+/// Seed one pending promise in `ws`'s queue — the shape the chat driver's
+/// `schedule` tool persists, hand-written here so the CLI surface is
+/// exercised against a real queue dir.
+fn seed_promise(ws: &std::path::Path, id: &str, at: &str) {
+    let store = JsonScheduleStore::new(schedule_dir(ws));
+    let task = ScheduledTask {
+        id: id.to_string(),
+        tenant: "telegram:user_1".to_string(),
+        platform: "telegram".to_string(),
+        chat_id: "chat_1".to_string(),
+        requester: "user_1".to_string(),
+        task: "run the standing task".to_string(),
+        at: at.to_string(),
+        status: ScheduledStatus::Pending,
+        result: None,
+    };
+    store.save(&task).unwrap();
+}
+
+#[test]
+fn schedule_help_exits_0() {
+    let out = std::process::Command::new(bin())
+        .args(["schedule", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = stdout(&out);
+    assert!(stdout.contains("amparo schedule"), "{}", stdout);
+    assert!(stdout.contains("cancel"), "{}", stdout);
+    assert!(stdout.contains("--workspace"), "{}", stdout);
+}
+
+#[tokio::test]
+async fn schedule_surface_usage_errors_exit_2() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["schedule"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("requires a command"),
+        "{}",
+        stderr(&out)
+    );
+    let out = run_with(&["schedule", "frobnicate"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown schedule command 'frobnicate'"),
+        "{}",
+        stderr(&out)
+    );
+    let out = run_with(&["schedule", "cancel"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("requires an id"), "{}", stderr(&out));
+    let out = run_with(&["schedule", "list", "extra"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("takes no arguments"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[tokio::test]
+async fn schedule_list_and_cancel_work_the_queue() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("schedule-e2e");
+    seed_promise(&ws, "sched-e2e-1", "2026-09-15T12:00:00Z");
+    let ws_flag = ws.to_str().expect("utf8 temp path");
+
+    // list shows the pending promise: id, instant, status, tenant, task.
+    let out = run_with(&["schedule", "list", "--workspace", ws_flag]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let out_stdout = stdout(&out);
+    assert!(out_stdout.contains("sched-e2e-1"), "{out_stdout}");
+    assert!(out_stdout.contains("2026-09-15T12:00:00Z"), "{out_stdout}");
+    assert!(out_stdout.contains("pending"), "{out_stdout}");
+    assert!(out_stdout.contains("telegram:user_1"), "{out_stdout}");
+    assert!(out_stdout.contains("run the standing task"), "{out_stdout}");
+
+    // cancel moves the promise to cancelled — the file survives (a status
+    // change, never a deletion).
+    let out = run_with(&["schedule", "cancel", "sched-e2e-1", "--workspace", ws_flag]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        stdout(&out).contains("cancelled sched-e2e-1"),
+        "{}",
+        stdout(&out)
+    );
+    let saved: Value = serde_json::from_str(
+        &std::fs::read_to_string(ws.join(".amparo/schedule/sched-e2e-1.json"))
+            .expect("the queue file survives"),
+    )
+    .expect("queue file is JSON");
+    assert_eq!(saved["status"], "cancelled");
+    assert_eq!(saved["result"], "cancelled by the operator");
+
+    // A second cancel is a runtime failure: only a pending promise can
+    // be cancelled.
+    let out = run_with(&["schedule", "cancel", "sched-e2e-1", "--workspace", ws_flag]).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("only a pending promise can be cancelled"),
+        "{}",
+        stderr(&out)
+    );
+
+    // An unknown id is a runtime failure too.
+    let out = run_with(&["schedule", "cancel", "sched-404", "--workspace", ws_flag]).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no such schedule: sched-404"),
+        "{}",
+        stderr(&out)
+    );
+
+    // An empty queue lists nothing, and a read never creates the dir.
+    let empty = fresh_workspace("schedule-empty");
+    let out = run_with(&["schedule", "list", "--workspace", empty.to_str().unwrap()]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        stdout(&out).contains("no scheduled tasks in"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        !empty.join(".amparo/schedule").exists(),
+        "a list never creates the queue dir"
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
 }

@@ -39,7 +39,9 @@ pub struct ApprovalRouter {
 impl ApprovalRouter {
     /// An empty router.
     pub fn new() -> Self {
-        Self { pending: Mutex::new(HashMap::new()) }
+        Self {
+            pending: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Register a waiting approval and return the receiver the gate awaits.
@@ -83,7 +85,9 @@ impl ApprovalRouter {
         if requester != presser_user_id {
             return TakeResult::WrongUser;
         }
-        let (_, tx) = pending.remove(&key).expect("the entry was inspected just above");
+        let (_, tx) = pending
+            .remove(&key)
+            .expect("the entry was inspected just above");
         TakeResult::Routed(tx)
     }
 
@@ -129,9 +133,15 @@ mod tests {
     async fn double_take_is_already_decided() {
         let router = ApprovalRouter::new();
         router.register("chat_1", "call_1", "user_1").await;
-        assert!(matches!(router.take("chat_1", "call_1", "user_1").await, TakeResult::Routed(_)));
+        assert!(matches!(
+            router.take("chat_1", "call_1", "user_1").await,
+            TakeResult::Routed(_)
+        ));
         assert!(
-            matches!(router.take("chat_1", "call_1", "user_1").await, TakeResult::AlreadyDecided),
+            matches!(
+                router.take("chat_1", "call_1", "user_1").await,
+                TakeResult::AlreadyDecided
+            ),
             "second press is already decided"
         );
     }
@@ -154,9 +164,15 @@ mod tests {
     async fn wrong_user_press_is_rejected_and_keeps_the_entry() {
         let router = ApprovalRouter::new();
         router.register("chat_1", "call_1", "alice").await;
-        assert!(matches!(router.take("chat_1", "call_1", "bob").await, TakeResult::WrongUser));
+        assert!(matches!(
+            router.take("chat_1", "call_1", "bob").await,
+            TakeResult::WrongUser
+        ));
         assert!(
-            matches!(router.take("chat_1", "call_1", "alice").await, TakeResult::Routed(_)),
+            matches!(
+                router.take("chat_1", "call_1", "alice").await,
+                TakeResult::Routed(_)
+            ),
             "the requester's own later press must still route"
         );
     }
@@ -165,7 +181,10 @@ mod tests {
     async fn wrong_user_then_unregister_notifies_false() {
         let router = ApprovalRouter::new();
         let rx = router.register("chat_1", "call_1", "alice").await;
-        assert!(matches!(router.take("chat_1", "call_1", "bob").await, TakeResult::WrongUser));
+        assert!(matches!(
+            router.take("chat_1", "call_1", "bob").await,
+            TakeResult::WrongUser
+        ));
         assert!(router.unregister("chat_1", "call_1").await);
         assert_eq!(rx.await.unwrap(), false, "unregistered gate is told denied");
     }

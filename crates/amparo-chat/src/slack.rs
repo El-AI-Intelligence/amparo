@@ -154,7 +154,12 @@ impl SlackTransport {
         bot_token: String,
         http: reqwest::Client,
     ) -> Self {
-        Self { base: base.into(), app_token, bot_token, http }
+        Self {
+            base: base.into(),
+            app_token,
+            bot_token,
+            http,
+        }
     }
 
     /// Open one Socket Mode connection: ask `apps.connections.open` for a
@@ -183,7 +188,9 @@ impl SlackTransport {
             }
             _ => Err(ChatError::Fatal(format!(
                 "apps.connections.open failed: {}",
-                resp.get("error").and_then(Value::as_str).unwrap_or("unknown error")
+                resp.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
             ))),
         }
     }
@@ -228,7 +235,7 @@ impl SlackTransport {
                 }
             }
             match envelope.r#type.as_str() {
-                "hello" => {} // acked (when it carries an id) and ignored
+                "hello" => {}          // acked (when it carries an id) and ignored
                 "disconnect" => break, // acked — the caller re-opens
                 "events_api" => self.handle_event(envelope.payload, driver).await,
                 "interactive" => self.handle_interactive(envelope.payload, driver).await,
@@ -242,7 +249,9 @@ impl SlackTransport {
     /// (edits, replies, …) are the echo — already acked, skipped here.
     async fn handle_event(&self, payload: Option<Value>, driver: &ChatDriver) {
         let Some(payload) = payload else { return };
-        let Ok(event) = serde_json::from_value::<EventPayload>(payload) else { return };
+        let Ok(event) = serde_json::from_value::<EventPayload>(payload) else {
+            return;
+        };
         if event.r#type != "message" || event.bot_id.is_some() || event.subtype.is_some() {
             return;
         }
@@ -253,7 +262,11 @@ impl SlackTransport {
         if text.is_empty() {
             return;
         }
-        let chat = ChatRef { platform: "slack", chat_id: channel, user_id: user };
+        let chat = ChatRef {
+            platform: "slack",
+            chat_id: channel,
+            user_id: user,
+        };
         driver.on_message(chat, text).await;
     }
 
@@ -270,9 +283,15 @@ impl SlackTransport {
         if interactive.r#type != "block_actions" {
             return;
         }
-        let Some(action) = interactive.actions.first() else { return };
-        let Some((kind, approval_id)) = action.action_id.split_once(':') else { return };
-        let Some(channel_id) = interactive.channel.map(|c| c.id) else { return };
+        let Some(action) = interactive.actions.first() else {
+            return;
+        };
+        let Some((kind, approval_id)) = action.action_id.split_once(':') else {
+            return;
+        };
+        let Some(channel_id) = interactive.channel.map(|c| c.id) else {
+            return;
+        };
         let approved = match kind {
             "approve" => true,
             "deny" => false,
@@ -331,11 +350,18 @@ impl ChatTransport for SlackTransport {
         // buttons; the top-level text is the non-rich fallback.
         use crate::transport::{preflight_line, session_line};
         let args = truncate(&request.arguments.to_string(), BLOCK_TEXT_LIMIT);
-        let session = session_line(request).map(|line| format!("{line}\n")).unwrap_or_default();
-        let preflight = preflight_line(request).map(|line| format!("{line}\n")).unwrap_or_default();
+        let session = session_line(request)
+            .map(|line| format!("{line}\n"))
+            .unwrap_or_default();
+        let preflight = preflight_line(request)
+            .map(|line| format!("{line}\n"))
+            .unwrap_or_default();
         let reasons = request.reasons.join("\n");
         let section_text = truncate(
-            &format!("{session}*{}* needs approval\n```{args}```\n{preflight}{reasons}", request.tool_name),
+            &format!(
+                "{session}*{}* needs approval\n```{args}```\n{preflight}{reasons}",
+                request.tool_name
+            ),
             BLOCK_TEXT_LIMIT,
         );
         let body = json!({
@@ -358,7 +384,9 @@ impl ChatTransport for SlackTransport {
                     chat_id: chat.chat_id.clone(),
                     message_id: ts.to_string(),
                 }),
-                None => Err(ChatError::Slack("chat.postMessage accepted without a ts".into())),
+                None => Err(ChatError::Slack(
+                    "chat.postMessage accepted without a ts".into(),
+                )),
             }
         } else {
             Err(ChatError::Slack(api_error("chat.postMessage", &resp)))
@@ -367,7 +395,8 @@ impl ChatTransport for SlackTransport {
 
     async fn edit_approval(&self, msg: &ApprovalMessage, outcome: &str) -> Result<(), ChatError> {
         // Empty blocks remove the buttons; `text` records the outcome.
-        let body = json!({"channel": msg.chat_id, "ts": msg.message_id, "text": outcome, "blocks": []});
+        let body =
+            json!({"channel": msg.chat_id, "ts": msg.message_id, "text": outcome, "blocks": []});
         let resp = self.api_post("chat.update", &body).await?;
         if resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             Ok(())
@@ -390,7 +419,10 @@ impl ChatTransport for SlackTransport {
 
 /// The Slack API `error` field of an `ok: false` body, or a fallback.
 fn api_error(method: &str, resp: &Value) -> String {
-    let error = resp.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+    let error = resp
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
     format!("{method} rejected: {error}")
 }
 
@@ -415,17 +447,26 @@ fn truncate(s: &str, max: usize) -> String {
 /// token, for example) ends it.
 pub async fn serve(flags: &crate::dispatch::ChatFlags) -> Result<(), ChatError> {
     let app_token = std::env::var("AMPARO_CHAT_SLACK_APP_TOKEN").map_err(|_| {
-        ChatError::Fatal("AMPARO_CHAT_SLACK_APP_TOKEN (and AMPARO_CHAT_SLACK_BOT_TOKEN) is required".into())
+        ChatError::Fatal(
+            "AMPARO_CHAT_SLACK_APP_TOKEN (and AMPARO_CHAT_SLACK_BOT_TOKEN) is required".into(),
+        )
     })?;
     let bot_token = std::env::var("AMPARO_CHAT_SLACK_BOT_TOKEN").map_err(|_| {
-        ChatError::Fatal("AMPARO_CHAT_SLACK_APP_TOKEN (and AMPARO_CHAT_SLACK_BOT_TOKEN) is required".into())
+        ChatError::Fatal(
+            "AMPARO_CHAT_SLACK_APP_TOKEN (and AMPARO_CHAT_SLACK_BOT_TOKEN) is required".into(),
+        )
     })?;
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| ChatError::Http(format!("http client: {e}")))?;
-    let transport = Arc::new(SlackTransport::new("https://slack.com/api", app_token, bot_token, http));
+    let transport = Arc::new(SlackTransport::new(
+        "https://slack.com/api",
+        app_token,
+        bot_token,
+        http,
+    ));
     let driver = crate::dispatch::build_driver(flags, transport.clone())
         .await
         .map_err(|e| ChatError::Fatal(e.message))?;
