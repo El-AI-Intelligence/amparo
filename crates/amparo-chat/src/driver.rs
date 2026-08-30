@@ -28,7 +28,10 @@ use amparo_policy::{AuditNoticeEngine, PolicyEngine};
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore, PrivacyPolicy};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::registry::default_registry_with_policy;
-use amparo_tools::{Memory, PathPolicy, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool};
+use amparo_tools::{
+    Memory, PathPolicy, SendNotificationTool, SkillLibrary, ToolRegistry, ToolTrustTier,
+    UseSkillTool,
+};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -345,6 +348,16 @@ impl ChatDriver {
                 // allowlist arm inherits it from the dispatch-built
                 // shared registry).
                 registry.register(Arc::new(EvalWasmTool::new()));
+                // M10 W2: the notification tool leaves the workspace, so
+                // every send is an external-effector approval — the copy
+                // carries the destination. This per-task registry wires
+                // the platform transport.
+                registry.register(Arc::new(SendNotificationTool::new(Arc::new(
+                    crate::notification::ChatNotificationTransport::new(
+                        Arc::clone(&self.transport),
+                        chat.platform,
+                    ),
+                ))));
                 Some(TaskParts {
                     policy: self.task_policy(chat),
                     registry,

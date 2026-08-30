@@ -11,6 +11,7 @@ pub mod build;
 pub mod filesystem;
 pub mod git;
 pub mod memory;
+pub mod notification;
 pub mod paths;
 pub mod registry;
 pub mod shell;
@@ -23,6 +24,10 @@ pub use blackboard::{
     BLACKBOARD_FILE, BLACKBOARD_READ, BLACKBOARD_WRITE,
 };
 pub use memory::{InMemoryStore, Memory, MemoryEntry, MemorySearchTool, MemoryWriteTool};
+pub use notification::{
+    Notification, NotificationTransport, SendNotificationTool, StderrTransport, WebhookTransport,
+    SEND_NOTIFICATION,
+};
 pub use paths::PathPolicy;
 pub use registry::{
     default_registry, ToolCall, ToolExecutor, ToolParam, ToolRegistry, ToolResult, ToolSchema,

@@ -21,7 +21,7 @@ use amparo_inference::{
     InferenceStream,
 };
 use amparo_tools::{
-    ToolCall, ToolExecutor, ToolParam, ToolResult, ToolRegistry, ToolSchema, ToolTrustTier,
+    ToolCall, ToolExecutor, ToolParam, ToolRegistry, ToolResult, ToolSchema, ToolTrustTier,
 };
 use async_trait::async_trait;
 use std::collections::VecDeque;
@@ -84,10 +84,15 @@ pub async fn wait_for_text(transport: &Arc<MockTransport>, needle: &str) -> Stri
 /// makes the next `send_approval` fail, for the gate's fail-closed test.
 pub struct MockTransport {
     texts: Mutex<Vec<String>>,
+    /// The [`ChatRef`] each text went to, in order — the route matters for
+    /// the `send_notification` adapter (M10 W2).
+    chats: Mutex<Vec<ChatRef>>,
     approvals: Mutex<Vec<ApprovalMessage>>,
     edits: Mutex<Vec<(ApprovalMessage, String)>>,
     /// Set to `true` to make the next `send_approval` return an error.
     pub fail_next_send: AtomicBool,
+    /// Set to `true` to make the next `send_text` return an error.
+    pub fail_next_text: AtomicBool,
 }
 
 impl MockTransport {
@@ -95,15 +100,23 @@ impl MockTransport {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             texts: Mutex::new(Vec::new()),
+            chats: Mutex::new(Vec::new()),
             approvals: Mutex::new(Vec::new()),
             edits: Mutex::new(Vec::new()),
             fail_next_send: AtomicBool::new(false),
+            fail_next_text: AtomicBool::new(false),
         })
     }
 
     /// Every text sent so far, in order.
     pub fn texts(&self) -> Vec<String> {
         self.texts.lock().unwrap().clone()
+    }
+
+    /// The most recently sent text's [`ChatRef`], if any — which chat the
+    /// outbound line went to.
+    pub fn last_chat(&self) -> Option<ChatRef> {
+        self.chats.lock().unwrap().last().cloned()
     }
 
     /// Every approval message sent so far, in order.
@@ -119,8 +132,12 @@ impl MockTransport {
 
 #[async_trait]
 impl ChatTransport for MockTransport {
-    async fn send_text(&self, _chat: &ChatRef, text: &str) -> Result<(), ChatError> {
+    async fn send_text(&self, chat: &ChatRef, text: &str) -> Result<(), ChatError> {
+        if self.fail_next_text.swap(false, Ordering::SeqCst) {
+            return Err(ChatError::Telegram("simulated text failure".into()));
+        }
         self.texts.lock().unwrap().push(text.to_string());
+        self.chats.lock().unwrap().push(chat.clone());
         Ok(())
     }
 
@@ -134,13 +151,19 @@ impl ChatTransport for MockTransport {
             return Err(ChatError::Telegram("simulated send failure".into()));
         }
         let message_id = format!("msg_{}", self.approvals.lock().unwrap().len());
-        let msg = ApprovalMessage { chat_id: chat.chat_id.clone(), message_id };
+        let msg = ApprovalMessage {
+            chat_id: chat.chat_id.clone(),
+            message_id,
+        };
         self.approvals.lock().unwrap().push(msg.clone());
         Ok(msg)
     }
 
     async fn edit_approval(&self, msg: &ApprovalMessage, outcome: &str) -> Result<(), ChatError> {
-        self.edits.lock().unwrap().push((msg.clone(), outcome.to_string()));
+        self.edits
+            .lock()
+            .unwrap()
+            .push((msg.clone(), outcome.to_string()));
         Ok(())
     }
 
@@ -241,7 +264,11 @@ impl InferenceProvider for StubProvider {
         request: InferenceRequest,
     ) -> Result<InferenceResponse, InferenceError> {
         self.complete_prompts.lock().unwrap().push(request.prompt);
-        Ok(InferenceResponse { text: "VERIFIED".into(), tokens: 1, finish_reason: "stop".into() })
+        Ok(InferenceResponse {
+            text: "VERIFIED".into(),
+            tokens: 1,
+            finish_reason: "stop".into(),
+        })
     }
 
     async fn complete_chat_stream(

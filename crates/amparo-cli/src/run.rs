@@ -31,7 +31,9 @@ use amparo_policy::{
 };
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore};
 use amparo_sandbox::EvalWasmTool;
-use amparo_tools::{default_registry, PathPolicy, SkillLibrary, ToolTrustTier, UseSkillTool};
+use amparo_tools::{
+    default_registry, PathPolicy, SendNotificationTool, SkillLibrary, ToolTrustTier, UseSkillTool,
+};
 use std::sync::{Arc, Mutex};
 
 use crate::approve::InteractiveApprovalGate;
@@ -66,6 +68,8 @@ FLAGS:
   --ledger-max-bytes N  bound the always-on privacy ledger file; when it
                       would grow past N, the oldest rows rotate off and a
                       marker records the drop (K/M/G suffixes, e.g. 64K)
+  --webhook-url URL   deliver send_notification messages by POSTing them
+                      as JSON to URL (default: stderr)
 
 The task is the joined positional arguments. stdout carries the final answer
 only; progress, gate decisions and the report go to stderr.
@@ -99,7 +103,15 @@ with the run — the same seam the chat driver uses for platform:user_id.
 Without the flag the task id is the session id (on --resume, the
 checkpoint's original task id). The policy engine's audit-mode notice —
 \"policy engine is in audit mode; verdicts are advisory\" — prints to
-stderr the first time an audit-only verdict comes back, exactly once.";
+stderr the first time an audit-only verdict comes back, exactly once.
+
+--webhook-url wires the send_notification tool (M10 W2): each
+notification is POSTed as {\"destination\", \"message\"} JSON to the URL,
+and a non-success status fails the call. Without the flag the default
+stderr transport stands — the notification prints as
+\"[notification] to <destination>: <message>\". Every send asks for
+human approval first (external-effector tier), and the approval prompt
+names the destination.";
 
 /// Parsed `amparo run` flags.
 #[derive(Debug, Clone)]
@@ -126,6 +138,10 @@ pub struct RunFlags {
     /// Session id attached to every policy check (M9 W3): correlates
     /// engine-side audit rows with this run. `None` = the task id.
     pub session_id: Option<String>,
+    /// Webhook URL for `send_notification` (M10 W2): when set, each
+    /// notification is POSTed there as JSON; `None` = the stderr
+    /// transport.
+    pub webhook_url: Option<String>,
     /// The task — joined positional arguments (empty when resuming).
     pub task: String,
 }
@@ -147,6 +163,7 @@ impl Default for RunFlags {
             ledger_max_bytes: None,
             max_sub_agents: 4,
             session_id: None,
+            webhook_url: None,
             task: String::new(),
         }
     }
@@ -213,6 +230,10 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
             "--session-id" => match args.next() {
                 Some(id) => flags.session_id = Some(id),
                 None => return ParseRunResult::Error("--session-id requires an id".into()),
+            },
+            "--webhook-url" => match args.next() {
+                Some(url) => flags.webhook_url = Some(url),
+                None => return ParseRunResult::Error("--webhook-url requires a URL".into()),
             },
             "--allow-all" => flags.allow_all = true,
             "--auto-approve" => flags.auto_approve = true,
@@ -441,6 +462,11 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
     // M7b: eval_wasm is host-registered (like use_skill below), not part
     // of the default registry — amparo-tools stays wasmtime-free.
     registry.register(Arc::new(EvalWasmTool::new()));
+    // M10 W2: with --webhook-url the notification tool POSTs to the
+    // webhook; without it the default registry's stderr transport stands.
+    if let Some(url) = &flags.webhook_url {
+        registry.register(Arc::new(SendNotificationTool::to_webhook(url.clone())));
+    }
 
     let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {

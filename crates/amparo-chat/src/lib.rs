@@ -40,6 +40,7 @@ pub mod discord;
 pub mod dispatch;
 pub mod driver;
 pub mod gate;
+pub mod notification;
 pub mod router;
 pub mod schedule;
 pub mod sink;
@@ -50,6 +51,7 @@ pub mod transport;
 pub use config::{ChatConfig, ConfigError, UserProfile};
 pub use driver::{ChatDriver, PolicySource, Tenants};
 pub use gate::{ChatApprovalGate, TimeoutApprovalGate};
+pub use notification::ChatNotificationTransport;
 pub use router::{ApprovalRouter, TakeResult};
 pub use schedule::{
     schedule_dir, JsonScheduleStore, ScheduleStore, ScheduleTool, ScheduledStatus, ScheduledTask,

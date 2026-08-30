@@ -202,6 +202,31 @@ mod tests {
     }
 
     #[test]
+    fn prompt_text_names_the_notification_destination() {
+        // M10 W2: the approval copy for a send_notification call carries
+        // the arguments, so the human approves a named destination —
+        // never a blanket "send something somewhere".
+        let request = ApprovalRequest {
+            tool_name: "send_notification".into(),
+            arguments: serde_json::json!({
+                "destination": "ops-channel",
+                "message": "deploy finished",
+            }),
+            ..request()
+        };
+        let text = prompt_text(&request);
+        assert!(text.contains("send_notification"), "{text}");
+        assert!(
+            text.contains("ops-channel"),
+            "the copy names the destination: {text}"
+        );
+        assert!(
+            text.contains("deploy finished"),
+            "the copy shows the message: {text}"
+        );
+    }
+
+    #[test]
     fn session_label_leads_the_copy_for_a_sub_agent() {
         let mut request = request();
         request.session_label = Some("sub-agent sess-123.1 of task sess-123".into());

@@ -275,14 +275,16 @@ use crate::git::{
     GitBlameTool, GitBranchTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool,
 };
 use crate::memory::MemorySearchTool;
+use crate::notification::SendNotificationTool;
 use crate::paths::PathPolicy;
 use crate::shell::RunCommandTool;
 use crate::testing::RunTestsTool;
 use crate::web::{FetchUrlTool, WebSearchTool};
 
-/// Create the default registry with all 19 built-in tools, the 14
+/// Create the default registry with all 20 built-in tools, the 14
 /// workspace-bound ones rooted at `policy` — plus the blackboard, rooted
-/// at the policy's workspace root.
+/// at the policy's workspace root, and `send_notification` on its stderr
+/// default transport (hosts re-register it with their own seam).
 ///
 /// The deny-by-default posture lives in the *agent*, not here: a registry
 /// registers tools; only the policy gate in `amparo-agent` decides whether a
@@ -305,6 +307,9 @@ pub fn default_registry_with_policy(policy: Arc<PathPolicy>) -> ToolRegistry {
     let board = Arc::new(BlackboardStore::new(&policy.workspace_root));
     registry.register(Arc::new(BlackboardReadTool::new(Arc::clone(&board))));
     registry.register(Arc::new(BlackboardWriteTool::new(board)));
+    // The notification tool (M10 W2) ships on the stderr default; hosts
+    // replace it by re-registering with their own transport.
+    registry.register(Arc::new(SendNotificationTool::to_stderr()));
     registry.register(Arc::new(GitStatusTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(GitDiffTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(GitCommitTool::with_policy(Arc::clone(&policy))));

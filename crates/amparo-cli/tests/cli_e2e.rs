@@ -755,6 +755,170 @@ async fn blackboard_write_emits_a_bus_row_and_the_read_sees_the_value() {
     assert_eq!(stdout(&out).trim(), "Done.");
 }
 
+/// A one-shot HTTP responder (the MockPolicy accept-loop shape) that
+/// captures one request and answers 200 — the webhook target for the
+/// `send_notification` e2e.
+struct MockWebhook {
+    addr: std::net::SocketAddr,
+    requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+impl MockWebhook {
+    async fn start() -> MockWebhook {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock webhook");
+        let addr = listener.local_addr().unwrap();
+        let requests: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    // Read the request head, then the body by
+                    // Content-Length (the MockPolicy pattern — a read may
+                    // overshoot past the delimiter into body bytes, so the
+                    // split position is what delimits the head).
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let split = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|i| i + 4)
+                        .unwrap_or(buf.len());
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            l.split_once(':').and_then(|(k, v)| {
+                                k.trim().eq_ignore_ascii_case("content-length").then_some(v)
+                            })
+                        })
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut body = buf[split..].to_vec();
+                    while body.len() < len {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    recorded
+                        .lock()
+                        .await
+                        .push(format!("{head}{}", String::from_utf8_lossy(&body)));
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        MockWebhook { addr, requests }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    async fn requests(&self) -> Vec<String> {
+        self.requests.lock().await.clone()
+    }
+}
+
+#[tokio::test]
+async fn send_notification_without_a_webhook_delivers_to_stderr() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "send_notification",
+            r#"{"destination":"ops-channel","message":"deploy finished"}"#,
+        ),
+        vec![content_frame("Notified.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with(&[
+        "run",
+        "--allow-all",
+        "--auto-approve",
+        "notify the ops channel",
+    ])
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[exec] send_notification"), "{err}");
+    assert!(
+        err.contains("[notification] to ops-channel: deploy finished"),
+        "the default stderr transport prints the notification: {err}"
+    );
+    assert_eq!(stdout(&out).trim(), "Notified.");
+}
+
+#[tokio::test]
+async fn send_notification_posts_to_the_configured_webhook() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "send_notification",
+            r#"{"destination":"ops-channel","message":"deploy finished"}"#,
+        ),
+        vec![content_frame("Notified.")],
+    ])
+    .await;
+    let webhook = MockWebhook::start().await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with(&[
+        "run",
+        "--allow-all",
+        "--auto-approve",
+        "--webhook-url",
+        &webhook.url(),
+        "notify the ops channel",
+    ])
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[exec] send_notification"), "{err}");
+    assert_eq!(stdout(&out).trim(), "Notified.");
+    let requests = webhook.requests().await;
+    assert_eq!(requests.len(), 1, "one POST: {requests:?}");
+    assert!(
+        requests[0].contains("POST / HTTP/1.1"),
+        "must POST to the webhook URL: {}",
+        requests[0]
+    );
+    assert!(requests[0].contains("ops-channel"), "body: {}", requests[0]);
+    assert!(
+        requests[0].contains("\"destination\""),
+        "body is the notification JSON: {}",
+        requests[0]
+    );
+}
+
 #[tokio::test]
 async fn audit_mode_notice_prints_once_and_checks_carry_the_session_id() {
     let _guard = LOCK.lock().await;

@@ -22,13 +22,14 @@
 
 use crate::config::ChatConfig;
 use crate::driver::{ChatDriver, PolicySource, Tenants};
+use crate::notification::ChatNotificationTransport;
 use crate::router::ApprovalRouter;
 use crate::transport::ChatTransport;
 use amparo_inference::InferenceConfig;
 use amparo_notebook::{notebook_dir, JsonlStore, HOT_FILE};
 use amparo_policy::{AllowAllPolicyEngine, DenyAllPolicyEngine};
 use amparo_sandbox::EvalWasmTool;
-use amparo_tools::{default_registry, ToolTrustTier};
+use amparo_tools::{default_registry, SendNotificationTool, ToolTrustTier};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -287,6 +288,13 @@ pub async fn build_driver(
     // registry is also the driver's legacy shared registry, so the
     // allowlist tenant arm gets eval_wasm from here.
     registry.register(Arc::new(EvalWasmTool::new()));
+    // M10 W2: send_notification rides the platform transport. The
+    // shared registry serves every allowlist tenant, so the adapter
+    // routes by the destination argument (the approval copy names it —
+    // the send itself always asks a human first).
+    registry.register(Arc::new(SendNotificationTool::new(Arc::new(
+        ChatNotificationTransport::new(Arc::clone(&transport), flags.platform.name()),
+    ))));
 
     let policy_source = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {
