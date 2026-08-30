@@ -25,6 +25,7 @@ use crate::events::{truncate, AgentEvent, EventSink, InMemoryEventSink};
 use crate::preflight::classify;
 use crate::session::{Checkpoint, CheckpointStore, LoopState, SessionStatus};
 use crate::sse::accumulate_turn;
+use crate::tokens::estimate_tokens;
 use amparo_inference::{
     AssistantToolCall, ChatMessage, ChatRequest, FunctionCall, InferenceProvider, InferenceRequest,
     Tool,
@@ -100,6 +101,15 @@ pub struct AgentReport {
     pub steps_used: usize,
     /// The self-verification outcome, when one ran.
     pub verification: Option<Verification>,
+    /// Estimated tokens consumed across every inference call of the run —
+    /// outgoing request text plus returned content and tool-call JSON
+    /// (`chars / 4`; an estimate, not provider billing — the method is
+    /// stated on the cost line).
+    pub tokens_estimated: usize,
+    /// Tool calls the model requested during the run, counted at
+    /// dispatch — blocked calls included: the model asked, the gate
+    /// answered, the count records the ask.
+    pub tool_calls: usize,
 }
 
 /// Loop configuration.
@@ -115,6 +125,10 @@ pub struct AgentConfig {
     pub max_tokens: Option<usize>,
     /// Override the provider's default sampling temperature.
     pub temperature: Option<f32>,
+    /// Dollars per million tokens for the cost estimate; `None` turns the
+    /// cost line off (counts still reported). Default `Some(3.0)` — a
+    /// stated mid-range model assumption.
+    pub cost_per_million_tokens: Option<f64>,
 }
 
 impl Default for AgentConfig {
@@ -125,6 +139,7 @@ impl Default for AgentConfig {
             model: None,
             max_tokens: None,
             temperature: None,
+            cost_per_million_tokens: Some(3.0),
         }
     }
 }
@@ -417,6 +432,8 @@ struct LoopVars {
     verification: Option<Verification>,
     steps_used: usize,
     used_tool_names: Vec<String>,
+    tokens_estimated: usize,
+    tool_calls: usize,
 }
 
 impl LoopVars {
@@ -432,6 +449,8 @@ impl LoopVars {
             verification: None,
             steps_used: 0,
             used_tool_names: Vec::new(),
+            tokens_estimated: 0,
+            tool_calls: 0,
         }
     }
 }
@@ -644,6 +663,11 @@ impl Agent {
             verification: None,
             steps_used: starting_steps,
             used_tool_names: checkpoint.loop_state.used_tool_names,
+            // A resume's report covers the resumed segment only — the
+            // checkpoint carries no counters (they are not part of its
+            // schema), so accounting starts fresh here.
+            tokens_estimated: 0,
+            tool_calls: 0,
         };
         let session = SessionHandle {
             task_id: checkpoint.task_id,
@@ -683,6 +707,8 @@ impl Agent {
             mut verification,
             mut steps_used,
             mut used_tool_names,
+            mut tokens_estimated,
+            mut tool_calls,
         } = vars;
 
         for step in 0..self.config.max_steps.saturating_sub(starting_steps) {
@@ -745,6 +771,8 @@ impl Agent {
                         steps,
                         steps_used,
                         verification: None,
+                        tokens_estimated,
+                        tool_calls,
                     };
                 }
             }
@@ -758,6 +786,13 @@ impl Agent {
                 }
                 _ => (conversation.clone(), Vec::new()),
             };
+
+            // ── Token accounting (M8 W1) ────────────────────────────────────
+            // The outgoing request is billed whether the stream fails or
+            // not, so it is counted up front. chars/4 — the method is
+            // stated on the cost line.
+            let request_json = serde_json::to_string(&send_messages).unwrap_or_default();
+            tokens_estimated = tokens_estimated.saturating_add(estimate_tokens(&request_json));
 
             // ── LLM call (native tool calling) ──────────────────────────────
             let request = ChatRequest {
@@ -801,6 +836,8 @@ impl Agent {
                             steps,
                             steps_used,
                             verification: None,
+                            tokens_estimated,
+                            tool_calls,
                         };
                     }
                 },
@@ -829,9 +866,19 @@ impl Agent {
                         steps,
                         steps_used,
                         verification: None,
+                        tokens_estimated,
+                        tool_calls,
                     };
                 }
             };
+
+            // The returned content and tool-call JSON join the count only
+            // when the stream actually delivered a turn.
+            tokens_estimated = tokens_estimated.saturating_add(estimate_tokens(&turn.content));
+            if !turn.tool_calls.is_empty() {
+                let calls_json = serde_json::to_string(&turn.tool_calls).unwrap_or_default();
+                tokens_estimated = tokens_estimated.saturating_add(estimate_tokens(&calls_json));
+            }
 
             // ── Empty-turn recovery ─────────────────────────────────────────
             // A reasoning model can burn its whole budget on hidden tokens and
@@ -883,6 +930,8 @@ impl Agent {
                         steps,
                         steps_used,
                         verification: None,
+                        tokens_estimated,
+                        tool_calls,
                     };
                 }
                 let message = "The model produced no output after a retry, and no prior tool \
@@ -911,6 +960,8 @@ impl Agent {
                     steps,
                     steps_used,
                     verification: None,
+                    tokens_estimated,
+                    tool_calls,
                 };
             }
             // A non-empty turn arrived — reset the retry budget so a later
@@ -952,6 +1003,11 @@ impl Agent {
                             .unwrap_or(serde_json::Value::Null),
                     })
                     .collect();
+
+                // Counted at dispatch (M8 W1) — every call the model
+                // asked for, blocked or not: the gate answers, the count
+                // records the ask.
+                tool_calls = tool_calls.saturating_add(calls.len());
 
                 for call in &calls {
                     steps.push(AgentStep::ToolCall(call.clone()));
@@ -1088,6 +1144,8 @@ impl Agent {
                         steps,
                         steps_used,
                         verification: None,
+                        tokens_estimated,
+                        tool_calls,
                     };
                 }
 
@@ -1214,6 +1272,11 @@ impl Agent {
             };
             conversation.push(ChatMessage::user(verify_prompt.clone()));
 
+            // The verification completion is billed like any call — count
+            // the prompt up front, the reply when it arrives.
+            tokens_estimated =
+                tokens_estimated.saturating_add(estimate_tokens(&verify_prompt));
+
             let verify_text = match self
                 .inference
                 .complete(InferenceRequest {
@@ -1240,6 +1303,7 @@ impl Agent {
                     "VERIFIED".to_string()
                 }
             };
+            tokens_estimated = tokens_estimated.saturating_add(estimate_tokens(&verify_text));
 
             match interpret_verification(&verify_text) {
                 VerificationDecision::Complete => {
@@ -1297,6 +1361,8 @@ impl Agent {
                 steps,
                 steps_used,
                 verification,
+                tokens_estimated,
+                tool_calls,
             };
         }
 
@@ -1319,7 +1385,15 @@ impl Agent {
             },
             final_answer.as_deref(),
         );
-        AgentReport { status: TaskStatus::Failed, final_answer, steps, steps_used, verification }
+        AgentReport {
+            status: TaskStatus::Failed,
+            final_answer,
+            steps,
+            steps_used,
+            verification,
+            tokens_estimated,
+            tool_calls,
+        }
     }
 
     /// Snapshot the task through the attached checkpoint store (M7):
@@ -2095,6 +2169,59 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, AgentStep::FinalAnswer { .. })));
+    }
+
+    #[tokio::test]
+    async fn report_accumulates_token_estimate_and_tool_calls() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+        provider.push_chat(turn_text("The answer is 42."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, calls) = echo_registry();
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove));
+
+        let report = agent.run("what is the answer?").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // One tool call dispatched → counted once.
+        assert_eq!(report.tool_calls, 1);
+
+        // Recompute the expected estimate from what the provider recorded —
+        // this pins the counting contract, not a magic number: outgoing
+        // request JSON per chat turn, the returned content and tool-call
+        // JSON, then the verification prompt and reply.
+        let mut expected = 0usize;
+        let add = |acc: &mut usize, text: &str| *acc += estimate_tokens(text);
+
+        let chat_requests = provider.recorded_requests();
+        assert_eq!(chat_requests.len(), 2);
+        for req in &chat_requests {
+            add(&mut expected, &serde_json::to_string(&req.messages).unwrap());
+        }
+        // Turn 1: empty content (zero), plus the tool call reconstructed
+        // exactly as the SSE accumulator assembles it.
+        let assembled = vec![AssistantToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "echo".to_string(),
+                arguments: r#"{"message":"hi"}"#.to_string(),
+            },
+        }];
+        add(&mut expected, &serde_json::to_string(&assembled).unwrap());
+        // Turn 2: content only.
+        add(&mut expected, "The answer is 42.");
+        // The verification completion: the prompt as sent, the reply as
+        // received ("VERIFIED" — the scripted reply, unchanged).
+        let complete_requests = provider.recorded_complete_requests();
+        assert_eq!(complete_requests.len(), 1);
+        add(&mut expected, &complete_requests[0].prompt);
+        add(&mut expected, "VERIFIED");
+
+        assert_eq!(report.tokens_estimated, expected);
+        assert!(report.tokens_estimated > 0);
     }
 
     // ── Case library (M6b) tests ────────────────────────────────────────────

@@ -66,6 +66,7 @@ pub mod events;
 pub mod ledger_sink;
 pub mod preflight;
 pub mod session;
+pub mod tokens;
 mod sse;
 
 pub use agent::{
@@ -81,3 +82,4 @@ pub use session::{
     continuity_context, Checkpoint, CheckpointStore, JsonCheckpointStore, LoopState,
     SessionStatus, CONTINUITY_TAIL,
 };
+pub use tokens::{estimate_tokens, format_cost_line};
