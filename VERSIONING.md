@@ -1,7 +1,7 @@
 # Versioning and API stability
 
 Amparo is a workspace of Rust crates that share one version
-(`[workspace.package] version = 0.6.0`). This file is the contract for how
+(`[workspace.package] version = 0.7.0`). This file is the contract for how
 that version moves and what "stable" means at each stage.
 
 ## Semver
@@ -32,6 +32,12 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
   computation, approval-gated, honestly labeled `read_only`) and the
   opt-in ledger quota lever (`--ledger-max-bytes`, per-tenant chat
   quotas; rotation marker rows record exactly what was dropped).
+- **0.7.0 (2026-08-30)** — sub-agents & scheduling: `spawn_agent` (the
+  child is the same loop, gate chain, and ceiling; the delegation chain
+  is in the ids, checkpoints, ledger rows, and approval copy; the
+  shared budget fails closed), `schedule` (a persisted promise
+  re-entering the gate chain as its requester; missed = fail-closed),
+  and the swarm report with the cost line.
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 

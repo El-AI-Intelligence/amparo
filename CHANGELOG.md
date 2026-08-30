@@ -8,6 +8,87 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-30
+
+M8, landed: sub-agents and scheduling behind the gate chain — no member
+exits the gate chain, and a model is never the approver (see
+`docs/m8-swarms.md`).
+
+### Added
+
+- **Token accounting + the cost line** (`amparo-agent`):
+  `estimate_tokens` (chars/4, the standard approximation — deterministic
+  and uniform across providers; an estimate, not provider billing),
+  accumulated per turn into `AgentReport.tokens_estimated` and
+  `tool_calls` (counted at dispatch). `AgentConfig.
+  cost_per_million_tokens: Option<f64>` (default `Some(3.0)`, a stated
+  mid-range model assumption; `None` omits the cost line, counts still
+  shown). Rendered as `~$0.04 in inference (estimate, chars/4, $3/1M
+  tokens)` — the method states its assumptions.
+- **Delegation identity** — host-generated task ids
+  (`Agent::with_task_id`); child ids chain (`{parent}.{n}`:
+  `sess-123.1`, `sess-123.1.1`). `Checkpoint.parent_task_id:
+  Option<String>` (additive, serde default); `LedgerRow.task_id` /
+  `parent_task_id` (additive — pre-M8 rows parse with `None`);
+  `LedgerSink::new` gains `(task_id, parent_task_id)`.
+  `ApprovalRequest.session_label: Option<String>` (`None` at
+  non-agent sites) renders `[session] sub-agent sess-123.1 of task
+  sess-123 wants to run:` in CLI approvals and the same label in chat
+  approval messages — display-only (I1), the gate is unchanged.
+  `TaskStarted`/`TaskComplete` gain an optional `task_id` in their
+  render lines.
+- **`spawn_agent`** (`amparo-agent/src/spawn.rs`, registered by the
+  hosts): param `task` (required), trust tier `ExternalEffector` —
+  creating an acting entity always asks a human. The child is a fresh
+  `Agent` sharing the parent's provider, policy engine, approval gate,
+  event sink, registry, `PathPolicy`, checkpoint store, tenant, trust
+  ceiling, and config (the rate knob inherits); `child.run()` executes
+  inside the tool executor and the child's report returns as the tool
+  result. **The budget is shared across generations**
+  (`Arc<Mutex<usize>>`) and fails closed: past the limit the result is
+  `swarm budget exhausted: N sub-agents max` and no agent exists.
+  `SubAgentSpawned` event renders `[spawn] {child} under {parent}: …`
+  (render + NotebookSink arms).
+- **Preflight `sub_agent`**: `BlastRadius::SubAgent` (severity 2; the
+  classes renumber 0–5) with the note `spawns a sub-agent that acts
+  under the same gate chain`; `classify` maps `spawn_agent` to it
+  (static override). Display-only.
+- **`--max-sub-agents N` on `amparo run`** — default 4; `0` means the
+  tool is not registered (swarms off); garbage or negative → usage
+  error, exit 2. Chat: `UserProfile.swarm: Option<SwarmProfile>`
+  (`[users."…".swarm]` with `max_sub_agents`, default 4, and
+  `schedule`, default false) — per-profile → per-tenant (I2), unknown
+  keys rejected. `spawn_agent` is deliberately absent from the MCP and
+  `amparo chat dispatch` surfaces.
+- **`schedule`** (`amparo-chat`): a persisted promise, not an
+  execution. `ScheduledTask { id, tenant, requester, task
+  (PII-stripped at write — I6), at: RFC 3339, status: pending | fired
+  | missed, result }` at `<workspace>/.amparo/schedule/<id>.json`
+  (atomic tmp + rename); `ScheduleTool` params `at` + `task`, tier
+  `ExternalEffector`, preflight `system_wide`; registered only in the
+  chat driver, per-profile `schedule: true`, after `with_spawn_agent`
+  (children never inherit it). The driver's 30 s ticker (Amparo's
+  first background loop; `MissedTickBehavior::Delay`, startup scan)
+  runs the pure due-scan (`due_scan(tasks, now, grace)`, 60 s grace)
+  and fires each due promise back through the full gate chain as its
+  original requester — fresh Agent, continuity off, ledger +
+  checkpoints attached, wrapped in `TimeoutApprovalGate` (90 s) over
+  the chat gate (60 s): firing while nobody is present auto-denies,
+  never silently ahead of the gate. Past the grace window a promise is
+  marked **missed** — fail-closed, never fired late — and the
+  requester is notified; a fire notifies `[schedule] {id} fired —
+  {answer}`. The fire path carries no skills/case-library/spawn/
+  schedule — a promise fires one task.
+- **`amparo schedule list|cancel`** — the operator's window on the
+  queue: `list` prints every promise; `cancel` moves a pending promise
+  to `cancelled` (`cancelled by the operator`) — a status change,
+  never a deletion. Exit codes follow the `amparo run` contract (2
+  usage / 1 runtime / 0 ok).
+- **The swarm report** — `swarm: N sub-agent(s) (ids), M tool calls,
+  ~$X.XX in inference (estimate, chars/4, $R/1M tokens)` (tool calls
+  and tokens include the parent's): `[swarm]` in the CLI, appended to
+  the final answer in chat.
+
 ## [0.6.0] — 2026-08-29
 
 M7's two deliberate exclusions, landed: the WASM eval sandbox and the

@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M7b landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed
+## Status: pre-alpha, M8 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed, M8 (sub-agents & scheduling: `spawn_agent` + `schedule` behind the gate chain) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -80,19 +80,23 @@ approval copy.
   log at `<workspace>/.amparo/privacy/ledger.jsonl` recording every
   network-touching execution attempt (tool, host at most, outcome, human
   gate answer) and every PII strip as per-category counts.
-- **`amparo-chat`** (M4) — the chat adapter layer: one `ChatTransport`
+- **`amparo-chat`** (M4, M8) — the chat adapter layer: one `ChatTransport`
   seam, a per-task `ChatDriver` (allowlist, one task per chat, panic-proof
   task boundary), an `ApprovalRouter` for inline-button presses, a
   `ChatApprovalGate` (inline Approve/Deny buttons, 60 s auto-deny), and
   hand-rolled transports for **Telegram** (long polling), **Discord**
-  (gateway websocket) and **Slack** (Socket Mode).
-- **`amparo-cli`** (M3, M4, M7, M7b) — the one binary: `amparo run "task"`
+  (gateway websocket) and **Slack** (Socket Mode). M8 adds the schedule
+  queue: a promise store and a 30 s ticker that fires due promises back
+  through the gate chain as their requester.
+- **`amparo-cli`** (M3, M4, M7, M7b, M8) — the one binary: `amparo run "task"`
   drives the loop end-to-end (fail-closed BYO-LLM env, interactive terminal
   approval with a `[preflight] blast radius` line, `--auto-approve`/
   `--auto-deny` overrides, `--ledger-max-bytes` bounds the privacy
-  ledger), `amparo run --resume` resumes the newest
+  ledger, `--max-sub-agents` bounds the swarm — default 4, 0 turns it
+  off), `amparo run --resume` resumes the newest
   incomplete checkpoint for tenant `cli`, `amparo privacy` reads the
   ledger (summary + tail, incl. quota and rotation counts),
+  `amparo schedule list|cancel` inspects the chat promise queue,
   `amparo mcp-serve`
   reuses the same implementation as the standalone `amparo-mcp-serve`
   binary (same help, errors, exit codes), `amparo chat
@@ -332,6 +336,52 @@ default stays unbounded, so the M7 audit guarantee is unchanged for
 anyone who didn't opt in. `amparo privacy` reports the bound, the file
 size, rotations and dropped rows.
 
+## Sub-agents & scheduling
+
+M8 brings the two advanced-system features screened in
+`docs/swarms-advanced.md` behind the same gate chain every Amparo tool
+passes (see `docs/m8-swarms.md`). **The one rule: no member exits the
+gate chain.**
+
+**`spawn_agent`** lets a task decompose itself into sub-agents. A
+sub-agent is the same loop with the same gate chain, the parent's trust
+ceiling, and the parent's config; spawning is itself a gated tool call
+(`ExternalEffector`), so creating an acting entity always asks a human.
+The delegation chain is legible everywhere: child task ids chain
+(`sess-123.1`, `sess-123.1.1`), checkpoints carry `parent_task_id`,
+ledger rows carry `task_id`/`parent_task_id`, and the approval copy
+names who is asking (`[session] sub-agent sess-123.1 of task sess-123
+wants to run:`). A **swarm budget** (`--max-sub-agents`, default 4; `0`
+turns swarms off) is shared across generations and fails closed at the
+limit — past it, no agent exists. Every report states what the swarm
+burned — tool calls and a cost line with its method attached
+(`~$0.04 in inference (estimate, chars/4, $3/1M tokens)`) — as
+`[swarm]` in the CLI, appended to the final answer in chat.
+
+**`schedule`** is a promise, not an execution (chat only, per-tenant):
+the model commits to an RFC 3339 instant, the promise is written
+PII-stripped to `<workspace>/.amparo/schedule/`, and the chat driver's
+30 s ticker fires each due promise back through the full gate chain as
+its original requester — under a timeout wrapper that auto-denies when
+nobody answers, never silently ahead of the gate. A promise past its
+60 s grace window is marked **missed** — fail-closed, never fired
+late; re-scheduling is the operator's call. `amparo schedule
+list|cancel` inspects the queue (cancel is a status change, never a
+deletion).
+
+Per-tenant swarm profiles in the TOML chat config:
+
+```toml
+[users."telegram:444555666".swarm]
+max_sub_agents = 2     # default 4; 0 turns swarms off
+schedule = true        # opens the schedule tool for this tenant
+```
+
+A model is never the approver: supervisor agents are excluded by
+design, and `spawn_agent` is deliberately absent from the MCP and
+`amparo chat dispatch` surfaces — those paths have no session, no
+delegation chain, no audit.
+
 ## What Amparo is meant to be
 
 An agent that runs a real tool-use loop — shell, files, git, web, tests — where
@@ -372,6 +422,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 6 | Controlled self-improvement | ✅ done — M6a + M6b + M6c + M6d + M6e landed: the lab notebook (`--growth`, PII-stripped run records), the verification case library (same-tenant evidence in the verification prompt only), gated skills (adopted procedures executed step-by-step through the gate chain), metrics + retirement (running per-skill records, startup drift re-checks, `amparo skill check|retire`), and rollup + archival (the hot layer over the cold archive, `amparo notebook list|promote|rollup`) |
 | 7 | Instrumentation & hardening | ✅ landed — the always-on privacy ledger (every network-touching execution attempt and human denial, every PII strip as counts; `amparo privacy`), session persistence (`amparo run --resume` for crashed runs, per-tenant chat continuity from completed tasks), and preflight blast-radius classification (display-only labels in the approval copy) |
 | 8 | WASM eval sandbox + ledger quota | ✅ landed — the `eval_wasm` tool (fuel-metered, deterministic, approval-gated sandbox for untrusted computation; honestly labeled `read_only` in preflight) and the opt-in ledger quota lever (`--ledger-max-bytes`, per-tenant chat quotas; rotation marker rows record exactly what was dropped) |
+| 9 | Sub-agents & scheduling | ✅ landed — `spawn_agent` (a sub-agent is the same loop, gate chain, and ceiling; the delegation chain is in the ids, checkpoints, ledger rows, and approval copy; the shared budget fails closed) and `schedule` (a persisted promise re-entering the gate chain as its requester; missed = fail-closed), plus the swarm report with the cost line |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant
