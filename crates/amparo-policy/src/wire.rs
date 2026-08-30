@@ -16,6 +16,12 @@ use std::time::Duration;
 /// execution — a hung engine must not hang the agent.
 pub const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 60;
 
+/// The `fired` marker that identifies an audit-only (`enforced: false`)
+/// verdict: the engine's real verdict was a prediction, never a block.
+/// [`crate::AuditNoticeEngine`] keys its one-time stderr notice off this
+/// marker — producer and consumer share one constant.
+pub const AUDIT_ONLY_MARKER: &str = "audit-only";
+
 /// The request body per the wire spec.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckRequest {
@@ -128,8 +134,9 @@ impl WirePolicyEngine {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(CheckResponse { verdict: Some(_), .. }) =
-                    serde_json::from_value::<CheckResponse>(json.clone()).ok()
+                if let Some(CheckResponse {
+                    verdict: Some(_), ..
+                }) = serde_json::from_value::<CheckResponse>(json.clone()).ok()
                 {
                     return serde_json::from_value::<CheckResponse>(json)
                         .map_err(|e| format!("bad engine response: {e}"));
@@ -165,23 +172,18 @@ impl WirePolicyEngine {
             // Proceed, but carry the engine's real verdict in `fired` so the
             // audit trail is honest.
             Some(v @ ("deny" | "escalate")) => {
-                let real = resp
-                    .engine_verdict
-                    .clone()
-                    .unwrap_or_else(|| v.to_string());
+                let real = resp.engine_verdict.clone().unwrap_or_else(|| v.to_string());
                 PolicyDecision {
                     verdict: PolicyVerdict::Allow,
                     fired: vec![format!(
-                        "audit-only (enforced:false): engine verdict {real} — {reason}; proceeding unenforced"
+                        "{AUDIT_ONLY_MARKER} (enforced:false): engine verdict {real} — {reason}; proceeding unenforced"
                     )],
                 }
             }
-            Some(other) => PolicyDecision::escalate(format!(
-                "unknown engine verdict {other:?}: {reason}"
-            )),
-            None => PolicyDecision::escalate(format!(
-                "engine response missing verdict: {reason}"
-            )),
+            Some(other) => {
+                PolicyDecision::escalate(format!("unknown engine verdict {other:?}: {reason}"))
+            }
+            None => PolicyDecision::escalate(format!("engine response missing verdict: {reason}")),
         }
     }
 }
@@ -248,7 +250,9 @@ mod tests {
                 .to_string(),
         )
         .await;
-        let d = engine(&url).judge_tool("run_command", "rm -rf /", &[]).await;
+        let d = engine(&url)
+            .judge_tool("run_command", "rm -rf /", &[])
+            .await;
         assert_eq!(d.verdict, PolicyVerdict::Deny);
         assert!(d.fired[0].contains("rm"));
         server.await.unwrap();
@@ -273,12 +277,17 @@ mod tests {
         let (url, server) = mock_engine(
             &json!({"verdict":"deny","reason":"rm with destructive flags","enforced":false,
                     "engine_verdict":"deny"})
-                .to_string(),
+            .to_string(),
         )
         .await;
-        let d = engine(&url).judge_tool("run_command", "rm -rf /", &[]).await;
+        let d = engine(&url)
+            .judge_tool("run_command", "rm -rf /", &[])
+            .await;
         assert_eq!(d.verdict, PolicyVerdict::Allow, "audit mode must not block");
-        assert!(d.fired[0].contains("audit-only"), "real verdict must be recorded");
+        assert!(
+            d.fired[0].starts_with(AUDIT_ONLY_MARKER),
+            "real verdict must be recorded under the shared marker"
+        );
         assert!(d.fired[0].contains("deny"));
         server.await.unwrap();
     }
@@ -286,8 +295,11 @@ mod tests {
     #[tokio::test]
     async fn engine_direct_missing_enforced_is_authoritative() {
         // Engine-direct responses lack `enforced` — treat as enforced:true.
-        let (url, server) = mock_engine(&json!({"verdict":"deny","reason":"blocked"}).to_string()).await;
-        let d = engine(&url).judge_tool("run_command", "rm -rf /", &[]).await;
+        let (url, server) =
+            mock_engine(&json!({"verdict":"deny","reason":"blocked"}).to_string()).await;
+        let d = engine(&url)
+            .judge_tool("run_command", "rm -rf /", &[])
+            .await;
         assert_eq!(d.verdict, PolicyVerdict::Deny);
         server.await.unwrap();
     }
@@ -297,11 +309,15 @@ mod tests {
         let (url, server) = mock_engine(
             &json!({"verdict":"escalate","reason":"plan limit","enforced":false,
                     "limit_reached":true})
-                .to_string(),
+            .to_string(),
         )
         .await;
         let d = engine(&url).judge_tool("run_command", "ls", &[]).await;
-        assert_eq!(d.verdict, PolicyVerdict::Deny, "limit_reached bypasses audit mode");
+        assert_eq!(
+            d.verdict,
+            PolicyVerdict::Deny,
+            "limit_reached bypasses audit mode"
+        );
         server.await.unwrap();
     }
 

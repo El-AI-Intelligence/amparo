@@ -24,7 +24,7 @@ use amparo_notebook::{
     SkillSet,
 };
 use amparo_policy::wire::WirePolicyEngine;
-use amparo_policy::PolicyEngine;
+use amparo_policy::{AuditNoticeEngine, PolicyEngine};
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore, PrivacyPolicy};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::registry::default_registry_with_policy;
@@ -32,6 +32,7 @@ use amparo_tools::{Memory, PathPolicy, SkillLibrary, ToolRegistry, ToolTrustTier
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// The toast shown to a user who presses a button on someone else's
@@ -148,6 +149,9 @@ pub struct ChatDriver {
     provider: Arc<dyn InferenceProvider>,
     /// How each task's policy engine is obtained.
     policy_source: PolicySource,
+    /// One shared notice flag (M9 W3): the per-task wire engines print the
+    /// audit-mode notice once per process, not once per task.
+    audit_notice: Arc<AtomicBool>,
     /// Optional privacy policy, attached to every task's agent.
     privacy: Option<Arc<PrivacyPolicy>>,
     /// The optional lab notebook: with `--growth`, every completed or failed
@@ -241,6 +245,7 @@ impl ChatDriver {
             tenants,
             provider,
             policy_source,
+            audit_notice: Arc::new(AtomicBool::new(false)),
             privacy: None,
             notebook: None,
             hot: None,
@@ -368,10 +373,11 @@ impl ChatDriver {
     fn task_policy(&self, chat: &ChatRef) -> Arc<dyn PolicyEngine> {
         match &self.policy_source {
             PolicySource::Shared(engine) => Arc::clone(engine),
-            PolicySource::Wire { base_url, api_key } => Arc::new(
+            PolicySource::Wire { base_url, api_key } => Arc::new(AuditNoticeEngine::with_flag(
                 WirePolicyEngine::new(base_url.clone(), api_key.clone())
                     .with_session_id(format!("{}:{}", chat.platform, chat.user_id)),
-            ),
+                Arc::clone(&self.audit_notice),
+            )),
         }
     }
 
@@ -2089,6 +2095,62 @@ mod tests {
                 .any(|b| b.contains("\"session_id\":\"mock:user_b\"")),
             "user_b's check carries its session: {bodies:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn audit_mode_wire_engine_proceeds_and_serves_the_task() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // An audit-mode engine: `enforced:false` with a deny prediction.
+        // The caller contract never blocks on it — the tool runs and the
+        // task completes (the one-time notice goes to stderr).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _body = read_http_body(&mut sock).await.unwrap_or_default();
+            let body = r#"{"verdict":"deny","reason":"audit test","enforced":false}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let transport = MockTransport::new();
+        let provider = StubProvider::new(vec![
+            vec![
+                tool_call_frame("call_1", "read_file", r#"{"path":"notes.txt"}"#),
+                done_frame(),
+            ],
+            turn_text("A done."),
+        ]);
+        let mut users = BTreeMap::new();
+        users.insert("mock:user_a".to_string(), profile());
+        let driver = ChatDriver::new(
+            Tenants::Directory(Arc::new(ChatConfig { users })),
+            provider,
+            PolicySource::Wire {
+                base_url: format!("http://{addr}"),
+                api_key: None,
+            },
+            ToolRegistry::new(),
+            PathBuf::from("/tmp/amparo-chat-test-dir"),
+            transport.clone(),
+            Arc::new(ApprovalRouter::new()),
+            true,
+        );
+
+        driver
+            .on_message(chat_for("user_a"), "read a note".into())
+            .await;
+        wait_for_text(&transport, "A done.").await;
+        server
+            .await
+            .expect("mock policy engine served the audit check");
     }
 
     // ── M7 W8: chat continuity ─────────────────────────────────────────────

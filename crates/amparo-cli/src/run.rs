@@ -26,7 +26,8 @@ use amparo_notebook::{
     JsonlStore, NotebookSink, SkillLogEvent, SkillSet, HOT_FILE,
 };
 use amparo_policy::{
-    wire::WirePolicyEngine, AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine,
+    wire::WirePolicyEngine, AllowAllPolicyEngine, AuditNoticeEngine, DenyAllPolicyEngine,
+    PolicyEngine,
 };
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore};
 use amparo_sandbox::EvalWasmTool;
@@ -44,6 +45,8 @@ USAGE:
 
 FLAGS:
   --policy-url URL    wire a remote policy engine (deny-all default)
+  --session-id ID     tag every policy check with ID (engine-side audit
+                      rows); defaults to the task id
   --allow-all         run without policy checks (explicit opt-in)
   --auto-approve      approve escalated/external-effector calls without a human
   --auto-deny         deny escalated/external-effector calls without asking
@@ -88,7 +91,15 @@ trust.
 --max-sub-agents bounds the swarm (M8): the parent registers spawn_agent,
 every spawn asks for approval like any external-effector call, and the
 report states what the swarm burned — the sub-agent count and chain ids,
-the tool-call total and the cost estimate with its method attached.";
+the tool-call total and the cost estimate with its method attached.
+
+--session-id carries provenance to the policy engine (M9 W3): every check
+in this run is tagged with the id, so engine-side audit rows correlate
+with the run — the same seam the chat driver uses for platform:user_id.
+Without the flag the task id is the session id (on --resume, the
+checkpoint's original task id). The policy engine's audit-mode notice —
+\"policy engine is in audit mode; verdicts are advisory\" — prints to
+stderr the first time an audit-only verdict comes back, exactly once.";
 
 /// Parsed `amparo run` flags.
 #[derive(Debug, Clone)]
@@ -112,6 +123,9 @@ pub struct RunFlags {
     /// Swarm budget (M8): at most this many sub-agents per task.
     /// `0` turns `spawn_agent` off.
     pub max_sub_agents: usize,
+    /// Session id attached to every policy check (M9 W3): correlates
+    /// engine-side audit rows with this run. `None` = the task id.
+    pub session_id: Option<String>,
     /// The task — joined positional arguments (empty when resuming).
     pub task: String,
 }
@@ -132,6 +146,7 @@ impl Default for RunFlags {
             resume: false,
             ledger_max_bytes: None,
             max_sub_agents: 4,
+            session_id: None,
             task: String::new(),
         }
     }
@@ -194,6 +209,10 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
             "--policy-url" => match args.next() {
                 Some(url) => flags.policy_url = Some(url),
                 None => return ParseRunResult::Error("--policy-url requires a URL".into()),
+            },
+            "--session-id" => match args.next() {
+                Some(id) => flags.session_id = Some(id),
+                None => return ParseRunResult::Error("--session-id requires an id".into()),
             },
             "--allow-all" => flags.allow_all = true,
             "--auto-approve" => flags.auto_approve = true,
@@ -426,7 +445,17 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
     let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {
             let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
-            Arc::new(WirePolicyEngine::new(url.clone(), api_key))
+            // M9 W3: every check carries the run's session id (the task id
+            // by default) so engine-side audit rows correlate with this
+            // run; the audit-mode notice prints once, on the first
+            // audit-only verdict.
+            let session_id = flags
+                .session_id
+                .clone()
+                .unwrap_or_else(|| parent_task_id.clone());
+            Arc::new(AuditNoticeEngine::new(
+                WirePolicyEngine::new(url.clone(), api_key).with_session_id(session_id),
+            ))
         }
         (None, true) => Arc::new(AllowAllPolicyEngine),
         (None, false) => Arc::new(DenyAllPolicyEngine::new(
@@ -749,6 +778,21 @@ mod tests {
     fn help_is_recognized() {
         assert!(matches!(parse(&["--help"]), ParseRunResult::Help));
         assert!(matches!(parse(&["-h"]), ParseRunResult::Help));
+    }
+
+    #[test]
+    fn session_id_parses_defaults_to_none_and_rejects_missing_value() {
+        assert_eq!(
+            flags(parse(&["--session-id", "web-1", "task"]))
+                .session_id
+                .as_deref(),
+            Some("web-1")
+        );
+        assert!(flags(parse(&["task"])).session_id.is_none());
+        assert_eq!(
+            error(parse(&["--session-id"])),
+            "--session-id requires an id"
+        );
     }
 
     #[test]

@@ -35,6 +35,8 @@
 pub mod wire;
 
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// A policy verdict for a single tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,17 +73,26 @@ pub struct PolicyDecision {
 impl PolicyDecision {
     /// Builds an allow decision with no fired rules.
     pub fn allow() -> Self {
-        Self { verdict: PolicyVerdict::Allow, fired: Vec::new() }
+        Self {
+            verdict: PolicyVerdict::Allow,
+            fired: Vec::new(),
+        }
     }
 
     /// Builds a deny decision carrying the given reason.
     pub fn deny(reason: impl Into<String>) -> Self {
-        Self { verdict: PolicyVerdict::Deny, fired: vec![reason.into()] }
+        Self {
+            verdict: PolicyVerdict::Deny,
+            fired: vec![reason.into()],
+        }
     }
 
     /// Builds an escalate decision carrying the given reason.
     pub fn escalate(reason: impl Into<String>) -> Self {
-        Self { verdict: PolicyVerdict::Escalate, fired: vec![reason.into()] }
+        Self {
+            verdict: PolicyVerdict::Escalate,
+            fired: vec![reason.into()],
+        }
     }
 }
 
@@ -148,6 +159,70 @@ impl PolicyEngine for AllowAllPolicyEngine {
     }
 }
 
+/// The exact one-time stderr notice when a wire engine first answers in
+/// audit mode (`enforced: false`) — the copy promised at
+/// `docs/trial-bundle.md` §"graceful degradation".
+pub const AUDIT_NOTICE: &str = "policy engine is in audit mode; verdicts are advisory";
+
+/// A [`PolicyEngine`] wrapper that prints [`AUDIT_NOTICE`] to stderr the
+/// first time an underlying decision is audit-only — and never again.
+///
+/// The notice is display-only (I1): verdicts pass through untouched, so
+/// audit mode stays advisory by contract. The flag is an `Arc` so one
+/// process serving many engines (the chat driver's per-task wire engines)
+/// shares a single notice; every other caller gets a fresh flag.
+pub struct AuditNoticeEngine<E> {
+    inner: E,
+    noticed: Arc<AtomicBool>,
+    print: fn(&str),
+}
+
+impl<E> AuditNoticeEngine<E> {
+    /// Wraps `inner` with a fresh notice flag and the default stderr
+    /// printer — one notice per process.
+    pub fn new(inner: E) -> Self {
+        Self::with_flag(inner, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Wraps `inner` sharing an existing notice flag: engines built for
+    /// separate tasks in one process print the notice once, not once per
+    /// task.
+    pub fn with_flag(inner: E, noticed: Arc<AtomicBool>) -> Self {
+        Self::with_printer(inner, noticed, |line| eprintln!("{line}"))
+    }
+
+    /// The test seam: wraps `inner` sharing `noticed`, printing through
+    /// `print` instead of stderr.
+    pub fn with_printer(inner: E, noticed: Arc<AtomicBool>, print: fn(&str)) -> Self {
+        Self {
+            inner,
+            noticed,
+            print,
+        }
+    }
+}
+
+#[async_trait]
+impl<E: PolicyEngine> PolicyEngine for AuditNoticeEngine<E> {
+    async fn judge_tool(
+        &self,
+        tool_name: &str,
+        target: &str,
+        params: &[(&str, &str)],
+    ) -> PolicyDecision {
+        let decision = self.inner.judge_tool(tool_name, target, params).await;
+        if decision
+            .fired
+            .iter()
+            .any(|f| f.contains(wire::AUDIT_ONLY_MARKER))
+            && !self.noticed.swap(true, Ordering::SeqCst)
+        {
+            (self.print)(AUDIT_NOTICE);
+        }
+        decision
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +262,136 @@ mod tests {
         assert_eq!(PolicyVerdict::Allow.as_str(), "allowed");
         assert_eq!(PolicyVerdict::Deny.as_str(), "denied");
         assert_eq!(PolicyVerdict::Escalate.as_str(), "escalated");
+    }
+
+    // ── AuditNoticeEngine (M9 W3) ─────────────────────────────────────────
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// A scripted inner engine: returns the given decisions in order, then
+    /// allows.
+    struct ScriptedEngine {
+        decisions: Vec<PolicyDecision>,
+        seen: std::sync::Mutex<usize>,
+    }
+
+    impl ScriptedEngine {
+        fn new(decisions: Vec<PolicyDecision>) -> Self {
+            Self {
+                decisions,
+                seen: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PolicyEngine for ScriptedEngine {
+        async fn judge_tool(
+            &self,
+            _tool_name: &str,
+            _target: &str,
+            _params: &[(&str, &str)],
+        ) -> PolicyDecision {
+            let mut seen = self.seen.lock().unwrap();
+            let i = *seen;
+            *seen += 1;
+            self.decisions
+                .get(i)
+                .cloned()
+                .unwrap_or_else(PolicyDecision::allow)
+        }
+    }
+
+    fn audit_decision() -> PolicyDecision {
+        PolicyDecision {
+            verdict: PolicyVerdict::Allow,
+            fired: vec![format!(
+                "{} (enforced:false): engine verdict deny — test; proceeding unenforced",
+                wire::AUDIT_ONLY_MARKER
+            )],
+        }
+    }
+
+    static PRINTS_ONCE: AtomicUsize = AtomicUsize::new(0);
+    static LAST_LINE_ONCE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    fn record_once(line: &str) {
+        PRINTS_ONCE.fetch_add(1, Ordering::SeqCst);
+        *LAST_LINE_ONCE.lock().unwrap() = Some(line.to_string());
+    }
+
+    #[tokio::test]
+    async fn audit_notice_prints_exactly_once_with_the_exact_copy() {
+        let inner = ScriptedEngine::new(vec![audit_decision(), audit_decision(), audit_decision()]);
+        let engine =
+            AuditNoticeEngine::with_printer(inner, Arc::new(AtomicBool::new(false)), record_once);
+        for _ in 0..3 {
+            let d = engine.judge_tool("run_command", "x", &[]).await;
+            assert_eq!(
+                d.verdict,
+                PolicyVerdict::Allow,
+                "verdicts pass through untouched"
+            );
+        }
+        assert_eq!(
+            PRINTS_ONCE.load(Ordering::SeqCst),
+            1,
+            "one notice, not three"
+        );
+        assert_eq!(
+            LAST_LINE_ONCE.lock().unwrap().as_deref(),
+            Some(AUDIT_NOTICE)
+        );
+    }
+
+    static PRINTS_CLEAN: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_clean(_line: &str) {
+        PRINTS_CLEAN.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn non_audit_decisions_never_print_the_notice() {
+        let inner = ScriptedEngine::new(vec![
+            PolicyDecision::allow(),
+            PolicyDecision::deny("enforced block"),
+            PolicyDecision::escalate("engine failure: down"),
+        ]);
+        let engine =
+            AuditNoticeEngine::with_printer(inner, Arc::new(AtomicBool::new(false)), record_clean);
+        engine.judge_tool("read_file", "/tmp/x", &[]).await;
+        engine.judge_tool("run_command", "rm -rf /", &[]).await;
+        engine.judge_tool("write_file", "/tmp/y", &[]).await;
+        assert_eq!(PRINTS_CLEAN.load(Ordering::SeqCst), 0);
+    }
+
+    static PRINTS_SHARED: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_shared(_line: &str) {
+        PRINTS_SHARED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn one_shared_flag_prints_once_across_many_engines() {
+        // The chat driver builds a fresh wire engine per task; one process
+        // must still print the notice exactly once.
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = AuditNoticeEngine::with_printer(
+            ScriptedEngine::new(vec![audit_decision()]),
+            Arc::clone(&flag),
+            record_shared,
+        );
+        let second = AuditNoticeEngine::with_printer(
+            ScriptedEngine::new(vec![audit_decision()]),
+            Arc::clone(&flag),
+            record_shared,
+        );
+        first.judge_tool("run_command", "a", &[]).await;
+        second.judge_tool("run_command", "b", &[]).await;
+        assert_eq!(
+            PRINTS_SHARED.load(Ordering::SeqCst),
+            1,
+            "one process, one notice"
+        );
     }
 }

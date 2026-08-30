@@ -12,10 +12,11 @@
 
 use amparo_agent::{ApprovalGate, AutoApprove, AutoDeny};
 use amparo_policy::{
-    AllowAllPolicyEngine, DenyAllPolicyEngine, PolicyEngine, wire::WirePolicyEngine,
+    wire::WirePolicyEngine, AllowAllPolicyEngine, AuditNoticeEngine, DenyAllPolicyEngine,
+    PolicyEngine,
 };
 use amparo_sandbox::EvalWasmTool;
-use amparo_tools::{ToolRegistry, ToolTrustTier, default_registry};
+use amparo_tools::{default_registry, ToolRegistry, ToolTrustTier};
 use std::sync::Arc;
 
 use crate::McpServer;
@@ -31,6 +32,9 @@ pub struct ServeFlags {
     pub auto_approve: bool,
     /// Highest trust tier the server will execute.
     pub trust_ceiling: ToolTrustTier,
+    /// Session id attached to every policy check (M9 W3): correlates
+    /// engine-side audit rows with the caller behind this server.
+    pub session_id: Option<String>,
 }
 
 impl Default for ServeFlags {
@@ -40,6 +44,7 @@ impl Default for ServeFlags {
             allow_all: false,
             auto_approve: false,
             trust_ceiling: ToolTrustTier::SystemControl,
+            session_id: None,
         }
     }
 }
@@ -65,6 +70,8 @@ pub const HELP: &str =
      \n\
      FLAGS:\n\
      \x20 --policy-url URL    wire a remote policy engine (deny-all default)\n\
+     \x20 --session-id ID     tag every policy check with ID (engine-side\n\
+     \x20                      audit rows)\n\
      \x20 --allow-all         run without policy checks (explicit opt-in)\n\
      \x20 --auto-approve      approve escalated/external-effector calls\n\
      \x20                      without a human (default: auto-deny)\n\
@@ -83,6 +90,10 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> ParseResult {
             "--policy-url" => match args.next() {
                 Some(url) => flags.policy_url = Some(url),
                 None => return ParseResult::Error("--policy-url requires a URL".to_string()),
+            },
+            "--session-id" => match args.next() {
+                Some(id) => flags.session_id = Some(id),
+                None => return ParseResult::Error("--session-id requires an id".to_string()),
             },
             "--allow-all" => flags.allow_all = true,
             "--auto-approve" => flags.auto_approve = true,
@@ -114,11 +125,17 @@ pub struct ServeError {
 
 impl ServeError {
     fn config(message: impl Into<String>) -> Self {
-        Self { message: message.into(), exit_code: 2 }
+        Self {
+            message: message.into(),
+            exit_code: 2,
+        }
     }
 
     fn serve(e: impl std::fmt::Display) -> Self {
-        Self { message: format!("amparo-mcp-serve: {e}"), exit_code: 1 }
+        Self {
+            message: format!("amparo-mcp-serve: {e}"),
+            exit_code: 1,
+        }
     }
 }
 
@@ -133,7 +150,14 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
         }
         (Some(url), false) => {
             let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
-            Arc::new(WirePolicyEngine::new(url, api_key))
+            // M9 W3: every check carries the caller's session id (when
+            // given), and the audit-mode notice prints once per process.
+            let engine = WirePolicyEngine::new(url, api_key);
+            let engine = match &flags.session_id {
+                Some(id) => engine.with_session_id(id.clone()),
+                None => engine,
+            };
+            Arc::new(AuditNoticeEngine::new(engine))
         }
         (None, true) => Arc::new(AllowAllPolicyEngine),
         (None, false) => Arc::new(DenyAllPolicyEngine::new(
@@ -185,17 +209,23 @@ mod tests {
     #[test]
     fn parses_every_flag() {
         let f = flags(parse(&[
-            "--policy-url", "http://policy.test",
+            "--policy-url",
+            "http://policy.test",
+            "--session-id",
+            "web-1",
             "--auto-approve",
-            "--trust-ceiling", "observational",
+            "--trust-ceiling",
+            "observational",
         ]));
         assert_eq!(f.policy_url.as_deref(), Some("http://policy.test"));
+        assert_eq!(f.session_id.as_deref(), Some("web-1"));
         assert!(f.auto_approve);
         assert!(!f.allow_all);
         assert_eq!(f.trust_ceiling, ToolTrustTier::Observational);
 
         let f = flags(parse(&["--allow-all", "--trust-ceiling", "local_mutating"]));
         assert!(f.allow_all);
+        assert!(f.session_id.is_none());
         assert_eq!(f.trust_ceiling, ToolTrustTier::LocalMutating);
     }
 
@@ -217,6 +247,10 @@ mod tests {
     fn flags_that_take_values_reject_missing_values() {
         match parse(&["--policy-url"]) {
             ParseResult::Error(m) => assert_eq!(m, "--policy-url requires a URL"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match parse(&["--session-id"]) {
+            ParseResult::Error(m) => assert_eq!(m, "--session-id requires an id"),
             other => panic!("expected Error, got {other:?}"),
         }
         match parse(&["--trust-ceiling"]) {
