@@ -97,6 +97,19 @@ pub enum AgentEvent {
         /// The findings, empty when approved.
         findings: Vec<QcFinding>,
     },
+    /// A blackboard key was written (M10): the `[bus]` row. The key comes
+    /// from the tool's own output and the writer is the loop's task id —
+    /// never model-supplied arguments. Emitted only for successful writes;
+    /// reads are observational and already covered by `[exec]` rows.
+    BlackboardWrite {
+        /// The key written.
+        key: String,
+        /// The writing task's id, when the host fixed one (M8) — mirrors
+        /// [`AgentEvent::TaskStarted::task_id`] so the row names the
+        /// delegation chain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_by: Option<String>,
+    },
     /// The self-verification turn decided.
     Verification {
         /// `complete` | `incomplete`
@@ -304,6 +317,10 @@ pub fn format_event(event: &AgentEvent) -> String {
                 format!("[qc] with_findings: {}", list.join("; "))
             }
         },
+        AgentEvent::BlackboardWrite { key, written_by } => match written_by {
+            Some(writer) => format!("[bus] {} by {}", truncate(key), writer),
+            None => format!("[bus] {}", truncate(key)),
+        },
         AgentEvent::Verification { decision, feedback } => {
             let detail = feedback
                 .as_ref()
@@ -500,6 +517,20 @@ mod tests {
                         rule: "cost_honesty",
                         message: "the figure diverges".into(),
                     }],
+                }),
+            ),
+            (
+                "[bus] status by sess-123.1",
+                format_event(&AgentEvent::BlackboardWrite {
+                    key: "status".into(),
+                    written_by: Some("sess-123.1".into()),
+                }),
+            ),
+            (
+                "[bus] status",
+                format_event(&AgentEvent::BlackboardWrite {
+                    key: "status".into(),
+                    written_by: None,
                 }),
             ),
             (

@@ -721,6 +721,41 @@ async fn run_executes_approved_tool_end_to_end() {
 }
 
 #[tokio::test]
+async fn blackboard_write_emits_a_bus_row_and_the_read_sees_the_value() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![
+        tool_script("blackboard_write", r#"{"key":"handoff","value":"42"}"#),
+        tool_script("blackboard_read", r#"{"key":"handoff"}"#),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with(&[
+        "run",
+        "--allow-all",
+        "--auto-approve",
+        "--session-id",
+        "web-1",
+        "leave a handoff",
+    ])
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[exec] blackboard_write"), "{err}");
+    assert!(
+        err.contains("[bus] handoff by sess-"),
+        "the bus row names the writing task: {err}"
+    );
+    assert!(err.contains("[exec] blackboard_read"), "{err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+}
+
+#[tokio::test]
 async fn audit_mode_notice_prints_once_and_checks_carry_the_session_id() {
     let _guard = LOCK.lock().await;
     let marker = format!("amparo-cli-e2e-{}", std::process::id());

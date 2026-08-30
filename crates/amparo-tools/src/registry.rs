@@ -89,9 +89,7 @@ impl ToolSchema {
                 if let Some(enums) = &p.enum_values {
                     obj.insert(
                         "enum".to_string(),
-                        Value::Array(
-                            enums.iter().map(|e| Value::String(e.clone())).collect(),
-                        ),
+                        Value::Array(enums.iter().map(|e| Value::String(e.clone())).collect()),
                     );
                 }
                 (p.name.clone(), Value::Object(obj))
@@ -209,7 +207,9 @@ impl Default for ToolRegistry {
 impl ToolRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self {
+            tools: HashMap::new(),
+        }
     }
 
     /// Registers a tool executor under its schema name, replacing any tool
@@ -221,7 +221,10 @@ impl ToolRegistry {
 
     /// Schemas for all registered tools, rendered as OpenAI function definitions.
     pub fn openai_tools(&self) -> Vec<Value> {
-        self.tools.values().map(|t| t.schema().to_openai_function()).collect()
+        self.tools
+            .values()
+            .map(|t| t.schema().to_openai_function())
+            .collect()
     }
 
     /// Schemas for tools at or below a given trust tier.
@@ -265,6 +268,7 @@ impl ToolRegistry {
 
 // ─────────────────────────────────────────── Build default registry ──────────
 
+use crate::blackboard::{BlackboardReadTool, BlackboardStore, BlackboardWriteTool};
 use crate::build::RunBuildTool;
 use crate::filesystem::{EditFileTool, ListDirTool, PatchFileTool, ReadFileTool, WriteFileTool};
 use crate::git::{
@@ -276,8 +280,9 @@ use crate::shell::RunCommandTool;
 use crate::testing::RunTestsTool;
 use crate::web::{FetchUrlTool, WebSearchTool};
 
-/// Create the default registry with all 17 built-in tools, the 14
-/// workspace-bound ones rooted at `policy`.
+/// Create the default registry with all 19 built-in tools, the 14
+/// workspace-bound ones rooted at `policy` — plus the blackboard, rooted
+/// at the policy's workspace root.
 ///
 /// The deny-by-default posture lives in the *agent*, not here: a registry
 /// registers tools; only the policy gate in `amparo-agent` decides whether a
@@ -293,6 +298,13 @@ pub fn default_registry_with_policy(policy: Arc<PathPolicy>) -> ToolRegistry {
     registry.register(Arc::new(PatchFileTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(RunCommandTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(MemorySearchTool::new()));
+    // The blackboard (M10): one store shared by both tools and, through
+    // the registry clone handed to sub-agents, by the whole delegation
+    // chain. Rooted at the workspace — the same policy every other
+    // workspace-bound tool is confined by.
+    let board = Arc::new(BlackboardStore::new(&policy.workspace_root));
+    registry.register(Arc::new(BlackboardReadTool::new(Arc::clone(&board))));
+    registry.register(Arc::new(BlackboardWriteTool::new(board)));
     registry.register(Arc::new(GitStatusTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(GitDiffTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(GitCommitTool::with_policy(Arc::clone(&policy))));
@@ -334,7 +346,10 @@ mod tests {
         assert_eq!(v["type"], "function");
         assert_eq!(v["function"]["name"], "read_file");
         assert_eq!(v["function"]["parameters"]["required"][0], "path");
-        assert_eq!(v["function"]["parameters"]["properties"]["path"]["type"], "string");
+        assert_eq!(
+            v["function"]["parameters"]["properties"]["path"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -386,17 +401,40 @@ mod tests {
     fn default_registry_has_no_desktop_or_stub_tools() {
         let reg = default_registry();
         let names: Vec<String> = reg.list_schemas().iter().map(|s| s.name.clone()).collect();
-        for banned in ["take_screenshot", "click", "type_text", "send_email", "wallet_send", "check_inbox"] {
-            assert!(!names.contains(&banned.to_string()), "{} must not be in the Amparo registry", banned);
+        for banned in [
+            "take_screenshot",
+            "click",
+            "type_text",
+            "send_email",
+            "wallet_send",
+            "check_inbox",
+        ] {
+            assert!(
+                !names.contains(&banned.to_string()),
+                "{} must not be in the Amparo registry",
+                banned
+            );
         }
-        for required in ["run_command", "read_file", "write_file", "git_commit", "web_search", "run_tests"] {
-            assert!(names.contains(&required.to_string()), "{} must be in the registry", required);
+        for required in [
+            "run_command",
+            "read_file",
+            "write_file",
+            "git_commit",
+            "web_search",
+            "run_tests",
+        ] {
+            assert!(
+                names.contains(&required.to_string()),
+                "{} must be in the registry",
+                required
+            );
         }
     }
 
     #[tokio::test]
     async fn default_registry_with_policy_roots_workspace_tools() {
-        let root = std::env::temp_dir().join(format!("amparo-registry-policy-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("amparo-registry-policy-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("seed.txt"), "injected content").unwrap();
         let reg = default_registry_with_policy(Arc::new(PathPolicy::from_root(root.clone())));

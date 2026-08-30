@@ -250,12 +250,15 @@ impl EventSink for NotebookSink {
             // own TaskStarted/TaskComplete already opened and closed its
             // record on the stack above. QcAudit (M9): advisory — the
             // findings live in the event stream and the verification
-            // prompt, not in the run record.
+            // prompt, not in the run record. BlackboardWrite (M10): the
+            // write already lands in the record as its tool call — the
+            // `[bus]` row is the event stream's rendering of it.
             AgentEvent::AssistantTurn { .. }
             | AgentEvent::FinalAnswer { .. }
             | AgentEvent::PrivacyStripped { .. }
             | AgentEvent::QcAudit { .. }
             | AgentEvent::SubAgentSpawned { .. }
+            | AgentEvent::BlackboardWrite { .. }
             | AgentEvent::TaskResumed { .. } => {}
         }
     }

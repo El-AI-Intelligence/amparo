@@ -259,6 +259,11 @@ impl EventSink for LedgerSink {
             // verification prompt carry the findings; the ledger records
             // actions, not advice.
             AgentEvent::QcAudit { .. } => {}
+            // BlackboardWrite (M10): a workspace file append, not a
+            // network call — outside the privacy ledger's charter. The
+            // write's `[bus]` row lives in the event stream, and the
+            // notebook records the call itself.
+            AgentEvent::BlackboardWrite { .. } => {}
             _ => {}
         }
     }

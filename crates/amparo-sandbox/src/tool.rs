@@ -222,15 +222,11 @@ mod tests {
     #[tokio::test]
     async fn execute_round_trips_the_module() {
         let tool = EvalWasmTool::new();
-        let result = tool
-            .execute(&call(Some(&echo_wasm_b64())))
-            .await;
+        let result = tool.execute(&call(Some(&echo_wasm_b64()))).await;
         assert!(result.success, "round trip must succeed: {result:?}");
         assert_eq!(result.output["output"], serde_json::json!({}));
         assert!(result.output["fuel_consumed"].as_u64().unwrap() > 0);
-        assert!(result
-            .display_summary
-            .contains("eval_wasm completed"));
+        assert!(result.display_summary.contains("eval_wasm completed"));
     }
 
     #[tokio::test]
@@ -243,10 +239,7 @@ mod tests {
         });
         let result = tool.execute(&c).await;
         assert!(result.success, "input round trip must succeed: {result:?}");
-        assert_eq!(
-            result.output["output"],
-            serde_json::json!({"msg": "hello"})
-        );
+        assert_eq!(result.output["output"], serde_json::json!({"msg": "hello"}));
     }
 
     #[tokio::test]
@@ -265,11 +258,7 @@ mod tests {
             .execute(&call(Some("!!!not-base64!!!")))
             .await;
         assert!(!result.success);
-        assert!(result
-            .output["error"]
-            .as_str()
-            .unwrap()
-            .contains("base64"));
+        assert!(result.output["error"].as_str().unwrap().contains("base64"));
     }
 
     #[tokio::test]
@@ -283,12 +272,13 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_stays_at_17_without_eval_wasm() {
+    fn default_registry_stays_at_19_without_eval_wasm() {
         // eval_wasm is registered host-side only — the default registry
-        // is untouched by the sandbox crate.
+        // is untouched by the sandbox crate. (19 = the 17 base tools
+        // plus the blackboard pair, M10.)
         let reg = default_registry();
         let schemas = reg.list_schemas();
-        assert_eq!(schemas.len(), 17, "default registry count changed");
+        assert_eq!(schemas.len(), 19, "default registry count changed");
         assert!(
             schemas.iter().all(|s| s.name != EVAL_WASM),
             "eval_wasm must not be in the default registry"

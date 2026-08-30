@@ -6,6 +6,7 @@
 
 #![warn(missing_docs)]
 
+pub mod blackboard;
 pub mod build;
 pub mod filesystem;
 pub mod git;
@@ -17,12 +18,14 @@ pub mod skills;
 pub mod testing;
 pub mod web;
 
+pub use blackboard::{
+    BlackboardEntry, BlackboardReadTool, BlackboardStore, BlackboardWriteTool, BLACKBOARD_DIR,
+    BLACKBOARD_FILE, BLACKBOARD_READ, BLACKBOARD_WRITE,
+};
 pub use memory::{InMemoryStore, Memory, MemoryEntry, MemorySearchTool, MemoryWriteTool};
 pub use paths::PathPolicy;
 pub use registry::{
     default_registry, ToolCall, ToolExecutor, ToolParam, ToolRegistry, ToolResult, ToolSchema,
     ToolTrustTier,
 };
-pub use skills::{
-    SkillLibrary, SkillOrigin, SkillSpec, SkillStep, UseSkillTool, USE_SKILL,
-};
+pub use skills::{SkillLibrary, SkillOrigin, SkillSpec, SkillStep, UseSkillTool, USE_SKILL};

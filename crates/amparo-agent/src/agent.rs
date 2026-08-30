@@ -36,7 +36,7 @@ use amparo_policy::{PolicyEngine, PolicyVerdict};
 use amparo_privacy::{DataCategory, PiiPlaceholder};
 use amparo_tools::{
     PathPolicy, SkillLibrary, ToolCall, ToolExecutor, ToolRegistry, ToolResult, ToolTrustTier,
-    USE_SKILL,
+    BLACKBOARD_WRITE, USE_SKILL,
 };
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -774,6 +774,22 @@ impl Agent {
             .emit(&AgentEvent::PrivacyStripped { categories });
     }
 
+    /// Emit the `[bus]` row for a successful blackboard write (M10 W1).
+    /// The key comes from the tool's own output; the writer is this
+    /// agent's task id — never model-supplied arguments. Reads are
+    /// observational (`[exec]` covers them) and failed writes wrote
+    /// nothing, so neither emits.
+    fn emit_bus_row(&self, result: &ToolResult) {
+        if result.tool_name == BLACKBOARD_WRITE && result.success {
+            if let Some(key) = result.output.get("key").and_then(|v| v.as_str()) {
+                self.events.emit(&AgentEvent::BlackboardWrite {
+                    key: key.to_string(),
+                    written_by: self.task_id.clone(),
+                });
+            }
+        }
+    }
+
     /// Run the loop to completion: every gate decision, tool execution and
     /// the final self-verification, all reported through [`AgentReport`] and
     /// the [`EventSink`].
@@ -1380,6 +1396,7 @@ impl Agent {
                         self.events.emit(&AgentEvent::ToolExecuted {
                             result: result.clone(),
                         });
+                        self.emit_bus_row(&result);
                         if !executed_tools.contains(&result.tool_name) {
                             executed_tools.push(result.tool_name.clone());
                         }
@@ -1433,6 +1450,7 @@ impl Agent {
                     self.events.emit(&AgentEvent::ToolExecuted {
                         result: result.clone(),
                     });
+                    self.emit_bus_row(result);
                     if !executed_tools.contains(&result.tool_name) {
                         executed_tools.push(result.tool_name.clone());
                     }
@@ -2081,6 +2099,7 @@ impl Agent {
                         "display_summary": result.display_summary,
                         "output": result.output,
                     }));
+                    self.emit_bus_row(&result);
                     self.events.emit(&AgentEvent::ToolExecuted { result });
                 }
             }

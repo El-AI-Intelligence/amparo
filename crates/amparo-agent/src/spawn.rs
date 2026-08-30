@@ -348,7 +348,7 @@ mod tests {
     use amparo_inference::InferenceError;
     use amparo_privacy::LedgerStore;
     use amparo_tools::registry::default_registry_with_policy;
-    use amparo_tools::{PathPolicy, ToolRegistry};
+    use amparo_tools::{PathPolicy, ToolRegistry, BLACKBOARD_READ, BLACKBOARD_WRITE};
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::atomic::Ordering;
@@ -499,6 +499,71 @@ mod tests {
             "an exhausted spawn emits nothing — no agent exists"
         );
         assert_eq!(*budget.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn blackboard_is_shared_across_the_spawn_boundary() {
+        let provider = ScriptedProvider::new();
+        // One provider, one queue: the parent's spawn, the child's board
+        // write and its answer, the parent's board read and its answer.
+        provider.push_chat(spawn_call("call_1", "leave the handoff"));
+        provider.push_chat(turn_tool_call(
+            "call_2",
+            BLACKBOARD_WRITE,
+            r#"{"key":"handoff","value":"from the child"}"#,
+        ));
+        provider.push_chat(turn_text("child wrote the handoff"));
+        provider.push_chat(turn_tool_call(
+            "call_3",
+            BLACKBOARD_READ,
+            r#"{"key":"handoff"}"#,
+        ));
+        provider.push_chat(turn_text("parent read the handoff"));
+
+        let root = std::env::temp_dir().join(format!(
+            "amparo-board-swarm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let base = default_registry_with_policy(Arc::new(PathPolicy::from_root(root.clone())));
+        let budget = Arc::new(Mutex::new(2));
+        let (parent, _tool, events) = swarm(provider, &base, Arc::clone(&budget), 2, None);
+
+        let report = parent.run("coordinate").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(
+            report.final_answer.as_deref(),
+            Some("parent read the handoff")
+        );
+
+        // The board file under the workspace holds the child's row — the
+        // child inherited the parent's registry, store and path.
+        let rows = std::fs::read_to_string(root.join(".amparo/blackboard/board.jsonl"))
+            .expect("the child's write created the board");
+        assert!(rows.contains("from the child"), "{rows}");
+
+        // The `[bus]` row names the child (the trusted writer, never the
+        // caller), and the parent's read saw the child's value.
+        let snapshot = events.snapshot();
+        assert!(snapshot.iter().any(|e| matches!(
+            e,
+            AgentEvent::BlackboardWrite { key, written_by }
+                if key == "handoff" && written_by.as_deref() == Some("sess-123.1")
+        )));
+        let read = snapshot
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolExecuted { result } if result.tool_name == BLACKBOARD_READ => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .expect("the parent's board read executed");
+        assert!(read.success);
+        assert_eq!(read.output["value"], "from the child");
     }
 
     #[tokio::test]
