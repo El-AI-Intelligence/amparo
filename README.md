@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M8 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed, M8 (sub-agents & scheduling: `spawn_agent` + `schedule` behind the gate chain) landed
+## Status: pre-alpha, M9 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed, M8 (sub-agents & scheduling: `spawn_agent` + `schedule` behind the gate chain) landed, M9 (verification & QA: QC council beside policy, `amparo doctor`, the audit-mode notice + session tagging) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -382,6 +382,27 @@ design, and `spawn_agent` is deliberately absent from the MCP and
 `amparo chat dispatch` surfaces — those paths have no session, no
 delegation chain, no audit.
 
+## Verification & QA
+
+M9 makes the agent checkable (see `docs/m9-verification-qa.md`).
+**The QC council** runs deterministic rule auditors beside policy —
+after the loop produces a candidate final answer, before the
+verification prompt. Four rules fire on the run's own records
+(unexecuted-tool claims, evidence left the context, divergent
+inference-cost claims, residual PII shapes as category counts) and
+append **advisory** findings to the verification prompt; verification
+stays the model's call, and nothing the council produces auto-tunes
+anything. **`amparo doctor`** is the operator's QA pass: one
+read-only sweep over the workspace and configured surfaces (ledger,
+checkpoints, notebook, skills, schedule, policy reachability — with
+`--probe` sending one real check — and the chat config), exit 0
+healthy / 1 problems / 2 usage, cron-able. **The audit-mode notice**
+prints exactly once per process when a wire policy engine first
+answers `enforced: false` — `policy engine is in audit mode;
+verdicts are advisory` — and **session tagging**
+(`--session-id`, defaulting to the task id) attaches the caller to
+every engine-side audit row.
+
 ## What Amparo is meant to be
 
 An agent that runs a real tool-use loop — shell, files, git, web, tests — where
@@ -423,6 +444,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 7 | Instrumentation & hardening | ✅ landed — the always-on privacy ledger (every network-touching execution attempt and human denial, every PII strip as counts; `amparo privacy`), session persistence (`amparo run --resume` for crashed runs, per-tenant chat continuity from completed tasks), and preflight blast-radius classification (display-only labels in the approval copy) |
 | 8 | WASM eval sandbox + ledger quota | ✅ landed — the `eval_wasm` tool (fuel-metered, deterministic, approval-gated sandbox for untrusted computation; honestly labeled `read_only` in preflight) and the opt-in ledger quota lever (`--ledger-max-bytes`, per-tenant chat quotas; rotation marker rows record exactly what was dropped) |
 | 9 | Sub-agents & scheduling | ✅ landed — `spawn_agent` (a sub-agent is the same loop, gate chain, and ceiling; the delegation chain is in the ids, checkpoints, ledger rows, and approval copy; the shared budget fails closed) and `schedule` (a persisted promise re-entering the gate chain as its requester; missed = fail-closed), plus the swarm report with the cost line |
+| 10 | Verification & QA | ✅ landed — the QC council (deterministic rule auditors beside policy: findings feed the verification prompt, verification stays the model's call), `amparo doctor` (the operator's read-only workspace sweep, exit 0/1/2), and the audit-mode stderr notice + session tagging (`--session-id`, defaulting to the task id) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant

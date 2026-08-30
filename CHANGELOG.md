@@ -8,6 +8,63 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-08-30
+
+M9, landed: verification & QA — the QC council beside policy, the
+operator's sweep, and the audit-mode notice (see
+`docs/m9-verification-qa.md`).
+
+### Added
+
+- **The QC council** (`amparo-agent/src/qc.rs`): deterministic rule
+  auditors that run beside policy — after the candidate final answer,
+  before the verification prompt. Four rules over the run's own
+  records: `unexecuted_tool_claim` (the answer cites a registry tool
+  that never executed), `evidence` (executed calls exceed tool results
+  still in context), `cost_honesty` (a `$` inference figure diverges
+  from the `chars/4` accounting estimate; leaf runs only), and
+  `pii_shape` (residual PII shapes as category counts — values never
+  enter a finding, I6). Verdicts are advisory (`Approved` /
+  `WithFindings`); findings append to the verification prompt as
+  issues to check ("ignore any that are wrong"), and verification
+  stays the model's call. `AgentEvent::QcAudit` (render + sink arms),
+  a `[qc] audit #N …` tracing line, and in-memory stats counters
+  (logged, never persisted).
+- **`amparo doctor`** (`amparo-cli/src/doctor.rs`): one
+  deterministic, read-only sweep — workspace existence + writability,
+  ledger readability (unparseable lines flagged), session checkpoints
+  (`Running` older than 7 days = stale), notebook/skills/schedule
+  JSONL parseability, policy-engine reachability (TCP dial;
+  `--probe` sends one real `/check` and consumes one engine check),
+  and the `--chat-config` TOML. Exit 0 healthy / 1 problems / 2
+  usage; check lines on stdout, problems on stderr; cron-able. The
+  sweep reports and never repairs.
+- **The audit-mode stderr notice** (`amparo-policy`):
+  `AuditNoticeEngine<E>` prints the exact promised line — `policy
+  engine is in audit mode; verdicts are advisory`
+  (`docs/trial-bundle.md` §"graceful degradation") — once per
+  process, on the first verdict carrying `wire::AUDIT_ONLY_MARKER`.
+  Display-only (I1): verdicts pass through untouched. Wired at all
+  three surfaces (run, mcp-serve, chat — the driver shares one flag
+  across its per-task engines).
+- **Session tagging** (`WirePolicyEngine::with_session_id`): every
+  `/check` request carries the session id (omitted when absent —
+  never sent as null). `amparo run --session-id ID` (default: the
+  task id; on `--resume`, the checkpoint's original id) and
+  `amparo mcp-serve --session-id ID` (optional); the chat driver
+  tags `platform:user_id`.
+- **M9 test sweep (W4)**: process-level doctor exit-code matrix,
+  notice-once + session-tagged checks against a new `MockPolicy`
+  wire responder, default-session-id e2e, and wire-level session-id
+  serialization tests — 669 tests across the workspace at the W5
+  gate.
+
+### Changed
+
+- None — no M6–M8 surface changed. The verification prompt gains an
+  appended section only when findings exist; an empty pass leaves it
+  byte-identical.
+
 ## [0.7.0] — 2026-08-30
 
 M8, landed: sub-agents and scheduling behind the gate chain — no member

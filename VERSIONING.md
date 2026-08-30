@@ -38,6 +38,12 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
   shared budget fails closed), `schedule` (a persisted promise
   re-entering the gate chain as its requester; missed = fail-closed),
   and the swarm report with the cost line.
+- **0.8.0 (2026-08-30)** — verification & QA: the QC council
+  (deterministic rule auditors beside policy — advisory findings feed
+  the verification prompt, verification stays the model's call),
+  `amparo doctor` (the operator's read-only workspace sweep, exit
+  0/1/2), and the audit-mode stderr notice + session tagging
+  (`--session-id`, defaulting to the task id).
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 
