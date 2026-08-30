@@ -132,6 +132,7 @@ mod tests {
             arguments: serde_json::json!({"command": "ls"}),
             reasons: vec!["tool tier external_effector requires human approval".into()],
             blast_radius: Some(BlastRadius::Network),
+            session_label: None,
         }
     }
 

@@ -197,9 +197,10 @@ impl ChatTransport for TelegramTransport {
                 {"text": "Deny", "callback_data": format!("deny:{approval_id}")},
             ]]
         });
-        use crate::transport::preflight_line;
+        use crate::transport::{preflight_line, session_line};
         let text = truncate(&format!(
-            "Approval needed — {}: {}\n{}{}",
+            "{}Approval needed — {}: {}\n{}{}",
+            session_line(request).map(|line| format!("{line}\n")).unwrap_or_default(),
             request.tool_name,
             request.arguments,
             preflight_line(request).map(|line| format!("{line}\n")).unwrap_or_default(),

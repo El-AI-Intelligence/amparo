@@ -76,6 +76,11 @@ pub struct Checkpoint {
     pub tenant: String,
     /// The stable task handle: `sess-<nanos>-<pid>`, generated at start.
     pub task_id: String,
+    /// The parent task's id when this task is a spawned sub-agent (M8) —
+    /// the delegation chain, explicit in the file. `None` for top-level
+    /// tasks; files written before M8 parse with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     /// Unix seconds when the task started — the newest-Running scan
     /// orders by this.
     pub started_at: u64,
@@ -267,6 +272,7 @@ mod tests {
             version: CHECKPOINT_VERSION,
             tenant: tenant.to_string(),
             task_id: task_id.to_string(),
+            parent_task_id: None,
             started_at,
             prompt: "hello".to_string(),
             status,
@@ -374,6 +380,42 @@ mod tests {
         let store = JsonCheckpointStore::new(temp_root("missing"));
         assert!(store.latest_incomplete("nobody").is_none());
         assert!(store.latest_complete("nobody").is_none());
+    }
+
+    // ── M8 W2: delegation identity ──────────────────────────────────────────
+
+    #[test]
+    fn checkpoint_round_trips_the_parent_link() {
+        let root = temp_root("parent");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        let mut c = checkpoint("cli", "sess-123.1", 100, SessionStatus::Running);
+        c.parent_task_id = Some("sess-123".to_string());
+        store.save(&c).unwrap();
+        let got = store.latest_incomplete("cli").expect("the Running checkpoint");
+        assert_eq!(got.parent_task_id.as_deref(), Some("sess-123"));
+        assert_eq!(got.task_id, "sess-123.1");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkpoint_files_without_a_parent_field_parse_as_none() {
+        // A file written before M8 has no `parent_task_id` key — the
+        // serde default must read it, or resume breaks on old sessions.
+        let root = temp_root("old-shape");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        store.save(&checkpoint("cli", "sess-old", 100, SessionStatus::Running)).unwrap();
+        let path = checkpoint_path(&root, "cli", "sess-old");
+        fs::write(
+            &path,
+            r#"{"version":1,"tenant":"cli","task_id":"sess-old","started_at":100,"prompt":"hello","status":"running","conversation":[],"loop_state":{"last_tool_name":null,"same_tool_count":0,"empty_turn_retried":false,"last_good_summary":null,"used_tool_names":[],"steps_used":0},"final_answer":null}"#,
+        )
+        .unwrap();
+        let got = store.latest_incomplete("cli").expect("the old-shape checkpoint");
+        assert_eq!(got.task_id, "sess-old");
+        assert_eq!(got.parent_task_id, None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

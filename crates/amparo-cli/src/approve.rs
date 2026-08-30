@@ -110,11 +110,17 @@ impl ApprovalGate for InteractiveApprovalGate {
 /// classified the call — the human approves a concrete consequence, not
 /// an abstraction), and the gate reasons.
 fn prompt_text(request: &ApprovalRequest) -> String {
-    let mut lines = vec![format!(
+    let mut lines = Vec::new();
+    // M8: a sub-agent's ask is labeled with its delegation chain — who
+    // is asking, before what they want to run. Display-only (I1).
+    if let Some(label) = &request.session_label {
+        lines.push(format!("[session] {label} wants to run:"));
+    }
+    lines.push(format!(
         "[approval] {} {}",
         request.tool_name,
         serde_json::to_string_pretty(&request.arguments).unwrap_or_default()
-    )];
+    ));
     if let Some(radius) = &request.blast_radius {
         lines.push(format!("[preflight] blast radius: {radius} — {}", radius.note()));
     }
@@ -139,6 +145,7 @@ mod tests {
             arguments: serde_json::json!({"command": "echo hi"}),
             reasons: vec!["reaches outside the process".into()],
             blast_radius: Some(BlastRadius::Network),
+            session_label: None,
         }
     }
 
@@ -182,6 +189,24 @@ mod tests {
         let mut request = request();
         request.blast_radius = None;
         assert!(!prompt_text(&request).contains("[preflight]"), "{}", prompt_text(&request));
+    }
+
+    #[test]
+    fn session_label_leads_the_copy_for_a_sub_agent() {
+        let mut request = request();
+        request.session_label = Some("sub-agent sess-123.1 of task sess-123".into());
+        let text = prompt_text(&request);
+        let session = text.find("[session] sub-agent sess-123.1 of task sess-123 wants to run:");
+        let approval = text.find("[approval]");
+        let Some((session, approval)) = session.zip(approval) else {
+            panic!("expected both lines, got: {text}");
+        };
+        assert!(session < approval, "the session label leads the copy: {text}");
+    }
+
+    #[test]
+    fn no_session_label_omits_the_session_line() {
+        assert!(!prompt_text(&request()).contains("[session]"), "{}", prompt_text(&request()));
     }
 
     #[tokio::test]

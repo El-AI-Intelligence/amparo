@@ -423,6 +423,7 @@ async fn rest_retries_429_and_carries_approval_components() {
         arguments: json!({ "command": "ls" }),
         reasons: vec!["external effector".into()],
         blast_radius: Some(BlastRadius::Network),
+        session_label: None,
     };
 
     let msg = transport.send_approval(&chat, &request, "call_1").await.expect("send approval");

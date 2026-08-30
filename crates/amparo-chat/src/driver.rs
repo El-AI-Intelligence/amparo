@@ -454,7 +454,7 @@ impl ChatDriver {
                 privacy_dir(&ledger_root).join("ledger.jsonl"),
                 ledger_max_bytes.map(LedgerQuota::new),
             ) {
-                    Ok(store) => Some(Arc::new(LedgerSink::new(store, tenant_key.clone()))),
+                    Ok(store) => Some(Arc::new(LedgerSink::new(store, tenant_key.clone(), None, None))),
                     Err(e) => {
                         eprintln!(
                             "[ledger] unavailable — the task continues without the privacy \

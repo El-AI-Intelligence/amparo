@@ -34,6 +34,12 @@ pub struct ApprovalRequest {
     /// non-agent construction sites, which compute no classification —
     /// display-only context, never a gate input (I1).
     pub blast_radius: Option<BlastRadius>,
+    /// The optional session label (M8): who is asking — `sub-agent
+    /// sess-123.1 of task sess-123` — so a human approver sees the
+    /// delegation chain behind the call. `None` for a top-level agent
+    /// and at the non-agent construction sites. Display-only, like
+    /// [`ApprovalRequest::blast_radius`] — never a gate input (I1).
+    pub session_label: Option<String>,
 }
 
 /// The approval seam.

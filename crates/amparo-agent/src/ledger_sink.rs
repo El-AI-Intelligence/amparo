@@ -41,16 +41,31 @@ struct CallTracker {
 pub struct LedgerSink {
     store: LedgerStore,
     tenant_id: String,
+    /// The task the sink's rows describe (M8): stamped on every row, so
+    /// a swarm's ledger names whose action each row is.
+    task_id: Option<String>,
+    /// The parent task id (M8): the delegation chain, stamped on every
+    /// row beside `task_id`.
+    parent_task_id: Option<String>,
     calls: Mutex<HashMap<String, CallTracker>>,
     warn_on_write: AtomicBool,
 }
 
 impl LedgerSink {
     /// A sink appending rows tagged with `tenant_id` through `store`.
-    pub fn new(store: LedgerStore, tenant_id: impl Into<String>) -> Self {
+    /// `task_id`/`parent_task_id` (M8) stamp the delegation chain on
+    /// every row — `None` at the single-task hosts that generate no ids.
+    pub fn new(
+        store: LedgerStore,
+        tenant_id: impl Into<String>,
+        task_id: Option<String>,
+        parent_task_id: Option<String>,
+    ) -> Self {
         Self {
             store,
             tenant_id: tenant_id.into(),
+            task_id,
+            parent_task_id,
             calls: Mutex::new(HashMap::new()),
             warn_on_write: AtomicBool::new(false),
         }
@@ -103,6 +118,8 @@ impl EventSink for LedgerSink {
                         self.append(LedgerRow {
                             ts: chrono::Utc::now().to_rfc3339(),
                             tenant: self.tenant_id.clone(),
+                            task_id: self.task_id.clone(),
+                            parent_task_id: self.parent_task_id.clone(),
                             kind: LedgerKind::NetworkCall,
                             tool: Some(tracker.tool),
                             site: tracker.site,
@@ -119,6 +136,8 @@ impl EventSink for LedgerSink {
                     self.append(LedgerRow {
                         ts: chrono::Utc::now().to_rfc3339(),
                         tenant: self.tenant_id.clone(),
+                        task_id: self.task_id.clone(),
+                        parent_task_id: self.parent_task_id.clone(),
                         kind: LedgerKind::NetworkCall,
                         tool: Some(tracker.tool),
                         site: tracker.site,
@@ -133,6 +152,8 @@ impl EventSink for LedgerSink {
                 self.append(LedgerRow {
                     ts: chrono::Utc::now().to_rfc3339(),
                     tenant: self.tenant_id.clone(),
+                    task_id: self.task_id.clone(),
+                    parent_task_id: self.parent_task_id.clone(),
                     kind: LedgerKind::PiiStrip,
                     tool: None,
                     site: None,
@@ -169,7 +190,7 @@ mod tests {
 
     fn sink(dir: &PathBuf) -> LedgerSink {
         let store = LedgerStore::open(dir.join("ledger.jsonl")).unwrap();
-        LedgerSink::new(store, "cli")
+        LedgerSink::new(store, "cli", None, None)
     }
 
     fn request(sink: &LedgerSink, id: &str, name: &str, args: serde_json::Value) {
@@ -306,6 +327,26 @@ mod tests {
             rows[0].pii_counts,
             vec![("email".to_string(), 2), ("phone".to_string(), 1)]
         );
+    }
+
+    #[test]
+    fn rows_carry_the_delegation_chain() {
+        let dir = temp_dir();
+        let store = LedgerStore::open(dir.join("ledger.jsonl")).unwrap();
+        let sink = LedgerSink::new(
+            store,
+            "cli",
+            Some("sess-123.1".to_string()),
+            Some("sess-123".to_string()),
+        );
+        request(&sink, "c1", "fetch_url", json!({"url": "https://example.com"}));
+        sink.emit(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: true });
+        executed(&sink, "c1", "fetch_url", true);
+
+        let rows = rows(&dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id.as_deref(), Some("sess-123.1"));
+        assert_eq!(rows[0].parent_task_id.as_deref(), Some("sess-123"));
     }
 
     #[test]

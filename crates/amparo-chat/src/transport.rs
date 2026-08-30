@@ -89,6 +89,17 @@ pub fn preflight_line(request: &ApprovalRequest) -> Option<String> {
         .map(|radius| format!("[preflight] blast radius: {radius} — {}", radius.note()))
 }
 
+/// The one-line M8 delegation label for an approval message — who is
+/// asking — or `None` for a top-level agent. Like [`preflight_line`],
+/// display-only: the gate has already decided, and the label never
+/// feeds it (I1).
+pub fn session_line(request: &ApprovalRequest) -> Option<String> {
+    request
+        .session_label
+        .as_ref()
+        .map(|label| format!("[session] {label} wants to run:"))
+}
+
 /// The seam every chat adapter implements.
 ///
 /// The first three methods are outbound; [`receive`](ChatTransport::receive)
@@ -174,6 +185,7 @@ mod tests {
             arguments: serde_json::json!({}),
             reasons: vec![],
             blast_radius: radius,
+            session_label: None,
         }
     }
 
@@ -188,6 +200,21 @@ mod tests {
     #[test]
     fn preflight_line_is_none_without_a_classification() {
         assert_eq!(preflight_line(&request(None)), None);
+    }
+
+    #[test]
+    fn session_line_names_the_sub_agent_chain() {
+        let mut request = request(Some(amparo_agent::BlastRadius::Network));
+        request.session_label = Some("sub-agent sess-123.1 of task sess-123".into());
+        assert_eq!(
+            session_line(&request).unwrap(),
+            "[session] sub-agent sess-123.1 of task sess-123 wants to run:"
+        );
+    }
+
+    #[test]
+    fn session_line_is_none_for_a_top_level_agent() {
+        assert_eq!(session_line(&request(None)), None);
     }
 
     #[tokio::test]

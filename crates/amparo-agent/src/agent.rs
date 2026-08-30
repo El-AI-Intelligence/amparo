@@ -401,6 +401,17 @@ pub struct Agent {
     /// reuses the checkpoint's own tenant instead, so a restored task
     /// always lands back in its file.
     checkpoint_tenant: Option<String>,
+    /// The optional task id the next fresh run uses (M8): when the host
+    /// generated it — a sub-agent's chain id like `sess-123.1` — every
+    /// artifact (checkpoint file, ledger row, approval copy) names the
+    /// same task. `None` (the default) lets [`Agent::run`] generate
+    /// `sess-<nanos>-<pid>` as before.
+    task_id: Option<String>,
+    /// The optional parent task id (M8): set on a spawned sub-agent so
+    /// its approval copy, checkpoints and ledger rows carry the explicit
+    /// delegation link. Provenance and display only — delegation never
+    /// changes the gate (the one rule).
+    parent_task_id: Option<String>,
     /// The one-shot continuity context the next fresh task receives
     /// (M7 W8): built by the host from the tenant's latest complete
     /// checkpoint, injected as one user-role message between the system
@@ -415,6 +426,9 @@ pub struct Agent {
 /// `None` when no checkpoint store is attached — saves then no-op.
 struct SessionHandle {
     task_id: String,
+    /// The parent task's id when this task is a sub-agent (M8) —
+    /// persisted into checkpoints so the chain survives a resume.
+    parent_task_id: Option<String>,
     tenant: Option<String>,
     started_at: u64,
 }
@@ -477,6 +491,8 @@ impl Agent {
             path_policy: None,
             checkpoints: None,
             checkpoint_tenant: None,
+            task_id: None,
+            parent_task_id: None,
             continuity: None,
             config: AgentConfig::default(),
         }
@@ -537,6 +553,26 @@ impl Agent {
     ) -> Self {
         self.checkpoints = Some(store);
         self.checkpoint_tenant = Some(tenant.into());
+        self
+    }
+
+    /// Fix the task id the next fresh run uses (M8 W2): a host that
+    /// generated the id (a sub-agent's `{parent}.{n}` chain id) passes
+    /// it here so the checkpoint file, ledger rows and approval copy
+    /// all name the same task. Without it, [`Agent::run`] generates
+    /// `sess-<nanos>-<pid>` exactly as before.
+    pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
+    }
+
+    /// Mark this agent as a sub-agent of `parent_task_id` (M8 W2): the
+    /// approval copy names the chain (`sub-agent sess-123.1 of task
+    /// sess-123`), and checkpoints and ledger rows carry the explicit
+    /// parent link. Delegation is not exemption — the child runs the
+    /// same loop, the same gate chain, the same ceiling (the one rule).
+    pub fn with_parent_task_id(mut self, parent_task_id: impl Into<String>) -> Self {
+        self.parent_task_id = Some(parent_task_id.into());
         self
     }
 
@@ -629,7 +665,10 @@ impl Agent {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         let session = SessionHandle {
-            task_id: format!("sess-{}-{}", now.as_nanos(), std::process::id()),
+            task_id: self.task_id.clone().unwrap_or_else(|| {
+                format!("sess-{}-{}", now.as_nanos(), std::process::id())
+            }),
+            parent_task_id: self.parent_task_id.clone(),
             tenant: self.checkpoint_tenant.clone(),
             started_at: now.as_secs(),
         };
@@ -671,6 +710,7 @@ impl Agent {
         };
         let session = SessionHandle {
             task_id: checkpoint.task_id,
+            parent_task_id: checkpoint.parent_task_id,
             tenant: Some(checkpoint.tenant),
             started_at: checkpoint.started_at,
         };
@@ -688,6 +728,11 @@ impl Agent {
     /// The shared loop — a fresh run and a resume execute the same body.
     /// `vars` carry the loop locals, `session` the checkpoint handle,
     /// `starting_steps` the iteration offset (0 for a fresh run).
+    ///
+    /// M8 W2: the loop computes one `session_label` from the session's
+    /// task id and the agent's parent link — `sub-agent sess-123.1 of
+    /// task sess-123` — and every approval inside (model calls and
+    /// skill steps alike) carries it. `None` for a top-level agent.
     async fn run_loop(
         &self,
         prompt: String,
@@ -710,6 +755,16 @@ impl Agent {
             mut tokens_estimated,
             mut tool_calls,
         } = vars;
+
+        // Who is asking (M8 W2): a sub-agent's approvals name its
+        // delegation chain. Computed once from the session's task id
+        // and the agent's parent link; every gate_call below — model
+        // calls and skill steps — carries the same label. Display-only
+        // (I1): the label decorates the approval copy, never the gate.
+        let session_label: Option<String> = self
+            .parent_task_id
+            .as_ref()
+            .map(|parent| format!("sub-agent {} of task {}", session.task_id, parent));
 
         for step in 0..self.config.max_steps.saturating_sub(starting_steps) {
             steps_used = starting_steps + step + 1;
@@ -1027,7 +1082,7 @@ impl Agent {
                 let mut tool_messages: Vec<ChatMessage> = Vec::new();
 
                 for call in &calls {
-                    match self.gate_call(call).await {
+                    match self.gate_call(call, session_label.as_deref()).await {
                         GateOutcome::Blocked { result, decision, reasons } => {
                             self.block_call(
                                 &result,
@@ -1051,7 +1106,8 @@ impl Agent {
                                 // rest of the batch executes. Steps never add
                                 // conversation messages — the model asked for
                                 // `use_skill` and gets ONE tool-role answer.
-                                let (result, step_tools) = self.expand_skill(call).await;
+                                let (result, step_tools) =
+                                    self.expand_skill(call, session_label.as_deref()).await;
                                 for tool in step_tools {
                                     if !used_tool_names.contains(&tool) {
                                         used_tool_names.push(tool);
@@ -1418,6 +1474,7 @@ impl Agent {
             version: crate::session::CHECKPOINT_VERSION,
             tenant: tenant.clone(),
             task_id: session.task_id.clone(),
+            parent_task_id: session.parent_task_id.clone(),
             started_at: session.started_at,
             prompt: amparo_privacy::secure_minions_strip(prompt).sanitised_text,
             status,
@@ -1510,7 +1567,12 @@ impl Agent {
     /// record (model calls via [`Self::block_call`]; skill steps into the
     /// expansion record). Emits `ApprovalRequested`/`ApprovalResolved` when
     /// the approval gate runs; never emits `ToolGate` — the caller decides.
-    async fn gate_call(&self, call: &ToolCall) -> GateOutcome {
+    ///
+    /// `session_label` (M8) names who is asking on the approval copy —
+    /// `sub-agent sess-123.1 of task sess-123` — or `None` for a
+    /// top-level agent. The loop computes it once and every call inside
+    /// shares it. Display-only (I1).
+    async fn gate_call(&self, call: &ToolCall, session_label: Option<&str>) -> GateOutcome {
         let check = gate_check(
             &self.registry,
             self.config.trust_ceiling,
@@ -1553,6 +1615,7 @@ impl Agent {
                 arguments: call.arguments.clone(),
                 reasons: ask_reasons.clone(),
                 blast_radius,
+                session_label: session_label.map(str::to_string),
             };
             self.events.emit(&AgentEvent::ApprovalRequested {
                 call_id: call.id.clone(),
@@ -1621,7 +1684,14 @@ impl Agent {
     /// authored finite sequence is not a loop symptom. The returned
     /// `Vec<String>` is the step tool names in first-use order, feeding the
     /// case-library retrieval query.
-    async fn expand_skill(&self, call: &ToolCall) -> (ToolResult, Vec<String>) {
+    ///
+    /// `session_label` (M8) is the loop's who-is-asking label; every
+    /// step's approval carries it, exactly like a model call.
+    async fn expand_skill(
+        &self,
+        call: &ToolCall,
+        session_label: Option<&str>,
+    ) -> (ToolResult, Vec<String>) {
         let skill_name = call.arg_str("skill_name").unwrap_or("").to_string();
         let names = self
             .skills
@@ -1669,7 +1739,7 @@ impl Agent {
                 step_tools.push(step_call.name.clone());
             }
             self.events.emit(&AgentEvent::ToolCallRequested { call: step_call.clone() });
-            match self.gate_call(&step_call).await {
+            match self.gate_call(&step_call, session_label).await {
                 GateOutcome::Blocked { result, decision, reasons } => {
                     self.events.emit(&AgentEvent::ToolGate {
                         call_id: step_call.id.clone(),
@@ -2763,6 +2833,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sub_agent_approval_copy_names_the_delegation_chain() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+
+        let (echo, calls) = EchoTool::new(ToolTrustTier::ExternalEffector);
+        let registry = registry_with(Arc::new(echo));
+        let gate = RecordingGate::new(true);
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(gate.clone())
+            .with_task_id("sess-123.1")
+            .with_parent_task_id("sess-123");
+        let report = agent.run("do a thing").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let request = &gate.requests()[0];
+        assert_eq!(
+            request.session_label.as_deref(),
+            Some("sub-agent sess-123.1 of task sess-123")
+        );
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| matches!(s, AgentStep::ToolResult(r) if r.success)));
+    }
+
+    #[tokio::test]
     async fn trust_ceiling_blocks_higher_tiers() {
         let provider = ScriptedProvider::new();
         provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
@@ -3297,6 +3392,7 @@ mod tests {
             version: crate::session::CHECKPOINT_VERSION,
             tenant: "cli".to_string(),
             task_id: task_id.to_string(),
+            parent_task_id: None,
             started_at: 100,
             prompt: "echo hi".to_string(),
             status: SessionStatus::Running,
@@ -3304,6 +3400,29 @@ mod tests {
             loop_state: LoopState { steps_used, ..Default::default() },
             final_answer: None,
         }
+    }
+
+    #[tokio::test]
+    async fn with_task_id_names_the_checkpoint_file() {
+        let root =
+            std::env::temp_dir().join(format!("amparo-agent-w2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (echo, _) = EchoTool::new(ToolTrustTier::Observational);
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+        let store = Arc::new(JsonCheckpointStore::new(&root));
+        let agent = Agent::new(provider, registry_with(Arc::new(echo)), Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_checkpoints(store.clone(), "cli")
+            .with_task_id("sess-host-1");
+        agent.run("echo hi").await;
+        // The host's id — not a generated one — named the checkpoint
+        // file, so every artifact agrees on the task's identity.
+        assert!(crate::session::checkpoint_path(&root, "cli", "sess-host-1").exists());
+        let complete = store.latest_complete("cli").expect("the terminal checkpoint");
+        assert_eq!(complete.task_id, "sess-host-1");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

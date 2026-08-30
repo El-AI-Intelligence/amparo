@@ -59,6 +59,16 @@ pub struct LedgerRow {
     pub ts: String,
     /// Tenant tag — `cli` for runs, `platform:user_id` for chat tasks.
     pub tenant: String,
+    /// The task that produced the row (M8): the agent's task id —
+    /// `sess-123.1` for a spawned sub-agent — so every row answers
+    /// "whose action was this". Absent on rows written before M8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// The parent task's id when this row's task is a sub-agent (M8) —
+    /// the delegation chain, explicit on the row. Absent for top-level
+    /// tasks and pre-M8 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     /// The row's kind.
     pub kind: LedgerKind,
     /// `NetworkCall`: the tool name. `PiiStrip`: absent.
@@ -309,6 +319,8 @@ impl LedgerStore {
                     .last()
                     .map(|row| row.tenant.clone())
                     .unwrap_or_else(|| "ledger".to_string()),
+                task_id: None,
+                parent_task_id: None,
                 kind: LedgerKind::Rotated,
                 tool: None,
                 site: None,
@@ -444,6 +456,8 @@ mod tests {
         LedgerRow {
             ts: "2026-08-29T00:00:00+00:00".to_string(),
             tenant: "cli".to_string(),
+            task_id: None,
+            parent_task_id: None,
             kind,
             tool: None,
             site: None,
@@ -762,6 +776,24 @@ mod tests {
         // A garbage sidecar reads as "never recorded", not a wrong bound.
         std::fs::write(dir.join(QUOTA_SIDECAR), "not-a-number").unwrap();
         assert_eq!(recorded_quota(&path), None);
+    }
+
+    #[test]
+    fn rows_written_before_task_ids_parse_with_none() {
+        // A pre-M8 line carries no `task_id`/`parent_task_id` keys — the
+        // serde defaults must read it, or old ledgers stop parsing.
+        let dir = temp_dir();
+        let path = dir.join("ledger.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"ts":"2026-08-28T00:00:00+00:00","tenant":"cli","kind":"network_call","tool":"fetch_url","site":"https://example.com","outcome":"ok","gate":"human_approved","pii_counts":[]}"#,
+        )
+        .unwrap();
+        let rows = read_ledger(&path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, None);
+        assert_eq!(rows[0].parent_task_id, None);
+        assert_eq!(rows[0].tool.as_deref(), Some("fetch_url"));
     }
 
     #[test]

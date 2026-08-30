@@ -242,8 +242,10 @@ impl McpServer {
                     arguments: call.arguments.clone(),
                     reasons,
                     // The MCP server runs no agent loop — no preflight
-                    // classification (display-only context).
+                    // classification or delegation label (display-only
+                    // context).
                     blast_radius: None,
+                    session_label: None,
                 };
                 if !self.approval.request(&request).await {
                     return fail(call, "User denied the action or approval timed out".to_string());
@@ -264,6 +266,7 @@ impl McpServer {
                 arguments: call.arguments.clone(),
                 reasons: vec![format!("tool tier {:?} requires human approval", tier)],
                 blast_radius: None,
+                session_label: None,
             };
             if !self.approval.request(&request).await {
                 return fail(call, "User denied the action or approval timed out".to_string());

@@ -516,7 +516,7 @@ async fn wire(flags: &RunFlags) -> Result<WiredRun, String> {
         privacy_dir(&workspace_root).join("ledger.jsonl"),
         flags.ledger_max_bytes.map(LedgerQuota::new),
     ) {
-        Ok(store) => Some(Arc::new(LedgerSink::new(store, "cli"))),
+        Ok(store) => Some(Arc::new(LedgerSink::new(store, "cli", None, None))),
         Err(e) => {
             eprintln!(
                 "[ledger] unavailable — the run continues without the privacy ledger: {e}"
