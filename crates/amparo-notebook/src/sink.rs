@@ -90,8 +90,7 @@ impl NotebookSink {
     /// Await every pending record write. Idempotent — after the terminal
     /// events the records exist on disk once this returns.
     pub async fn flush(&self) {
-        let handles: Vec<JoinHandle<()>> =
-            std::mem::take(&mut *self.pending.lock().unwrap());
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.pending.lock().unwrap());
         for handle in handles {
             let _ = handle.await;
         }
@@ -249,10 +248,13 @@ impl EventSink for NotebookSink {
             // checkpoint is the session trail, and a resumed run's events
             // still reach the formatter. SubAgentSpawned (M8): the child's
             // own TaskStarted/TaskComplete already opened and closed its
-            // record on the stack above.
+            // record on the stack above. QcAudit (M9): advisory — the
+            // findings live in the event stream and the verification
+            // prompt, not in the run record.
             AgentEvent::AssistantTurn { .. }
             | AgentEvent::FinalAnswer { .. }
             | AgentEvent::PrivacyStripped { .. }
+            | AgentEvent::QcAudit { .. }
             | AgentEvent::SubAgentSpawned { .. }
             | AgentEvent::TaskResumed { .. } => {}
         }
@@ -267,10 +269,7 @@ mod tests {
 
     fn sink(tenant: &str) -> (Arc<NotebookSink>, Arc<InMemoryStore>) {
         let store = Arc::new(InMemoryStore::new());
-        let sink = Arc::new(NotebookSink::new(
-            store.clone() as Arc<dyn Memory>,
-            tenant,
-        ));
+        let sink = Arc::new(NotebookSink::new(store.clone() as Arc<dyn Memory>, tenant));
         (sink, store)
     }
 
@@ -352,10 +351,10 @@ mod tests {
         assert_eq!(record.tenant_id, "cli");
         assert_eq!(record.status, "complete");
         assert_eq!(record.task_text, "list the directory");
-        assert_eq!(record.tool_sequence_hash, sequence_hash(&[(
-            "run_command".to_string(),
-            "ls".to_string()
-        )]));
+        assert_eq!(
+            record.tool_sequence_hash,
+            sequence_hash(&[("run_command".to_string(), "ls".to_string())])
+        );
         assert_eq!(record.tool_calls.len(), 1);
         let call = &record.tool_calls[0];
         assert_eq!(call.call_id, "call_1");
@@ -369,7 +368,10 @@ mod tests {
         assert_eq!(call.summary.as_deref(), Some("listed 3 entries"));
         assert_eq!(call.duration_ms, Some(42));
         assert_eq!(record.verification.as_ref().unwrap().decision, "complete");
-        assert_eq!(record.final_answer.as_deref(), Some("the directory has 3 entries"));
+        assert_eq!(
+            record.final_answer.as_deref(),
+            Some("the directory has 3 entries")
+        );
         assert!(record.token_cost_estimate > 0);
         assert!(record.duration_ms < 60_000);
     }
@@ -396,7 +398,10 @@ mod tests {
         assert_eq!(record.final_answer.as_deref(), Some("no tool ran"));
         let call = &record.tool_calls[0];
         assert_eq!(call.decision, "trust_blocked");
-        assert_eq!(call.reasons, vec!["tool tier exceeds the trust ceiling".to_string()]);
+        assert_eq!(
+            call.reasons,
+            vec!["tool tier exceeds the trust ceiling".to_string()]
+        );
         assert!(!call.escalated);
         assert_eq!(call.approved, None);
         assert_eq!(call.success, None);
@@ -421,7 +426,13 @@ mod tests {
             decision: "allowed".into(),
             reasons: vec![],
         });
-        result(&sink, "call_1", "run_command", true, "mailed alice@example.com");
+        result(
+            &sink,
+            "call_1",
+            "run_command",
+            true,
+            "mailed alice@example.com",
+        );
         sink.emit(&AgentEvent::Verification {
             decision: "complete".into(),
             feedback: None,
@@ -444,13 +455,16 @@ mod tests {
         assert!(!everything.contains("alice@example.com"));
         assert!(record.task_text.contains("[EMAIL_1]"));
         assert!(record.tool_calls[0].target.contains("[EMAIL_1]"));
-        assert!(record
-            .tool_calls[0]
+        assert!(record.tool_calls[0]
             .summary
             .as_deref()
             .unwrap()
             .contains("[EMAIL_1]"));
-        assert!(record.final_answer.as_deref().unwrap().contains("[EMAIL_1]"));
+        assert!(record
+            .final_answer
+            .as_deref()
+            .unwrap()
+            .contains("[EMAIL_1]"));
     }
 
     #[tokio::test]
@@ -608,8 +622,14 @@ mod tests {
 
         let records = stored_records(&store).await;
         assert_eq!(records.len(), 2, "one record per task: {records:?}");
-        let parent = records.iter().find(|r| r.task_text == "parent task").unwrap();
-        let child = records.iter().find(|r| r.task_text == "child task").unwrap();
+        let parent = records
+            .iter()
+            .find(|r| r.task_text == "parent task")
+            .unwrap();
+        let child = records
+            .iter()
+            .find(|r| r.task_text == "child task")
+            .unwrap();
         assert_eq!(parent.status, "complete");
         assert_eq!(parent.final_answer.as_deref(), Some("parent done"));
         assert_eq!(parent.tool_calls.len(), 1);

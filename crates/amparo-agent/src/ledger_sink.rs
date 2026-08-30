@@ -255,6 +255,10 @@ impl EventSink for LedgerSink {
                     dropped_rows: None,
                 });
             }
+            // QcAudit (M9): advisory — the event stream and the
+            // verification prompt carry the findings; the ledger records
+            // actions, not advice.
+            AgentEvent::QcAudit { .. } => {}
             _ => {}
         }
     }

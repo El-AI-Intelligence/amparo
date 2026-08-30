@@ -60,6 +60,16 @@ pub struct LoopState {
     /// Tool names this task has called, in first-use order — the case
     /// library's retrieval query uses them as a sequence signal (M6b).
     pub used_tool_names: Vec<String>,
+    /// Tool names that actually executed this task (M9 W1 QC) — the
+    /// requested set minus gate blocks, plus skill steps that ran. A
+    /// resume restores it so the QC council never flags pre-resume
+    /// executions as unexecuted.
+    #[serde(default)]
+    pub executed_tools: Vec<String>,
+    /// Tool calls that actually executed (M9 W1 QC) — the council's
+    /// evidence rule compares this against tool results in context.
+    #[serde(default)]
+    pub executed_calls: usize,
     /// Loop iterations consumed so far (1 = one LLM turn).
     pub steps_used: usize,
 }
@@ -135,7 +145,10 @@ impl JsonCheckpointStore {
     /// chat tenant (`telegram:12345`) becomes `-` so the path stays a
     /// single, filesystem-friendly segment.
     fn dir_for(&self, tenant: &str) -> PathBuf {
-        self.root.join(".amparo").join("sessions").join(tenant.replace(':', "-"))
+        self.root
+            .join(".amparo")
+            .join("sessions")
+            .join(tenant.replace(':', "-"))
     }
 
     /// Scan `tenant`'s directory for the newest checkpoint matching
@@ -159,7 +172,10 @@ impl JsonCheckpointStore {
             let checkpoint: Checkpoint = match serde_json::from_str(&text) {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
-                    tracing::warn!("[amparo-agent] skipping corrupt checkpoint {}: {error}", path.display());
+                    tracing::warn!(
+                        "[amparo-agent] skipping corrupt checkpoint {}: {error}",
+                        path.display()
+                    );
                     continue;
                 }
             };
@@ -168,7 +184,10 @@ impl JsonCheckpointStore {
             }
             let better = newest
                 .as_ref()
-                .map(|current: &Checkpoint| (checkpoint.started_at, &checkpoint.task_id) > (current.started_at, &current.task_id))
+                .map(|current: &Checkpoint| {
+                    (checkpoint.started_at, &checkpoint.task_id)
+                        > (current.started_at, &current.task_id)
+                })
                 .unwrap_or(true);
             if better {
                 newest = Some(checkpoint);
@@ -267,7 +286,12 @@ pub fn continuity_context(checkpoint: &Checkpoint) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn checkpoint(tenant: &str, task_id: &str, started_at: u64, status: SessionStatus) -> Checkpoint {
+    fn checkpoint(
+        tenant: &str,
+        task_id: &str,
+        started_at: u64,
+        status: SessionStatus,
+    ) -> Checkpoint {
         Checkpoint {
             version: CHECKPOINT_VERSION,
             tenant: tenant.to_string(),
@@ -295,12 +319,17 @@ mod tests {
         c.loop_state.same_tool_count = 2;
         c.loop_state.last_good_summary = Some("read_file: ok".into());
         store.save(&c).unwrap();
-        let got = store.latest_incomplete("cli").expect("the Running checkpoint");
+        let got = store
+            .latest_incomplete("cli")
+            .expect("the Running checkpoint");
         assert_eq!(got.task_id, "sess-1");
         assert_eq!(got.tenant, "cli");
         assert_eq!(got.status, SessionStatus::Running);
         assert_eq!(got.loop_state.same_tool_count, 2);
-        assert_eq!(got.loop_state.last_good_summary.as_deref(), Some("read_file: ok"));
+        assert_eq!(
+            got.loop_state.last_good_summary.as_deref(),
+            Some("read_file: ok")
+        );
         assert_eq!(got.conversation.len(), 1);
         // The file lives at the documented layout, and no tmp lingers.
         let path = checkpoint_path(&root, "cli", "sess-1");
@@ -316,9 +345,13 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let store = JsonCheckpointStore::new(&root);
         for (task, started) in [("sess-old", 100), ("sess-new", 200), ("sess-mid", 150)] {
-            store.save(&checkpoint("cli", task, started, SessionStatus::Running)).unwrap();
+            store
+                .save(&checkpoint("cli", task, started, SessionStatus::Running))
+                .unwrap();
         }
-        let got = store.latest_incomplete("cli").expect("a Running checkpoint");
+        let got = store
+            .latest_incomplete("cli")
+            .expect("a Running checkpoint");
         assert_eq!(got.task_id, "sess-new");
         let _ = fs::remove_dir_all(&root);
     }
@@ -328,11 +361,35 @@ mod tests {
         let root = temp_root("status-filter");
         let _ = fs::remove_dir_all(&root);
         let store = JsonCheckpointStore::new(&root);
-        store.save(&checkpoint("cli", "sess-done", 200, SessionStatus::Complete)).unwrap();
-        store.save(&checkpoint("cli", "sess-failed", 150, SessionStatus::Failed)).unwrap();
+        store
+            .save(&checkpoint(
+                "cli",
+                "sess-done",
+                200,
+                SessionStatus::Complete,
+            ))
+            .unwrap();
+        store
+            .save(&checkpoint(
+                "cli",
+                "sess-failed",
+                150,
+                SessionStatus::Failed,
+            ))
+            .unwrap();
         assert!(store.latest_incomplete("cli").is_none());
-        store.save(&checkpoint("cli", "sess-running", 100, SessionStatus::Running)).unwrap();
-        assert_eq!(store.latest_incomplete("cli").expect("Running").task_id, "sess-running");
+        store
+            .save(&checkpoint(
+                "cli",
+                "sess-running",
+                100,
+                SessionStatus::Running,
+            ))
+            .unwrap();
+        assert_eq!(
+            store.latest_incomplete("cli").expect("Running").task_id,
+            "sess-running"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -341,9 +398,15 @@ mod tests {
         let root = temp_root("complete");
         let _ = fs::remove_dir_all(&root);
         let store = JsonCheckpointStore::new(&root);
-        store.save(&checkpoint("cli", "sess-a", 100, SessionStatus::Complete)).unwrap();
-        store.save(&checkpoint("cli", "sess-b", 300, SessionStatus::Complete)).unwrap();
-        store.save(&checkpoint("cli", "sess-c", 200, SessionStatus::Running)).unwrap();
+        store
+            .save(&checkpoint("cli", "sess-a", 100, SessionStatus::Complete))
+            .unwrap();
+        store
+            .save(&checkpoint("cli", "sess-b", 300, SessionStatus::Complete))
+            .unwrap();
+        store
+            .save(&checkpoint("cli", "sess-c", 200, SessionStatus::Running))
+            .unwrap();
         let got = store.latest_complete("cli").expect("a Complete checkpoint");
         assert_eq!(got.task_id, "sess-b");
         let _ = fs::remove_dir_all(&root);
@@ -354,7 +417,9 @@ mod tests {
         let root = temp_root("corrupt");
         let _ = fs::remove_dir_all(&root);
         let store = JsonCheckpointStore::new(&root);
-        store.save(&checkpoint("cli", "sess-good", 100, SessionStatus::Running)).unwrap();
+        store
+            .save(&checkpoint("cli", "sess-good", 100, SessionStatus::Running))
+            .unwrap();
         // A corrupt sibling must not break the scan.
         let dir = root.join(".amparo").join("sessions").join("cli");
         fs::write(dir.join("sess-bad.json"), "{not json").unwrap();
@@ -368,7 +433,14 @@ mod tests {
         let root = temp_root("tenant");
         let _ = fs::remove_dir_all(&root);
         let store = JsonCheckpointStore::new(&root);
-        store.save(&checkpoint("telegram:12345", "sess-1", 100, SessionStatus::Running)).unwrap();
+        store
+            .save(&checkpoint(
+                "telegram:12345",
+                "sess-1",
+                100,
+                SessionStatus::Running,
+            ))
+            .unwrap();
         let dir = root.join(".amparo").join("sessions").join("telegram-12345");
         assert!(dir.join("sess-1.json").exists());
         assert!(store.latest_incomplete("telegram:12345").is_some());
@@ -392,7 +464,9 @@ mod tests {
         let mut c = checkpoint("cli", "sess-123.1", 100, SessionStatus::Running);
         c.parent_task_id = Some("sess-123".to_string());
         store.save(&c).unwrap();
-        let got = store.latest_incomplete("cli").expect("the Running checkpoint");
+        let got = store
+            .latest_incomplete("cli")
+            .expect("the Running checkpoint");
         assert_eq!(got.parent_task_id.as_deref(), Some("sess-123"));
         assert_eq!(got.task_id, "sess-123.1");
         let _ = fs::remove_dir_all(&root);
@@ -405,14 +479,18 @@ mod tests {
         let root = temp_root("old-shape");
         let _ = fs::remove_dir_all(&root);
         let store = JsonCheckpointStore::new(&root);
-        store.save(&checkpoint("cli", "sess-old", 100, SessionStatus::Running)).unwrap();
+        store
+            .save(&checkpoint("cli", "sess-old", 100, SessionStatus::Running))
+            .unwrap();
         let path = checkpoint_path(&root, "cli", "sess-old");
         fs::write(
             &path,
             r#"{"version":1,"tenant":"cli","task_id":"sess-old","started_at":100,"prompt":"hello","status":"running","conversation":[],"loop_state":{"last_tool_name":null,"same_tool_count":0,"empty_turn_retried":false,"last_good_summary":null,"used_tool_names":[],"steps_used":0},"final_answer":null}"#,
         )
         .unwrap();
-        let got = store.latest_incomplete("cli").expect("the old-shape checkpoint");
+        let got = store
+            .latest_incomplete("cli")
+            .expect("the old-shape checkpoint");
         assert_eq!(got.task_id, "sess-old");
         assert_eq!(got.parent_task_id, None);
         let _ = fs::remove_dir_all(&root);
@@ -429,7 +507,9 @@ mod tests {
         c.final_answer = Some("done".into());
         store.save(&c).unwrap();
         assert!(store.latest_incomplete("cli").is_none());
-        let got = store.latest_complete("cli").expect("the terminal checkpoint");
+        let got = store
+            .latest_complete("cli")
+            .expect("the terminal checkpoint");
         assert_eq!(got.final_answer.as_deref(), Some("done"));
         let dir = root.join(".amparo").join("sessions").join("cli");
         let files: Vec<_> = fs::read_dir(dir).unwrap().flatten().collect();
@@ -454,11 +534,19 @@ mod tests {
         let context = continuity_context(&c).expect("a context");
         // The last six user/assistant messages appear, in order; older
         // messages and the tool message do not.
-        let first = context.find("message 4").expect("the tail's oldest kept message");
+        let first = context
+            .find("message 4")
+            .expect("the tail's oldest kept message");
         let last = context.find("message 9").expect("the newest message");
         assert!(first < last, "tail keeps its order: {context}");
-        assert!(!context.contains("message 3"), "older messages fall off: {context}");
-        assert!(!context.contains("call-1"), "tool messages are skipped: {context}");
+        assert!(
+            !context.contains("message 3"),
+            "older messages fall off: {context}"
+        );
+        assert!(
+            !context.contains("call-1"),
+            "tool messages are skipped: {context}"
+        );
     }
 
     #[test]

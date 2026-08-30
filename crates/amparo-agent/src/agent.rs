@@ -23,8 +23,9 @@ use crate::approval::{ApprovalGate, ApprovalRequest, AutoDeny};
 use crate::cases::{evidence_section, CaseLibrary};
 use crate::events::{truncate, AgentEvent, EventSink, InMemoryEventSink};
 use crate::preflight::classify;
+use crate::qc::{qc_prompt_section, QcCouncil, QcInput};
 use crate::session::{Checkpoint, CheckpointStore, LoopState, SessionStatus};
-use crate::spawn::SpawnAgentTool;
+use crate::spawn::{SpawnAgentTool, SPAWN_AGENT};
 use crate::sse::accumulate_turn;
 use crate::tokens::estimate_tokens;
 use amparo_inference::{
@@ -444,6 +445,11 @@ pub struct Agent {
     /// prompt and the task prompt. A resume ignores it — its own
     /// conversation continues.
     continuity: Option<String>,
+    /// The QC council (M9 W1): deterministic rule auditors run after
+    /// every candidate final answer. Advisory only — findings reach the
+    /// verification prompt, and the verification turn decides. Always
+    /// on; its counters live in memory.
+    qc: QcCouncil,
     config: AgentConfig,
 }
 
@@ -472,6 +478,13 @@ struct LoopVars {
     verification: Option<Verification>,
     steps_used: usize,
     used_tool_names: Vec<String>,
+    /// Tool names that actually executed (M9 W1 QC) — the requested set
+    /// minus gate blocks, plus skill steps that ran. The council's
+    /// unexecuted-tool-claim rule cites against this.
+    executed_tools: Vec<String>,
+    /// Tool calls that actually executed (M9 W1 QC) — the council's
+    /// evidence rule compares this against tool results in context.
+    executed_calls: usize,
     tokens_estimated: usize,
     tool_calls: usize,
 }
@@ -489,6 +502,8 @@ impl LoopVars {
             verification: None,
             steps_used: 0,
             used_tool_names: Vec::new(),
+            executed_tools: Vec::new(),
+            executed_calls: 0,
             tokens_estimated: 0,
             tool_calls: 0,
         }
@@ -555,6 +570,7 @@ impl Agent {
             task_id: None,
             parent_task_id: None,
             continuity: None,
+            qc: QcCouncil::new(),
             config: AgentConfig::default(),
         }
     }
@@ -843,6 +859,10 @@ impl Agent {
             verification: None,
             steps_used: starting_steps,
             used_tool_names: checkpoint.loop_state.used_tool_names,
+            // The QC council's evidence set restores with the loop, so a
+            // resumed task never flags pre-resume executions.
+            executed_tools: checkpoint.loop_state.executed_tools,
+            executed_calls: checkpoint.loop_state.executed_calls,
             // A resume's report covers the resumed segment only — the
             // checkpoint carries no counters (they are not part of its
             // schema), so accounting starts fresh here.
@@ -893,6 +913,8 @@ impl Agent {
             mut verification,
             mut steps_used,
             mut used_tool_names,
+            mut executed_tools,
+            mut executed_calls,
             mut tokens_estimated,
             mut tool_calls,
         } = vars;
@@ -923,6 +945,8 @@ impl Agent {
                     empty_turn_retried,
                     last_good_summary: last_good_summary.clone(),
                     used_tool_names: used_tool_names.clone(),
+                    executed_tools: executed_tools.clone(),
+                    executed_calls,
                     steps_used,
                 },
                 None,
@@ -959,6 +983,8 @@ impl Agent {
                             empty_turn_retried,
                             last_good_summary: last_good_summary.clone(),
                             used_tool_names: used_tool_names.clone(),
+                            executed_tools: executed_tools.clone(),
+                            executed_calls,
                             steps_used,
                         },
                         None,
@@ -1029,6 +1055,8 @@ impl Agent {
                                 last_good_summary: last_good_summary.clone(),
                                 used_tool_names: used_tool_names.clone(),
                                 steps_used,
+                                executed_tools: executed_tools.clone(),
+                                executed_calls,
                             },
                             None,
                         );
@@ -1062,6 +1090,8 @@ impl Agent {
                             empty_turn_retried,
                             last_good_summary: last_good_summary.clone(),
                             used_tool_names: used_tool_names.clone(),
+                            executed_tools: executed_tools.clone(),
+                            executed_calls,
                             steps_used,
                         },
                         None,
@@ -1133,6 +1163,8 @@ impl Agent {
                             // reads from complete checkpoints.
                             last_good_summary: Some(content.clone()),
                             used_tool_names: used_tool_names.clone(),
+                            executed_tools: executed_tools.clone(),
+                            executed_calls,
                             steps_used,
                         },
                         Some(&content),
@@ -1167,6 +1199,8 @@ impl Agent {
                         empty_turn_retried,
                         last_good_summary: last_good_summary.clone(),
                         used_tool_names: used_tool_names.clone(),
+                        executed_tools: executed_tools.clone(),
+                        executed_calls,
                         steps_used,
                     },
                     None,
@@ -1273,11 +1307,16 @@ impl Agent {
                                 // rest of the batch executes. Steps never add
                                 // conversation messages — the model asked for
                                 // `use_skill` and gets ONE tool-role answer.
-                                let (result, step_tools) =
+                                let (result, step_tools, executed_steps) =
                                     self.expand_skill(call, session_label.as_deref()).await;
                                 for tool in step_tools {
                                     if !used_tool_names.contains(&tool) {
                                         used_tool_names.push(tool);
+                                    }
+                                }
+                                for tool in executed_steps {
+                                    if !executed_tools.contains(&tool) {
+                                        executed_tools.push(tool);
                                     }
                                 }
                                 ready.push(ExecItem::Skill(result));
@@ -1341,6 +1380,10 @@ impl Agent {
                         self.events.emit(&AgentEvent::ToolExecuted {
                             result: result.clone(),
                         });
+                        if !executed_tools.contains(&result.tool_name) {
+                            executed_tools.push(result.tool_name.clone());
+                        }
+                        executed_calls = executed_calls.saturating_add(1);
                     }
                     steps.push(AgentStep::FinalAnswer {
                         content: summary.clone(),
@@ -1366,6 +1409,8 @@ impl Agent {
                             // summary continuity reads.
                             last_good_summary: Some(summary.clone()),
                             used_tool_names: used_tool_names.clone(),
+                            executed_tools: executed_tools.clone(),
+                            executed_calls,
                             steps_used,
                         },
                         Some(&summary),
@@ -1388,6 +1433,10 @@ impl Agent {
                     self.events.emit(&AgentEvent::ToolExecuted {
                         result: result.clone(),
                     });
+                    if !executed_tools.contains(&result.tool_name) {
+                        executed_tools.push(result.tool_name.clone());
+                    }
+                    executed_calls = executed_calls.saturating_add(1);
                     tool_messages.push(ChatMessage::tool(
                         result.tool_call_id.clone(),
                         serde_json::to_string(&result.output).unwrap_or_default(),
@@ -1470,6 +1519,39 @@ impl Agent {
                 content: assistant_content.clone(),
             });
 
+            // M9 QC council: deterministic auditors run over the
+            // candidate answer before the verification prompt is built.
+            // Advisory — the findings are appended to the prompt as
+            // issues to check, and the verification turn (the model)
+            // remains the only judge.
+            let qc_report = self.qc.audit(&QcInput {
+                final_answer: assistant_content.clone(),
+                requested_tools: used_tool_names.clone(),
+                executed_tools: executed_tools.clone(),
+                executed_calls,
+                tool_results_in_context: conversation.iter().filter(|m| m.role == "tool").count(),
+                tokens_estimated,
+                cost_per_million_tokens: self.config.cost_per_million_tokens,
+                known_tools: self
+                    .registry
+                    .list_schemas()
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect(),
+                spawned_subagents: used_tool_names.iter().any(|n| n == SPAWN_AGENT),
+            });
+            self.events.emit(&AgentEvent::QcAudit {
+                verdict: qc_report.verdict,
+                findings: qc_report.findings.clone(),
+            });
+            let stats = self.qc.stats();
+            tracing::info!(
+                "[qc] audit #{}: {:?}, cumulative findings {}",
+                stats.audits,
+                qc_report.verdict,
+                stats.findings_by_rule.values().sum::<usize>()
+            );
+
             // One extra turn at near-zero cost: ask the model whether its
             // answer fully addresses the original request. INCOMPLETE
             // re-enters the loop with the model's own feedback; an inference
@@ -1487,6 +1569,14 @@ impl Agent {
                 safe_prompt.chars().take(200).collect::<String>(),
                 assistant_content
             );
+            // M9: the council's findings — advisory issues to check —
+            // are appended to the verification prompt (never the action
+            // loop).
+            if !qc_report.findings.is_empty() {
+                verify_prompt.push('\n');
+                verify_prompt.push('\n');
+                verify_prompt.push_str(&qc_prompt_section(&qc_report.findings));
+            }
             // M6b: retrieved prior cases — observation-format evidence —
             // appended to the verification prompt only. An empty result
             // leaves the prompt byte-identical to the no-library build.
@@ -1589,6 +1679,8 @@ impl Agent {
                     empty_turn_retried,
                     last_good_summary: last_good_summary.clone(),
                     used_tool_names: used_tool_names.clone(),
+                    executed_tools: executed_tools.clone(),
+                    executed_calls,
                     steps_used,
                 },
                 Some(&content),
@@ -1623,6 +1715,8 @@ impl Agent {
                 empty_turn_retried,
                 last_good_summary: last_good_summary.clone(),
                 used_tool_names: used_tool_names.clone(),
+                executed_tools: executed_tools.clone(),
+                executed_calls,
                 steps_used,
             },
             final_answer.as_deref(),
@@ -1702,6 +1796,8 @@ impl Agent {
                     .last_good_summary
                     .map(|summary| amparo_privacy::secure_minions_strip(&summary).sanitised_text),
                 used_tool_names: loop_state.used_tool_names,
+                executed_tools: loop_state.executed_tools,
+                executed_calls: loop_state.executed_calls,
                 steps_used: loop_state.steps_used,
             },
             final_answer: final_answer
@@ -1882,11 +1978,15 @@ impl Agent {
     ///
     /// `session_label` (M8) is the loop's who-is-asking label; every
     /// step's approval carries it, exactly like a model call.
+    ///
+    /// The third return (M9 W1 QC) is the executed step names — the
+    /// subset of the second that actually ran (gate-blocked steps are
+    /// excluded) — feeding the council's executed-tool evidence.
     async fn expand_skill(
         &self,
         call: &ToolCall,
         session_label: Option<&str>,
-    ) -> (ToolResult, Vec<String>) {
+    ) -> (ToolResult, Vec<String>, Vec<String>) {
         let skill_name = call.arg_str("skill_name").unwrap_or("").to_string();
         let names = self
             .skills
@@ -1914,6 +2014,7 @@ impl Agent {
                         duration_ms: 0,
                     },
                     Vec::new(),
+                    Vec::new(),
                 );
             }
         };
@@ -1921,6 +2022,7 @@ impl Agent {
         let total = spec.steps.len();
         let mut done: Vec<serde_json::Value> = Vec::new();
         let mut step_tools: Vec<String> = Vec::new();
+        let mut executed_steps: Vec<String> = Vec::new();
         let mut duration_ms: u64 = 0;
         let mut blocked = false;
 
@@ -1968,6 +2070,9 @@ impl Agent {
                         reasons,
                     });
                     let result = self.execute_call(&step_call).await;
+                    if !executed_steps.contains(&step_call.name) {
+                        executed_steps.push(step_call.name.clone());
+                    }
                     duration_ms = duration_ms.saturating_add(result.duration_ms);
                     done.push(serde_json::json!({
                         "step": k + 1,
@@ -2020,6 +2125,7 @@ impl Agent {
                 duration_ms,
             },
             step_tools,
+            executed_steps,
         )
     }
 }
@@ -2143,6 +2249,7 @@ fn interpret_verification(verify_text: &str) -> VerificationDecision {
 mod tests {
     use super::*;
     use crate::approval::AutoApprove;
+    use crate::qc::{QcVerdict, UNEXECUTED_TOOL_CLAIM};
     use amparo_inference::InferenceError;
     use amparo_policy::PolicyDecision;
     use amparo_tools::{SkillLibrary, SkillOrigin, SkillSpec, SkillStep, UseSkillTool};
@@ -2236,6 +2343,57 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, AgentStep::FinalAnswer { .. })));
+    }
+
+    #[tokio::test]
+    async fn qc_finding_flows_into_verification_prompt() {
+        // The final answer cites echo, which never executed this run —
+        // the council flags the unexecuted-tool claim, the finding reaches
+        // the verification prompt, and the event stream carries the
+        // advisory verdict. Verification stays the model's call.
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("I used echo and the answer is 42."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, calls) = echo_registry();
+        let events = Arc::new(InMemoryEventSink::new());
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_events(events.clone());
+
+        let report = agent.run("what is the answer?").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        // The claim was never backed by a real call — echo never ran.
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // The advisory verdict lands in the event stream, once per audit.
+        let snapshot = events.snapshot();
+        let qc_events: Vec<&AgentEvent> = snapshot
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::QcAudit { .. }))
+            .collect();
+        assert_eq!(qc_events.len(), 1, "one QcAudit per verification round");
+        match qc_events[0] {
+            AgentEvent::QcAudit { verdict, findings } => {
+                assert_eq!(*verdict, QcVerdict::WithFindings);
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].rule, UNEXECUTED_TOOL_CLAIM);
+            }
+            _ => unreachable!("filtered to QcAudit"),
+        }
+
+        // The findings reached the verification prompt.
+        let verify_prompt = provider
+            .recorded_complete_requests()
+            .into_iter()
+            .map(|r| r.prompt)
+            .find(|p| p.contains("Verification check"))
+            .expect("verification completion ran");
+        assert!(
+            verify_prompt.contains("advisory findings"),
+            "got: {verify_prompt}"
+        );
+        assert!(verify_prompt.contains("unexecuted_tool_claim"));
     }
 
     #[tokio::test]

@@ -11,6 +11,8 @@ use amparo_tools::{ToolCall, ToolResult};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
+use crate::qc::{QcFinding, QcVerdict};
+
 /// Everything the agent does, in order. Serializable for audit trails.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -86,6 +88,15 @@ pub enum AgentEvent {
         /// The candidate answer text.
         content: String,
     },
+    /// The QC council audited the candidate final answer (M9): advisory
+    /// findings appended to the verification prompt. The verdict never
+    /// overrides the verification turn's decision.
+    QcAudit {
+        /// `approved` | `with_findings`
+        verdict: QcVerdict,
+        /// The findings, empty when approved.
+        findings: Vec<QcFinding>,
+    },
     /// The self-verification turn decided.
     Verification {
         /// `complete` | `incomplete`
@@ -146,7 +157,10 @@ impl InMemoryEventSink {
     /// An empty log with a fresh broadcast channel.
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(64);
-        Self { events: std::sync::Mutex::new(Vec::new()), tx }
+        Self {
+            events: std::sync::Mutex::new(Vec::new()),
+            tx,
+        }
     }
 
     /// A snapshot of everything emitted so far, in order.
@@ -224,7 +238,11 @@ pub fn format_event(event: &AgentEvent) -> String {
             Some(id) => format!("[task {id}] {}", truncate(prompt)),
             None => format!("[task] {}", truncate(prompt)),
         },
-        AgentEvent::AssistantTurn { step, content, tool_calls } => {
+        AgentEvent::AssistantTurn {
+            step,
+            content,
+            tool_calls,
+        } => {
             let calls = if *tool_calls > 0 {
                 format!(" ({tool_calls} tool call(s))")
             } else {
@@ -237,7 +255,12 @@ pub fn format_event(event: &AgentEvent) -> String {
             call.name,
             truncate(&serde_json::to_string(&call.arguments).unwrap_or_default())
         ),
-        AgentEvent::ToolGate { tool_name, decision, reasons, .. } => {
+        AgentEvent::ToolGate {
+            tool_name,
+            decision,
+            reasons,
+            ..
+        } => {
             let why = if reasons.is_empty() {
                 String::new()
             } else {
@@ -245,18 +268,25 @@ pub fn format_event(event: &AgentEvent) -> String {
             };
             format!("[gate] {tool_name}: {decision}{why}")
         }
-        AgentEvent::ApprovalRequested { tool_name, reasons, .. } => {
+        AgentEvent::ApprovalRequested {
+            tool_name, reasons, ..
+        } => {
             format!("[approval] {tool_name}: {}", truncate(&reasons.join("; ")))
         }
         AgentEvent::ApprovalResolved { approved, .. } => {
-            format!("[approval] {}", if *approved { "granted" } else { "denied" })
+            format!(
+                "[approval] {}",
+                if *approved { "granted" } else { "denied" }
+            )
         }
         AgentEvent::PrivacyStripped { categories } => {
             if categories.is_empty() {
                 "[privacy] stripped: nothing".to_string()
             } else {
-                let parts: Vec<String> =
-                    categories.iter().map(|(c, n)| format!("{c} x{n}")).collect();
+                let parts: Vec<String> = categories
+                    .iter()
+                    .map(|(c, n)| format!("{c} x{n}"))
+                    .collect();
                 format!("[privacy] stripped: {}", parts.join(", "))
             }
         }
@@ -264,6 +294,16 @@ pub fn format_event(event: &AgentEvent) -> String {
             format!("[exec] {} ({}ms)", result.tool_name, result.duration_ms)
         }
         AgentEvent::FinalAnswer { content } => format!("[answer] {}", truncate(content)),
+        AgentEvent::QcAudit { verdict, findings } => match verdict {
+            QcVerdict::Approved => "[qc] approved".to_string(),
+            QcVerdict::WithFindings => {
+                let list: Vec<String> = findings
+                    .iter()
+                    .map(|f| format!("{}: {}", f.rule, truncate(&f.message)))
+                    .collect();
+                format!("[qc] with_findings: {}", list.join("; "))
+            }
+        },
         AgentEvent::Verification { decision, feedback } => {
             let detail = feedback
                 .as_ref()
@@ -271,15 +311,28 @@ pub fn format_event(event: &AgentEvent) -> String {
                 .unwrap_or_default();
             format!("[verify] {decision}{detail}")
         }
-        AgentEvent::SubAgentSpawned { task_id, parent_task_id, prompt } => {
-            format!("[spawn] {task_id} under {parent_task_id}: {}", truncate(prompt))
+        AgentEvent::SubAgentSpawned {
+            task_id,
+            parent_task_id,
+            prompt,
+        } => {
+            format!(
+                "[spawn] {task_id} under {parent_task_id}: {}",
+                truncate(prompt)
+            )
         }
-        AgentEvent::TaskComplete { final_answer, task_id } => match task_id {
+        AgentEvent::TaskComplete {
+            final_answer,
+            task_id,
+        } => match task_id {
             Some(id) => format!("[complete {id}] {}", truncate(final_answer)),
             None => format!("[complete] {}", truncate(final_answer)),
-        }
+        },
         AgentEvent::TaskFailed { message } => format!("[failed] {}", truncate(message)),
-        AgentEvent::TaskResumed { task_id, steps_used } => {
+        AgentEvent::TaskResumed {
+            task_id,
+            steps_used,
+        } => {
             format!("[session] resumed {task_id} (step {steps_used})")
         }
     }
@@ -304,9 +357,17 @@ mod tests {
     #[test]
     fn snapshot_holds_emitted_events_in_order() {
         let sink = InMemoryEventSink::new();
-        sink.emit(&AgentEvent::TaskStarted { prompt: "hi".into(), task_id: None });
-        sink.emit(&AgentEvent::ToolExecuted { result: result("read_file") });
-        sink.emit(&AgentEvent::TaskComplete { final_answer: "done".into(), task_id: None });
+        sink.emit(&AgentEvent::TaskStarted {
+            prompt: "hi".into(),
+            task_id: None,
+        });
+        sink.emit(&AgentEvent::ToolExecuted {
+            result: result("read_file"),
+        });
+        sink.emit(&AgentEvent::TaskComplete {
+            final_answer: "done".into(),
+            task_id: None,
+        });
         let events = sink.snapshot();
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], AgentEvent::TaskStarted { .. }));
@@ -318,7 +379,10 @@ mod tests {
     fn broadcast_fans_out_to_subscribers() {
         let sink = InMemoryEventSink::new();
         let mut rx = sink.subscribe();
-        sink.emit(&AgentEvent::TaskStarted { prompt: "hi".into(), task_id: None });
+        sink.emit(&AgentEvent::TaskStarted {
+            prompt: "hi".into(),
+            task_id: None,
+        });
         // The channel holds the event even if no one awaited it yet.
         let received = rx.blocking_recv().unwrap();
         assert!(matches!(received, AgentEvent::TaskStarted { .. }));
@@ -360,7 +424,13 @@ mod tests {
     #[test]
     fn every_variant_renders_as_one_tagged_line() {
         let cases: Vec<(&str, String)> = vec![
-            ("[task]", format_event(&AgentEvent::TaskStarted { prompt: "p".into(), task_id: None })),
+            (
+                "[task]",
+                format_event(&AgentEvent::TaskStarted {
+                    prompt: "p".into(),
+                    task_id: None,
+                }),
+            ),
             (
                 "[turn",
                 format_event(&AgentEvent::AssistantTurn {
@@ -369,7 +439,10 @@ mod tests {
                     tool_calls: 1,
                 }),
             ),
-            ("[call]", format_event(&AgentEvent::ToolCallRequested { call: make_call() })),
+            (
+                "[call]",
+                format_event(&AgentEvent::ToolCallRequested { call: make_call() }),
+            ),
             (
                 "[gate]",
                 format_event(&AgentEvent::ToolGate {
@@ -389,7 +462,10 @@ mod tests {
             ),
             (
                 "[approval] granted",
-                format_event(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: true }),
+                format_event(&AgentEvent::ApprovalResolved {
+                    call_id: "c1".into(),
+                    approved: true,
+                }),
             ),
             (
                 "[privacy] stripped:",
@@ -397,8 +473,35 @@ mod tests {
                     categories: vec![("email".into(), 2)],
                 }),
             ),
-            ("[exec] run_command", format_event(&AgentEvent::ToolExecuted { result: make_result() })),
-            ("[answer]", format_event(&AgentEvent::FinalAnswer { content: "a".into() })),
+            (
+                "[exec] run_command",
+                format_event(&AgentEvent::ToolExecuted {
+                    result: make_result(),
+                }),
+            ),
+            (
+                "[answer]",
+                format_event(&AgentEvent::FinalAnswer {
+                    content: "a".into(),
+                }),
+            ),
+            (
+                "[qc] approved",
+                format_event(&AgentEvent::QcAudit {
+                    verdict: QcVerdict::Approved,
+                    findings: vec![],
+                }),
+            ),
+            (
+                "[qc] with_findings:",
+                format_event(&AgentEvent::QcAudit {
+                    verdict: QcVerdict::WithFindings,
+                    findings: vec![QcFinding {
+                        rule: "cost_honesty",
+                        message: "the figure diverges".into(),
+                    }],
+                }),
+            ),
             (
                 "[verify]",
                 format_event(&AgentEvent::Verification {
@@ -421,7 +524,13 @@ mod tests {
                     prompt: "research X".into(),
                 }),
             ),
-            ("[complete]", format_event(&AgentEvent::TaskComplete { final_answer: "a".into(), task_id: None })),
+            (
+                "[complete]",
+                format_event(&AgentEvent::TaskComplete {
+                    final_answer: "a".into(),
+                    task_id: None,
+                }),
+            ),
             (
                 "[complete sess-123.1]",
                 format_event(&AgentEvent::TaskComplete {
@@ -429,10 +538,18 @@ mod tests {
                     task_id: Some("sess-123.1".into()),
                 }),
             ),
-            ("[failed]", format_event(&AgentEvent::TaskFailed { message: "m".into() })),
+            (
+                "[failed]",
+                format_event(&AgentEvent::TaskFailed {
+                    message: "m".into(),
+                }),
+            ),
             (
                 "[session] resumed",
-                format_event(&AgentEvent::TaskResumed { task_id: "sess-1".into(), steps_used: 3 }),
+                format_event(&AgentEvent::TaskResumed {
+                    task_id: "sess-1".into(),
+                    steps_used: 3,
+                }),
             ),
         ];
         for (tag, line) in cases {
@@ -446,22 +563,33 @@ mod tests {
         let line = format_event(&AgentEvent::FinalAnswer { content: long });
         assert!(line.ends_with('…'));
         // Count chars, not bytes — the ellipsis is multi-byte.
-        assert_eq!(line.chars().count(), "[answer] ".chars().count() + TRUNCATE + 1);
+        assert_eq!(
+            line.chars().count(),
+            "[answer] ".chars().count() + TRUNCATE + 1
+        );
 
-        let line = format_event(&AgentEvent::FinalAnswer { content: "short".into() });
+        let line = format_event(&AgentEvent::FinalAnswer {
+            content: "short".into(),
+        });
         assert_eq!(line, "[answer] short");
     }
 
     #[test]
     fn denied_approvals_say_denied() {
-        let line = format_event(&AgentEvent::ApprovalResolved { call_id: "c1".into(), approved: false });
+        let line = format_event(&AgentEvent::ApprovalResolved {
+            call_id: "c1".into(),
+            approved: false,
+        });
         assert_eq!(line, "[approval] denied");
     }
 
     #[test]
     fn task_ids_name_the_chain_and_absent_ids_keep_the_plain_tag() {
         assert_eq!(
-            format_event(&AgentEvent::TaskStarted { prompt: "p".into(), task_id: None }),
+            format_event(&AgentEvent::TaskStarted {
+                prompt: "p".into(),
+                task_id: None
+            }),
             "[task] p"
         );
         assert_eq!(
@@ -496,8 +624,14 @@ mod tests {
             a.clone() as Arc<dyn EventSink>,
             b.clone() as Arc<dyn EventSink>,
         ]);
-        fanout.emit(&AgentEvent::TaskStarted { prompt: "hi".into(), task_id: None });
-        fanout.emit(&AgentEvent::TaskComplete { final_answer: "done".into(), task_id: None });
+        fanout.emit(&AgentEvent::TaskStarted {
+            prompt: "hi".into(),
+            task_id: None,
+        });
+        fanout.emit(&AgentEvent::TaskComplete {
+            final_answer: "done".into(),
+            task_id: None,
+        });
         // Both sinks saw both events, in order.
         assert_eq!(a.snapshot().len(), 2);
         assert_eq!(b.snapshot().len(), 2);
