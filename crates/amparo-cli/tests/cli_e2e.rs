@@ -290,6 +290,104 @@ impl MockLlm {
     }
 }
 
+// ── Mock policy engine ────────────────────────────────────────────────────────
+
+/// A hand-rolled HTTP responder for the wire policy protocol: every
+/// `POST /check` gets one canned audit-mode response (`enforced: false` —
+/// advisory, never a block; M9 W3). Request bodies are recorded so tests
+/// can assert what the wire client actually sent (session ids, tool names).
+struct MockPolicy {
+    addr: std::net::SocketAddr,
+    bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
+}
+
+impl MockPolicy {
+    async fn start() -> MockPolicy {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock policy");
+        let addr = listener.local_addr().unwrap();
+        let bodies: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    // Read the request head, then the body by Content-Length
+                    // (the MockLlm pattern).
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if buf.len() > 1_000_000 {
+                            break;
+                        }
+                    }
+                    let split = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                        .unwrap_or(buf.len());
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.trim_start()
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let mut body = buf[split..].to_vec();
+                    while body.len() < content_length {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                        recorded.lock().await.push(value);
+                    }
+                    let b = json!({
+                        "verdict": "deny",
+                        "reason": "audit test",
+                        "enforced": false,
+                        "engine_verdict": "deny"
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        b.len(),
+                        b
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        MockPolicy { addr, bodies }
+    }
+
+    /// Wire-protocol base URL for `--policy-url`.
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Every recorded `/check` request body, in arrival order.
+    async fn bodies(&self) -> Vec<Value> {
+        self.bodies.lock().await.clone()
+    }
+}
+
 /// One SSE frame carrying a content delta.
 fn content_frame(text: &str) -> Value {
     json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]})
@@ -527,6 +625,52 @@ async fn mcp_serve_subcommand_smoke_allow_all() {
     restore_workspace_env(prior);
 }
 
+// ── Doctor exit-code matrix ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn doctor_exit_code_matrix() {
+    let _guard = LOCK.lock().await;
+
+    // 0: a fresh workspace is healthy — missing files are information.
+    let fresh =
+        std::env::temp_dir().join(format!("amparo-doctor-e2e-{}-fresh", std::process::id()));
+    let _ = std::fs::remove_dir_all(&fresh);
+    std::fs::create_dir_all(&fresh).unwrap();
+    let out = run_with(&["doctor", "--workspace", fresh.to_str().unwrap()]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("[doctor] healthy"),
+        "the sweep printed its check lines to stdout: {}",
+        stdout(&out)
+    );
+
+    // 1: a workspace that is a file is a problem.
+    let not_dir =
+        std::env::temp_dir().join(format!("amparo-doctor-e2e-{}-file", std::process::id()));
+    std::fs::write(&not_dir, b"x").unwrap();
+    let out = run_with(&["doctor", "--workspace", not_dir.to_str().unwrap()]).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+
+    // 1: an unreadable ledger is a problem (unparseable lines count).
+    let corrupt =
+        std::env::temp_dir().join(format!("amparo-doctor-e2e-{}-corrupt", std::process::id()));
+    let _ = std::fs::remove_dir_all(&corrupt);
+    std::fs::create_dir_all(corrupt.join(".amparo").join("privacy")).unwrap();
+    std::fs::write(
+        corrupt.join(".amparo").join("privacy").join("ledger.jsonl"),
+        b"not json",
+    )
+    .unwrap();
+    let out = run_with(&["doctor", "--workspace", corrupt.to_str().unwrap()]).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+
+    // 2: usage errors — an unknown flag, and a probe without an engine.
+    let out = run_with(&["doctor", "--nonsense"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let out = run_with(&["doctor", "--probe"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+}
+
 // ── Loop e2e against the mock LLM ────────────────────────────────────────────
 
 #[tokio::test]
@@ -574,6 +718,101 @@ async fn run_executes_approved_tool_end_to_end() {
         "the approved tool ran: {err}"
     );
     assert_eq!(stdout(&out).trim(), "Done.");
+}
+
+#[tokio::test]
+async fn audit_mode_notice_prints_once_and_checks_carry_the_session_id() {
+    let _guard = LOCK.lock().await;
+    let marker = format!("amparo-cli-e2e-{}", std::process::id());
+    // Two tool calls → at least two wire checks, each an audit-only verdict.
+    let mock = MockLlm::start(vec![
+        tool_call_script(&format!("echo {marker} one")),
+        tool_call_script(&format!("echo {marker} two")),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let policy = MockPolicy::start().await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with(&[
+        "run",
+        "--policy-url",
+        &policy.url(),
+        "--session-id",
+        "web-1",
+        "--auto-approve",
+        "run two tools under an audit-mode engine",
+    ])
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // Multiple audit-only verdicts, exactly one notice — process-wide.
+    assert_eq!(
+        err.matches("policy engine is in audit mode; verdicts are advisory")
+            .count(),
+        1,
+        "the audit notice prints exactly once: {err}"
+    );
+
+    // Every wire check carried the explicit session id.
+    let bodies = policy.bodies().await;
+    assert!(
+        bodies.len() >= 2,
+        "both tool calls went through the wire engine: {bodies:?}"
+    );
+    for body in &bodies {
+        assert_eq!(
+            body["session_id"], "web-1",
+            "every check carries the session id: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn run_defaults_the_session_id_to_the_task_id() {
+    let _guard = LOCK.lock().await;
+    let marker = format!("amparo-cli-e2e-{}", std::process::id());
+    let mock = MockLlm::start(vec![
+        tool_call_script(&format!("echo {marker}")),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let policy = MockPolicy::start().await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with(&[
+        "run",
+        "--policy-url",
+        &policy.url(),
+        "--auto-approve",
+        "run one tool without an explicit session id",
+    ])
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // No --session-id → the task id itself tags every check, so the field
+    // is never simply absent (that would mean the default was lost).
+    let bodies = policy.bodies().await;
+    assert!(!bodies.is_empty(), "the tool call was checked: {bodies:?}");
+    for body in &bodies {
+        let id = body["session_id"].as_str();
+        assert!(
+            id.is_some_and(|s| !s.is_empty()),
+            "the default session id tags every check: {body}"
+        );
+    }
 }
 
 #[tokio::test]

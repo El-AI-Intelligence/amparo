@@ -222,13 +222,33 @@ mod tests {
 
     /// Tiny single-request HTTP responder for canned engine responses.
     async fn mock_engine(body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let (url, handle, _) = mock_engine_recording(body).await;
+        (url, handle)
+    }
+
+    /// Like [`mock_engine`], but also records every raw request body into
+    /// the returned mutex so tests can assert what the wire client sent
+    /// (M9 W4: session-id serialization).
+    async fn mock_engine_recording(
+        body: &str,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let body = body.to_string();
+        let bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&bodies);
         let handle = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 8192];
             let _ = sock.read(&mut buf).await.unwrap();
+            recorded
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&buf).to_string());
             let resp = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -236,7 +256,7 @@ mod tests {
             );
             sock.write_all(resp.as_bytes()).await.unwrap();
         });
-        (format!("http://{}", addr), handle)
+        (format!("http://{}", addr), handle, bodies)
     }
 
     fn engine(url: &str) -> WirePolicyEngine {
@@ -364,6 +384,43 @@ mod tests {
         let d = engine(&url).judge_tool("read_file", "/tmp/x", &[]).await;
         assert_eq!(d.verdict, PolicyVerdict::Allow);
         assert!(d.fired.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_id_flows_into_the_check_request() {
+        let (url, server, bodies) =
+            mock_engine_recording(&json!({"verdict":"allow","enforced":true}).to_string()).await;
+        let d = WirePolicyEngine::new(url, None)
+            .with_session_id("web-1")
+            .judge_tool("run_command", "ls", &[])
+            .await;
+        assert_eq!(d.verdict, PolicyVerdict::Allow);
+        let raw = bodies.lock().await;
+        assert_eq!(raw.len(), 1);
+        assert!(
+            raw[0].contains("\"session_id\":\"web-1\""),
+            "the check request carries the session id: {}",
+            raw[0]
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_session_id_omits_the_field() {
+        let (url, server, bodies) =
+            mock_engine_recording(&json!({"verdict":"allow","enforced":true}).to_string()).await;
+        let d = WirePolicyEngine::new(url, None)
+            .judge_tool("run_command", "ls", &[])
+            .await;
+        assert_eq!(d.verdict, PolicyVerdict::Allow);
+        let raw = bodies.lock().await;
+        assert_eq!(raw.len(), 1);
+        assert!(
+            !raw[0].contains("session_id"),
+            "absent session ids are skipped, not sent as null: {}",
+            raw[0]
+        );
         server.await.unwrap();
     }
 }
