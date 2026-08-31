@@ -325,15 +325,25 @@ impl ToolExecutor for WriteFileTool {
                     None
                 };
                 let result = if mode == "append" {
-                    use tokio::io::AsyncWriteExt;
-                    let mut file = tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&abs_path)
-                        .await;
-                    match file {
-                        Ok(ref mut f) => f.write_all(content.as_bytes()).await,
-                        Err(e) => Err(e),
+                    // A join-awaited blocking append, not a tokio::fs::File +
+                    // write_all: tokio's File::poll_write resolves write_all
+                    // as soon as the write is dispatched to the blocking pool,
+                    // and dropping the file detaches the task — the tool could
+                    // report success before the append reaches the file.
+                    let abs = abs_path.clone();
+                    let content = content.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&abs)?;
+                        std::io::Write::write_all(&mut file, content.as_bytes())
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e),
+                        Err(join) => Err(std::io::Error::other(join)),
                     }
                 } else {
                     tokio::fs::write(&abs_path, content.as_bytes()).await

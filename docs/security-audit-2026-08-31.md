@@ -211,6 +211,18 @@ to the box; the `.gitignore` decision for `web/` is the operator's.
   resume, task e2e, SSE, gate harness approve/deny/double/expire,
   ledger/sessions/schedule/notebook views, restart survival, Caddy
   valid). The audit's web-surface findings are closed in production.
+- **filesystem append completion semantics (2026-08-31)** — the
+  parallel-load flake in `write_file_append_backs_up_the_existing_file`
+  (#174) traced to a real tool defect: the append arm's `tokio::fs::File`
+  + `write_all` resolved before the write(2). Tokio's `File::poll_write`
+  returns Ready the moment the write is *dispatched* to the blocking
+  pool, and dropping the file detaches the task — `write_file` in append
+  mode could report success before the append reached the file. The
+  append is now a join-awaited `spawn_blocking` std write (the overwrite
+  arm's `tokio::fs::write` is join-awaited by construction, which is why
+  only the append path flaked); the hand-rolled tokio-File write pattern
+  was grep-verified workspace-unique. Verified: 8-way stress 1600/1600
+  green (pre-fix ~1%), both gates green.
 
 ## Operator note
 
