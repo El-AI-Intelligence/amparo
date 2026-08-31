@@ -151,6 +151,21 @@ to the box; the `.gitignore` decision for `web/` is the operator's.
   → `BlastRadius::Network`), MED-4 (`memory_store` strips PII), MED-5
   (`blackboard_write` strips PII), LOW-8 (API-key shapes in the strip
   engine, run before the digit patterns).
+- **20793d2** — MED-3 (git and build spawns inherit a stripped
+  environment via `amparo_tools::process_env::secret_free_env`:
+  `env_clear` + re-inject the current environment minus `AMPARO_*` keys,
+  so PATH/CARGO/RUSTUP toolchain resolution still works; the MCP client
+  spawn keeps the operator environment — the audit scoped git+build, and
+  an operator-configured MCP server may need its own env), MED-6
+  (`amparo_privacy::perms::owner_only` enforces 0600 files / 0700
+  directories at every persistence site: ledger + rotation sidecar,
+  notebook store, skills append, rollup lock + hot layer, blackboard,
+  session checkpoints, chat schedule. Directories are hardened only when
+  the call itself created them — a pre-existing parent is not ours to
+  re-permission; files we just opened are always hardened; mode carries
+  to the final file through the write-tmp-then-rename pattern. Residual:
+  state directories created by pre-fix versions keep their old modes
+  until recreated; the cold archive's content bytes are untouched).
 
 ## Operator note
 
