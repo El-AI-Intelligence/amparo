@@ -140,6 +140,18 @@ before the reveal; both gates green after each batch; cold archive
 byte-identical. The `web/` fixes edit the untracked tree on disk and deploy
 to the box; the `.gitignore` decision for `web/` is the operator's.
 
+### Fix log
+
+- **2552ef5** — MED-1 (wire client: only an `escalate` verdict passes
+  through failure statuses; the body read gets its own timeout), LOW-2
+  (body-read timeout), LOW-3 (`call_id` percent-encoded into the poll
+  URL), LOW-12 (`--approval-endpoint` requires scheme + host).
+- **d1cbc2e** — MED-2 (`fetch_url` → ExternalEffector; `web_search` →
+  new `Network` tier; `--trust-ceiling network`; preflight maps `Network`
+  → `BlastRadius::Network`), MED-4 (`memory_store` strips PII), MED-5
+  (`blackboard_write` strips PII), LOW-8 (API-key shapes in the strip
+  engine, run before the digit patterns).
+
 ## Operator note
 
 The audit is the prerequisite, not the decision: making the repo public and
