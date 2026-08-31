@@ -11,8 +11,8 @@
 //! the terminal by default.
 
 use amparo_agent::{
-    format_event, Agent, AgentConfig, AgentEvent, ApprovalGate, AutoApprove, AutoDeny, EventSink,
-    JsonCheckpointStore, SpawnAgentTool, WebApprovalGate,
+    format_event, valid_approval_endpoint, Agent, AgentConfig, AgentEvent, ApprovalGate,
+    AutoApprove, AutoDeny, EventSink, JsonCheckpointStore, SpawnAgentTool, WebApprovalGate,
 };
 use amparo_inference::InferenceConfig;
 use amparo_policy::{
@@ -170,9 +170,9 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> ParseResult {
         );
     }
     if let Some(url) = &flags.approval_endpoint {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
+        if !valid_approval_endpoint(url) {
             return ParseResult::Error(format!(
-                "--approval-endpoint must be an http(s) URL, got '{url}'"
+                "--approval-endpoint must be an http(s) URL with a host, got '{url}'"
             ));
         }
     }
@@ -440,7 +440,7 @@ mod tests {
             ParseResult::Error(m) => {
                 assert_eq!(
                     m,
-                    "--approval-endpoint must be an http(s) URL, got 'nonsense'"
+                    "--approval-endpoint must be an http(s) URL with a host, got 'nonsense'"
                 )
             }
             other => panic!("expected Error, got {other:?}"),

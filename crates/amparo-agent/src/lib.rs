@@ -94,4 +94,4 @@ pub use session::{
 };
 pub use spawn::{SpawnAgentTool, SubAgentSummary, SPAWN_AGENT};
 pub use tokens::{estimate_tokens, format_cost_line};
-pub use web_approval::WebApprovalGate;
+pub use web_approval::{valid_approval_endpoint, WebApprovalGate};

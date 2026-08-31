@@ -17,9 +17,9 @@
 //! stdout carries the final answer only; the report goes to stderr.
 
 use amparo_agent::{
-    format_cost_line, Agent, AgentConfig, AgentReport, ApprovalGate, AutoApprove, AutoDeny,
-    CaseLibrary, CheckpointStore, EventSink, FanoutSink, JsonCheckpointStore, LedgerSink,
-    SpawnAgentTool, TaskStatus, WebApprovalGate,
+    format_cost_line, valid_approval_endpoint, Agent, AgentConfig, AgentReport, ApprovalGate,
+    AutoApprove, AutoDeny, CaseLibrary, CheckpointStore, EventSink, FanoutSink,
+    JsonCheckpointStore, LedgerSink, SpawnAgentTool, TaskStatus, WebApprovalGate,
 };
 use amparo_chat::{
     due_scan, schedule_dir, JsonScheduleStore, ScheduleStore, ScheduleTool, ScheduledStatus,
@@ -361,9 +361,9 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
         );
     }
     if let Some(url) = &flags.approval_endpoint {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
+        if !valid_approval_endpoint(url) {
             return ParseRunResult::Error(format!(
-                "--approval-endpoint must be an http(s) URL, got '{url}'"
+                "--approval-endpoint must be an http(s) URL with a host, got '{url}'"
             ));
         }
     }
@@ -1250,7 +1250,7 @@ mod tests {
         );
         assert_eq!(
             error(parse(&["--approval-endpoint", "nonsense", "task"])),
-            "--approval-endpoint must be an http(s) URL, got 'nonsense'"
+            "--approval-endpoint must be an http(s) URL with a host, got 'nonsense'"
         );
     }
 

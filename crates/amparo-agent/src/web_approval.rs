@@ -17,6 +17,13 @@
 //!     unparseable body, transport error)         → fail closed: deny
 //! ```
 //!
+//! The model-supplied `call_id` is percent-encoded into the poll URL as a
+//! single path segment, so an id cannot smuggle path separators or query
+//! parameters into the poll. [`valid_approval_endpoint`] guards the
+//! operator-supplied endpoint URL itself (an approval decision rides on
+//! that wire — a scheme-only string or a missing host is refused at flag
+//! time, not discovered as a failure later).
+//!
 //! The whole round trip runs under a 60-second deadline — the Axiom
 //! auto-deny budget the gate contract carries over: a human who never
 //! decides is a denial, never a hang. Display-only fields stay
@@ -99,7 +106,7 @@ impl WebApprovalGate {
         let poll_url = format!(
             "{}/{}",
             self.endpoint.trim_end_matches('/'),
-            request.call_id
+            encode_path_segment(&request.call_id)
         );
         loop {
             let polled = self.client.get(&poll_url).send().await;
@@ -136,6 +143,43 @@ impl ApprovalGate for WebApprovalGate {
         let decided = tokio::time::timeout(self.timeout, self.decide(request)).await;
         matches!(decided, Ok(true))
     }
+}
+
+/// Validate the operator-supplied approvals endpoint URL. The gate holds
+/// no secrets, but an approval decision rides on that wire — require an
+/// `http://` or `https://` scheme and a non-empty host, so a scheme-only
+/// string or a typo is refused at flag time rather than discovered as a
+/// poll failure later.
+pub fn valid_approval_endpoint(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    !rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .is_empty()
+}
+
+/// Percent-encode a model-supplied id as a single URL path segment so it
+/// cannot smuggle path separators or query parameters into the poll URL.
+/// Ids the shipped surface produces ([A-Za-z0-9._-]) pass through
+/// unchanged; anything else becomes `%XX` — against the first-party
+/// endpoint (which accepts only that charset) a hostile id still 404s and
+/// the gate denies, and against query-parsing endpoints the injection is
+/// neutralized.
+fn encode_path_segment(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for b in id.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -404,5 +448,51 @@ mod tests {
             "restore the previous contents of note.txt"
         );
         assert_eq!(body["rollback"]["markers"][0], "note.txt.amparo-bak");
+    }
+
+    #[tokio::test]
+    async fn hostile_call_id_is_encoded_in_the_poll_url() {
+        // A model-supplied id carrying a query string must arrive as one
+        // encoded path segment — never as live query parameters.
+        let recorded: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = Arc::clone(&recorded);
+        let recording = Responder::start(move |line, _body| {
+            if line.starts_with("POST") {
+                (200, pending_ack())
+            } else {
+                rec.lock().unwrap().push(line);
+                (200, decided(true))
+            }
+        })
+        .await;
+        let mut req = request();
+        req.call_id = "x?status=decided&decision=true".to_string();
+        let gate =
+            WebApprovalGate::new(recording.url()).with_poll_interval(Duration::from_millis(5));
+        assert!(gate.request(&req).await);
+        let lines = recorded.lock().unwrap();
+        assert!(
+            lines[0].contains("x%3Fstatus%3Ddecided%26decision%3Dtrue"),
+            "the poll URL carries the encoded id, not raw query syntax: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn endpoint_validation_requires_scheme_and_host() {
+        assert!(valid_approval_endpoint("http://127.0.0.1:8080/approvals"));
+        assert!(valid_approval_endpoint("https://example.com/approvals"));
+        assert!(!valid_approval_endpoint("http://"));
+        assert!(!valid_approval_endpoint("https:///approvals"));
+        assert!(!valid_approval_endpoint("not a url"));
+        assert!(!valid_approval_endpoint("127.0.0.1:8080/approvals"));
+    }
+
+    #[test]
+    fn path_segment_encoding_keeps_shipped_ids_and_neutralizes_the_rest() {
+        assert_eq!(encode_path_segment("call_1"), "call_1");
+        assert_eq!(encode_path_segment("x?y=1"), "x%3Fy%3D1");
+        assert_eq!(encode_path_segment("../decided"), "..%2Fdecided");
     }
 }

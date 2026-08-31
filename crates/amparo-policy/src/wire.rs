@@ -128,25 +128,31 @@ impl WirePolicyEngine {
             .map_err(|_| "policy engine timed out".to_string())?
             .map_err(|e| format!("policy engine unreachable: {e}"))?;
 
-        if !resp.status().is_success() {
-            // A 500 may still carry the fail-safe escalate verdict (see the
-            // caller contract); other statuses are transport-level failures.
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(CheckResponse {
-                    verdict: Some(_), ..
-                }) = serde_json::from_value::<CheckResponse>(json.clone()).ok()
-                {
-                    return serde_json::from_value::<CheckResponse>(json)
-                        .map_err(|e| format!("bad engine response: {e}"));
+        let status = resp.status();
+        // The body read gets its own timeout: `send` resolves when headers
+        // arrive, so an engine that stalls mid-body would otherwise hang the
+        // loop past the fail-closed budget.
+        let body = tokio::time::timeout(self.timeout, resp.bytes())
+            .await
+            .map_err(|_| "policy engine timed out".to_string())?
+            .map_err(|e| format!("bad engine response: {e}"))?;
+
+        if !status.is_success() {
+            // The canonical engine 500 carries {"verdict":"escalate"}. Only
+            // an escalate may pass through a failure status — any other
+            // verdict (an allow on a 500 is an engine bug or a gateway
+            // forgery) is a transport-level failure and escalates.
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+                if let Ok(resp) = serde_json::from_value::<CheckResponse>(json) {
+                    if resp.verdict.as_deref() == Some("escalate") {
+                        return Ok(resp);
+                    }
                 }
             }
             return Err(format!("policy engine returned HTTP {status}"));
         }
 
-        resp.json::<CheckResponse>()
-            .await
+        serde_json::from_slice::<CheckResponse>(&body)
             .map_err(|e| format!("bad engine response: {e}"))
     }
 
@@ -341,29 +347,85 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// A single-request responder that answers with an arbitrary status line
+    /// and body (for failure-status tests).
+    async fn mock_engine_status(
+        status_line: &str,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let status_line = status_line.to_string();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
     #[tokio::test]
     async fn engine_500_with_escalate_body_is_fail_safe_escalate() {
         // The spec's canonical 500: {"error": "internal check failure",
         // "verdict": "escalate"} — never treat an engine failure as an allow.
+        let (url, server) = mock_engine_status(
+            "500 Internal Server Error",
+            r#"{"error":"internal check failure","verdict":"escalate"}"#,
+        )
+        .await;
+        let d = engine(&url).judge_tool("run_command", "ls", &[]).await;
+        assert_eq!(d.verdict, PolicyVerdict::Escalate);
+        assert!(d.fired[0].contains("internal check failure"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_500_with_allow_body_never_allows() {
+        // An allow on a failure status is an engine bug or a gateway forgery
+        // — the client must escalate, never execute.
+        let (url, server) = mock_engine_status(
+            "500 Internal Server Error",
+            r#"{"verdict":"allow","reason":"looks fine","enforced":true}"#,
+        )
+        .await;
+        let d = engine(&url).judge_tool("run_command", "ls", &[]).await;
+        assert_eq!(d.verdict, PolicyVerdict::Escalate);
+        assert!(
+            d.fired[0].contains("HTTP 500"),
+            "a forged allow on a failure status escalates with the status: {}",
+            d.fired[0]
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_stalled_body_times_out() {
+        // Headers arrive but the body never does — the body read must hit
+        // its own timeout, not hang the loop past the fail-closed budget.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 8192];
             let _ = sock.read(&mut buf).await.unwrap();
-            let body = r#"{"error":"internal check failure","verdict":"escalate"}"#;
-            let resp = format!(
-                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(), body
-            );
+            let resp = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: keep-alive\r\n\r\n{";
             sock.write_all(resp.as_bytes()).await.unwrap();
+            // Hold the socket open without completing the body.
+            tokio::time::sleep(Duration::from_secs(2)).await;
         });
-        let d = engine(&format!("http://{}", addr))
+        let d = WirePolicyEngine::new(format!("http://{}", addr), None)
+            .with_timeout(Duration::from_millis(300))
             .judge_tool("run_command", "ls", &[])
             .await;
         assert_eq!(d.verdict, PolicyVerdict::Escalate);
-        assert!(d.fired[0].contains("internal check failure"));
-        server.await.unwrap();
+        assert!(d.fired[0].contains("timed out"));
+        server.abort();
     }
 
     #[tokio::test]
