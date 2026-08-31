@@ -2,6 +2,7 @@
 name = "amparo-sandbox"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,7 +16,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 base64 = "0.22"
-wasmtime = { version = "16", default-features = false, features = ["cranelift"] }
+# Pinned at 34: the newest wasmtime whose rust-version (1.85) still
+# matches the workspace MSRV (audit 2026-08-31 MED-8; 35+ needs 1.86).
+# `runtime` is the embedder API (Store/Module/Instance/Val) — since
+# v18 it is feature-gated, not part of the defaults-off set.
+wasmtime = { version = "34", default-features = false, features = ["cranelift", "runtime"] }
 
 [dev-dependencies]
 wat = "1.0"

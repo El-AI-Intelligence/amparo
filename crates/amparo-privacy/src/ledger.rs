@@ -135,11 +135,17 @@ pub fn read_ledger(path: &Path) -> Result<Vec<LedgerRow>, String> {
 }
 
 /// Reduce a URL to `scheme://host[:port]` — the most a [`LedgerRow`] may
-/// carry. Paths, queries and fragments are dropped; anything without a
-/// `scheme://` prefix yields `None`.
+/// carry. Paths, queries, fragments and userinfo (`user:pass@`) are
+/// dropped; anything without a `scheme://` prefix yields `None`.
 pub fn site_host_only(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let host_and_port = rest.split(['/', '?', '#']).next()?;
+    // URL userinfo must never reach a ledger row — keep only what
+    // follows the last `@` (audit 2026-08-31 LOW-1).
+    let host_and_port = host_and_port
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(host_and_port);
     if host_and_port.is_empty() {
         return None;
     }
@@ -647,6 +653,27 @@ mod tests {
             Some("http://127.0.0.1:11434".to_string())
         );
         assert_eq!(site_host_only("not a url"), None);
+    }
+
+    #[test]
+    fn site_host_only_drops_userinfo() {
+        // Audit 2026-08-31 LOW-1: `user:pass@` must never reach a ledger
+        // row — the site field keeps scheme + host only.
+        assert_eq!(
+            site_host_only("https://user:pass@example.com/path"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            site_host_only("https://user@example.com"),
+            Some("https://example.com".to_string())
+        );
+        // An `@` inside the path is not userinfo (the path is already
+        // dropped), and a bare `user@` with no host yields `None`.
+        assert_eq!(
+            site_host_only("https://example.com/@user"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(site_host_only("https://user@"), None);
     }
 
     #[test]

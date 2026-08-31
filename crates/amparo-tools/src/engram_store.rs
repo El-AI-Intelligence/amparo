@@ -40,14 +40,26 @@ impl EngramStore {
     /// Creates an adapter for the engramd REST surface at `base_url`
     /// (a trailing slash is tolerated). `api_key` becomes the `Bearer`
     /// token when the daemon runs in keyed mode (`ENGRAMD_API_KEY`).
+    ///
+    /// A non-loopback plaintext `http` URL draws one stderr warning: the
+    /// bearer key and the memory content would travel in the clear
+    /// (audit 2026-08-31 LOW-5).
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        if non_loopback_http(&base_url) {
+            eprintln!(
+                "[memory] engram url {base_url} is non-loopback http — \
+the key and memory content travel in the clear (use https or a \
+loopback address)"
+            );
+        }
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("reqwest client build");
         Self {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             api_key,
         }
     }
@@ -160,6 +172,29 @@ impl Memory for EngramStore {
         }
         Ok(m.id)
     }
+}
+
+/// Loopback hosts the engramd URL may name without a warning — the
+/// documented local-daemon shapes, plus the full 127/8 block.
+fn is_loopback_host(host: &str) -> bool {
+    // The `url` crate returns IPv6 hosts bracketed ("[::1]").
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    matches!(host, "127.0.0.1" | "::1" | "localhost") || host.starts_with("127.")
+}
+
+/// True when the URL is plaintext HTTP and its host is not loopback —
+/// the shape the audit flags (2026-08-31 LOW-5): a remote daemon over
+/// HTTP sends the key and unstripped content in the clear. Unparseable
+/// URLs are not flagged here; reqwest fails them closed downstream.
+fn non_loopback_http(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "http"
+        && parsed
+            .host_str()
+            .map(|host| !is_loopback_host(host))
+            .unwrap_or(false)
 }
 
 /// Resolve the memory backend a host wires into its registry (M11 W1).
@@ -363,6 +398,21 @@ mod tests {
                 .await
         );
         handle.abort();
+    }
+
+    #[test]
+    fn flags_non_loopback_http_urls_only() {
+        // The warning shapes (audit 2026-08-31 LOW-5): loopback http is
+        // the documented default and stays quiet; remote http warns;
+        // https never warns; garbage is left to reqwest's fail-closed.
+        assert!(!non_loopback_http("http://127.0.0.1:8787"));
+        assert!(!non_loopback_http("http://127.0.42.1:8787"));
+        assert!(!non_loopback_http("http://localhost:8787"));
+        assert!(!non_loopback_http("http://[::1]:8787"));
+        assert!(non_loopback_http("http://daemon.example.com:8787"));
+        assert!(non_loopback_http("http://138.199.144.93:8787"));
+        assert!(!non_loopback_http("https://daemon.example.com"));
+        assert!(!non_loopback_http("not a url"));
     }
 
     #[tokio::test]
