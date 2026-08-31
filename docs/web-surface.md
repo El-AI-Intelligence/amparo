@@ -1,6 +1,6 @@
 # Web surface — build contract
 
-Status: **contract v3** (2026-08-31). This document is the binding
+Status: **contract v4** (2026-08-31). This document is the binding
 specification for the web surface — the operator-facing UI built against
 the shipped Amparo binary. It is the "escape hatch" named in
 `docs/swarms-advanced.md`: a face for the agent, not a new trust
@@ -47,7 +47,7 @@ Contract with the spawned process:
   (`[task]`, `[gate]`, `[approval]`, `[preflight]`, `[spawn]`,
   `[schedule]`, `[privacy]`, `[qc]`, …). The UI renders these live.
 - **exit codes**: `0` ok, `1` task/runtime failure, `2` usage error.
-- **`--approval-endpoint`** (ships in v0.9.0; see §3) replaces the
+- **`--approval-endpoint`** (shipped in v0.9.0; see §3) replaces the
   interactive gate — mutually exclusive with `--auto-approve` and
   `--auto-deny` (usage error otherwise). The same flag ships on
   `amparo mcp-serve` (mutually exclusive with `--auto-approve` there;
@@ -76,10 +76,8 @@ read the same queue (§4).
 
 ## 3. The approval contract (`--approval-endpoint`)
 
-Ships in **v0.9.0** (M10 W4). Until then the backend implements a mock
-of this endpoint and the UI is exercised against it; the JSON below is
-pinned by Amparo's tests and will not change without a contract-version
-bump.
+Shipped in **v0.9.0** (M10 W4). The JSON below is pinned by Amparo's
+tests and will not change without a contract-version bump.
 
 When the gate needs a human, it `POST`s to `<endpoint>/approvals`:
 
@@ -122,6 +120,13 @@ returns `{"status": "decided", "decision": true|false}`. **60-second
 timeout, fail closed**: no decision by then is a denial. All three
 fields (`blast_radius`, `session_label`, `rollback`) are display-only
 by invariant I1 — they never feed back into the gate decision.
+
+The `POST` may refuse the registration (v4): `400` for a `call_id`
+outside the poll-able charset `[A-Za-z0-9._-]` (max 256), `409` for a
+duplicate `call_id` (one registration per id), `429` when the pending
+queue is at capacity (64) or the endpoint's POST rate limit is hit.
+The gate treats every non-2xx as a denial — refusals fail closed, never
+queue.
 
 ## 4. Feature parity — what the UI must show
 
@@ -182,8 +187,8 @@ product vhosts (console, guardrail, engram, downloads).
   auto-HTTPS (Let's Encrypt) terminates TLS. The record is created by
   the operator (Cloudflare).
 - **Binary**: build the Amparo repo from source on the box (Rust
-  toolchain already present), pinned at tag `v0.7.0`; the
-  `--approval-endpoint` build follows at v0.9.0.
+  toolchain already present), pinned at tag **`v0.10.0`** — the release
+  the approval seam ships in.
 
 ## 7. Pinning and versioning
 
@@ -207,6 +212,15 @@ same gate chain with a reduced tool set (spawn/schedule recursion
 excluded), overdue promises are marked missed, and the scan touches
 only promises the CLI itself wrote (chat promises belong to the chat
 host's ticker). No approval-JSON or flag-removal changes.
+
+**v3 → v4**: pre-reveal security audit (2026-08-31). The approval JSON
+and the gate's POST/poll flow are unchanged; the backend's surface
+hardens and the binary pin moves to v0.10.0: the SSE stream switches
+from `?token=` to a **one-shot `?ticket=`** issued over the authed API
+(`POST /api/tickets`) — the operator token never rides a URL; the
+`POST /approvals` registration rejects invalid (`400`), duplicate
+(`409`) and over-capacity (`429`) `call_id`s, with the pending queue
+capped at 64; POSTs are rate-limited per source address (`429`).
 
 ## 8. Deliberately excluded
 
