@@ -42,7 +42,9 @@ pub struct WebSearchTool;
 
 impl WebSearchTool {
     /// Creates a new [`WebSearchTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Which backend should we use? Returns (backend, display_name).
     fn select_backend() -> (Backend, &'static str) {
@@ -93,7 +95,8 @@ impl WebSearchTool {
                 Some(SearchResult {
                     title: r.get("title")?.as_str()?.to_string(),
                     url: r.get("url")?.as_str()?.to_string(),
-                    snippet: r.get("content")
+                    snippet: r
+                        .get("content")
                         .or_else(|| r.get("snippet"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
@@ -121,10 +124,7 @@ impl WebSearchTool {
 
         let resp: Value = client
             .get("https://api.search.brave.com/res/v1/web/search")
-            .query(&[
-                ("q", query),
-                ("count", &num.min(20).to_string()),
-            ])
+            .query(&[("q", query), ("count", &num.min(20).to_string())])
             .header("Accept", "application/json")
             .header("Accept-Encoding", "gzip")
             .header("X-Subscription-Token", &api_key)
@@ -147,7 +147,8 @@ impl WebSearchTool {
                 Some(SearchResult {
                     title: r.get("title")?.as_str()?.to_string(),
                     url: r.get("url")?.as_str()?.to_string(),
-                    snippet: r.get("description")
+                    snippet: r
+                        .get("description")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
@@ -182,8 +183,16 @@ impl WebSearchTool {
         if let Some(abstract_text) = resp.get("AbstractText").and_then(|v| v.as_str()) {
             if !abstract_text.is_empty() {
                 results.push(SearchResult {
-                    title: resp.get("Heading").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    url: resp.get("AbstractURL").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    title: resp
+                        .get("Heading")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    url: resp
+                        .get("AbstractURL")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     snippet: abstract_text.to_string(),
                     source: "DuckDuckGo Abstract".to_string(),
                 });
@@ -196,7 +205,11 @@ impl WebSearchTool {
                 if let Some(text) = topic.get("Text").and_then(|v| v.as_str()) {
                     results.push(SearchResult {
                         title: text.chars().take(80).collect(),
-                        url: topic.get("FirstURL").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        url: topic
+                            .get("FirstURL")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         snippet: text.to_string(),
                         source: "DuckDuckGo Related".to_string(),
                     });
@@ -257,17 +270,22 @@ impl ToolExecutor for WebSearchTool {
     async fn execute(&self, call: &ToolCall) -> ToolResult {
         let query = match arg_str(call, "query") {
             Some(q) => q.to_string(),
-            None => return make_result(call, false, serde_json::json!({"error": "missing query parameter"}), "Search failed: no query".to_string()),
+            None => {
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "missing query parameter"}),
+                    "Search failed: no query".to_string(),
+                )
+            }
         };
-        let num = call.arg_u64("num_results")
-            .unwrap_or(5)
-            .min(10) as usize;
+        let num = call.arg_u64("num_results").unwrap_or(5).min(10) as usize;
 
         let (backend, backend_name) = Self::select_backend();
 
         let result = match backend {
             Backend::Searxng => Self::searxng_search(&query, num).await,
-            Backend::Brave   => Self::brave_search(&query, num).await,
+            Backend::Brave => Self::brave_search(&query, num).await,
             Backend::DuckduckgoInstant => Self::duckduckgo_instant_search(&query).await,
         };
 
@@ -277,14 +295,24 @@ impl ToolExecutor for WebSearchTool {
                 let summary = if results.is_empty() {
                     format!("No results found for \"{}\"", query)
                 } else {
-                    format!("Found {} results for \"{}\" ({})", results.len(), query, backend_name)
+                    format!(
+                        "Found {} results for \"{}\" ({})",
+                        results.len(),
+                        query,
+                        backend_name
+                    )
                 };
-                make_result(call, true, serde_json::json!({
-                    "query": query,
-                    "results": results,
-                    "count": results.len(),
-                    "backend": backend_name,
-                }), summary)
+                make_result(
+                    call,
+                    true,
+                    serde_json::json!({
+                        "query": query,
+                        "results": results,
+                        "count": results.len(),
+                        "backend": backend_name,
+                    }),
+                    summary,
+                )
             }
             Err(e) => {
                 // Try next backend in the chain on failure
@@ -297,45 +325,67 @@ impl ToolExecutor for WebSearchTool {
                             match Self::brave_search(&query, num).await {
                                 Ok(r) => Ok((r, "Brave Search (SearXNG fallback)")),
                                 Err(be) => {
-                                    tracing::warn!("Brave also failed ({}), trying DDG Instant Answers", be);
-                                    Self::duckduckgo_instant_search(&query).await
+                                    tracing::warn!(
+                                        "Brave also failed ({}), trying DDG Instant Answers",
+                                        be
+                                    );
+                                    Self::duckduckgo_instant_search(&query)
+                                        .await
                                         .map(|r| (r, "DuckDuckGo Instant Answers (dual fallback)"))
                                 }
                             }
                         } else {
-                            Self::duckduckgo_instant_search(&query).await
+                            Self::duckduckgo_instant_search(&query)
+                                .await
                                 .map(|r| (r, "DuckDuckGo Instant Answers (SearXNG fallback)"))
                         }
                     }
-                    Backend::Brave => {
-                        Self::duckduckgo_instant_search(&query).await
-                            .map(|r| (r, "DuckDuckGo Instant Answers (Brave fallback)"))
-                    }
+                    Backend::Brave => Self::duckduckgo_instant_search(&query)
+                        .await
+                        .map(|r| (r, "DuckDuckGo Instant Answers (Brave fallback)")),
                     Backend::DuckduckgoInstant => {
                         // Last resort — already at the bottom
-                        return make_result(call, false, serde_json::json!({
-                            "error": e.to_string(),
-                            "query": query,
-                        }), format!("Search failed: {}", e));
+                        return make_result(
+                            call,
+                            false,
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "query": query,
+                            }),
+                            format!("Search failed: {}", e),
+                        );
                     }
                 };
 
                 match fallback_result {
                     Ok((mut results, fallback_name)) => {
                         results.truncate(num);
-                        make_result(call, true, serde_json::json!({
-                            "query": query,
-                            "results": results,
-                            "count": results.len(),
-                            "backend": fallback_name,
-                        }), format!("Found {} results for \"{}\" ({})", results.len(), query, fallback_name))
+                        make_result(
+                            call,
+                            true,
+                            serde_json::json!({
+                                "query": query,
+                                "results": results,
+                                "count": results.len(),
+                                "backend": fallback_name,
+                            }),
+                            format!(
+                                "Found {} results for \"{}\" ({})",
+                                results.len(),
+                                query,
+                                fallback_name
+                            ),
+                        )
                     }
-                    Err(final_err) => {
-                        make_result(call, false, serde_json::json!({
+                    Err(final_err) => make_result(
+                        call,
+                        false,
+                        serde_json::json!({
                             "error": format!("{} (all backends exhausted)", final_err),
                             "query": query,
-                        }), format!("Search failed: all backends exhausted"))
-                    }
+                        }),
+                        format!("Search failed: all backends exhausted"),
+                    ),
                 }
             }
         }
@@ -350,7 +400,9 @@ pub struct FetchUrlTool;
 
 impl FetchUrlTool {
     /// Creates a new [`FetchUrlTool`].
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Strip HTML tags and decode entities to readable text.
     fn html_to_text(html: &str) -> String {
@@ -405,14 +457,24 @@ impl ToolExecutor for FetchUrlTool {
     async fn execute(&self, call: &ToolCall) -> ToolResult {
         let url = match arg_str(call, "url") {
             Some(u) => u.to_string(),
-            None => return make_result(call, false, serde_json::json!({"error": "missing url parameter"}), "Fetch failed: no URL".to_string()),
+            None => {
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "missing url parameter"}),
+                    "Fetch failed: no URL".to_string(),
+                )
+            }
         };
         if !url.starts_with("http://") && !url.starts_with("https://") {
-            return make_result(call, false, serde_json::json!({"error": "URL must start with http:// or https://"}), "Fetch failed: invalid URL scheme".to_string());
+            return make_result(
+                call,
+                false,
+                serde_json::json!({"error": "URL must start with http:// or https://"}),
+                "Fetch failed: invalid URL scheme".to_string(),
+            );
         }
-        let max_chars = call.arg_u64("max_chars")
-            .unwrap_or(4000)
-            .min(12000) as usize;
+        let max_chars = call.arg_u64("max_chars").unwrap_or(4000).min(12000) as usize;
 
         let client = match reqwest::Client::builder()
             .user_agent("Amparo/0.1 (companion AI; amparo@localhost)")
@@ -420,16 +482,29 @@ impl ToolExecutor for FetchUrlTool {
             .build()
         {
             Ok(c) => c,
-            Err(e) => return make_result(call, false, serde_json::json!({"error": e.to_string()}), "Fetch failed: client build error".to_string()),
+            Err(e) => {
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": e.to_string()}),
+                    "Fetch failed: client build error".to_string(),
+                )
+            }
         };
 
         match client.get(&url).send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 if !resp.status().is_success() {
-                    return make_result(call, false, serde_json::json!({"error": format!("HTTP {}", status), "url": url}), format!("Fetch failed: HTTP {}", status));
+                    return make_result(
+                        call,
+                        false,
+                        serde_json::json!({"error": format!("HTTP {}", status), "url": url}),
+                        format!("Fetch failed: HTTP {}", status),
+                    );
                 }
-                let content_type = resp.headers()
+                let content_type = resp
+                    .headers()
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
@@ -443,21 +518,40 @@ impl ToolExecutor for FetchUrlTool {
                             body
                         };
                         let truncated = if text.len() > max_chars {
-                            format!("{}... [truncated at {} chars]", &text[..max_chars], max_chars)
+                            format!(
+                                "{}... [truncated at {} chars]",
+                                &text[..max_chars],
+                                max_chars
+                            )
                         } else {
                             text.clone()
                         };
-                        make_result(call, true, serde_json::json!({
-                            "url": url,
-                            "content": truncated,
-                            "char_count": text.len(),
-                            "truncated": text.len() > max_chars,
-                        }), format!("Fetched {} chars from {}", text.len().min(max_chars), url))
+                        make_result(
+                            call,
+                            true,
+                            serde_json::json!({
+                                "url": url,
+                                "content": truncated,
+                                "char_count": text.len(),
+                                "truncated": text.len() > max_chars,
+                            }),
+                            format!("Fetched {} chars from {}", text.len().min(max_chars), url),
+                        )
                     }
-                    Err(e) => make_result(call, false, serde_json::json!({"error": e.to_string(), "url": url}), format!("Fetch failed reading body: {}", e)),
+                    Err(e) => make_result(
+                        call,
+                        false,
+                        serde_json::json!({"error": e.to_string(), "url": url}),
+                        format!("Fetch failed reading body: {}", e),
+                    ),
                 }
             }
-            Err(e) => make_result(call, false, serde_json::json!({"error": e.to_string(), "url": url}), format!("Fetch failed: {}", e)),
+            Err(e) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e.to_string(), "url": url}),
+                format!("Fetch failed: {}", e),
+            ),
         }
     }
 }

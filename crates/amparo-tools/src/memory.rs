@@ -127,7 +127,9 @@ pub struct MemorySearchTool {
 impl MemorySearchTool {
     /// Creates a search tool backed by the built-in in-memory store.
     pub fn new() -> Self {
-        Self { store: Arc::new(InMemoryStore::new()) }
+        Self {
+            store: Arc::new(InMemoryStore::new()),
+        }
     }
 
     /// Wire a specific store (e.g. an Engram adapter) behind the tool.
@@ -165,7 +167,14 @@ impl ToolExecutor for MemorySearchTool {
     async fn execute(&self, call: &ToolCall) -> ToolResult {
         let query = match call.arg_str("query") {
             Some(q) => q.to_string(),
-            None => return make_result(call, false, serde_json::json!({"error": "missing query"}), "Search failed".to_string()),
+            None => {
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "missing query"}),
+                    "Search failed".to_string(),
+                )
+            }
         };
         let limit = call.arg_u64("max_results").unwrap_or(5).min(20) as usize;
 
@@ -198,7 +207,9 @@ pub struct MemoryWriteTool {
 impl MemoryWriteTool {
     /// Creates a write tool backed by the built-in in-memory store.
     pub fn new() -> Self {
-        Self { store: Arc::new(InMemoryStore::new()) }
+        Self {
+            store: Arc::new(InMemoryStore::new()),
+        }
     }
 
     /// Wire a specific store (e.g. an Engram adapter) behind the tool.
@@ -227,7 +238,14 @@ impl ToolExecutor for MemoryWriteTool {
     async fn execute(&self, call: &ToolCall) -> ToolResult {
         let content = match call.arg_str("content") {
             Some(c) => c.to_string(),
-            None => return make_result(call, false, serde_json::json!({"error": "missing content"}), "Store failed".to_string()),
+            None => {
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "missing content"}),
+                    "Store failed".to_string(),
+                )
+            }
         };
         match self.store.store(content.clone()).await {
             Ok(id) => make_result(
@@ -236,7 +254,12 @@ impl ToolExecutor for MemoryWriteTool {
                 serde_json::json!({"id": id, "stored": content}),
                 "Stored in memory".to_string(),
             ),
-            Err(e) => make_result(call, false, serde_json::json!({"error": e}), "Store failed".to_string()),
+            Err(e) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e}),
+                "Store failed".to_string(),
+            ),
         }
     }
 }
@@ -248,7 +271,10 @@ mod tests {
     #[tokio::test]
     async fn in_memory_store_round_trips() {
         let store = InMemoryStore::new();
-        store.store("The user prefers dark mode".to_string()).await.unwrap();
+        store
+            .store("The user prefers dark mode".to_string())
+            .await
+            .unwrap();
         let hits = store.search("dark mode", 5).await;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("dark mode"));
@@ -257,7 +283,10 @@ mod tests {
     #[tokio::test]
     async fn search_requires_keyword_overlap() {
         let store = InMemoryStore::new();
-        store.store("cargo is the rust build tool".to_string()).await.unwrap();
+        store
+            .store("cargo is the rust build tool".to_string())
+            .await
+            .unwrap();
         assert!(store.search("python", 5).await.is_empty());
         assert_eq!(store.search("rust build", 5).await.len(), 1);
     }

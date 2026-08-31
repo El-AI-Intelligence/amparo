@@ -51,7 +51,9 @@ impl RunCommandTool {
     /// Creates a shell tool with the path policy loaded from environment
     /// variables.
     pub fn new() -> Self {
-        Self { policy: Arc::new(PathPolicy::from_env()) }
+        Self {
+            policy: Arc::new(PathPolicy::from_env()),
+        }
     }
 
     /// Create with a shared PathPolicy (preferred for consistent config).
@@ -89,11 +91,14 @@ impl ToolExecutor for RunCommandTool {
     async fn execute(&self, call: &ToolCall) -> ToolResult {
         let command = match call.arguments.get("command").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),
-            None => return make_result(
-                call, false,
-                serde_json::json!({"error": "missing command"}),
-                "Command failed".to_string(),
-            ),
+            None => {
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "missing command"}),
+                    "Command failed".to_string(),
+                )
+            }
         };
 
         // ── Blocklist (defense-in-depth) ──────────────────────────────

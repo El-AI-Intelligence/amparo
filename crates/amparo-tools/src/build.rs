@@ -79,15 +79,22 @@ impl ToolExecutor for RunBuildTool {
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
         let root = self.policy.workspace_root.clone();
-        let timeout = call.arg_u64("timeout_seconds")
-            .unwrap_or(300);
+        let timeout = call.arg_u64("timeout_seconds").unwrap_or(300);
 
         let (cmd, args) = if let Some(explicit) = arg_str(call, "command") {
             let parts: Vec<&str> = explicit.split_whitespace().collect();
             if parts.is_empty() {
-                return make_result(call, false, serde_json::json!({"error": "empty command"}), "Build failed".to_string());
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "empty command"}),
+                    "Build failed".to_string(),
+                );
             }
-            (parts[0].to_string(), parts[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            (
+                parts[0].to_string(),
+                parts[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
         } else {
             detect_build_command(&root).await
         };
@@ -98,10 +105,7 @@ impl ToolExecutor for RunBuildTool {
             .kill_on_drop(true)
             .output();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout),
-            output,
-        ).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout), output).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -110,21 +114,36 @@ impl ToolExecutor for RunBuildTool {
                 let combined = format!("{}\n{}", stdout, stderr);
                 let errors = parse_build_errors(&combined);
 
-                make_result(call, output.status.success(), serde_json::json!({
-                    "success": output.status.success(),
-                    "exit_code": output.status.code(),
-                    "errors": errors,
-                    "error_count": errors.len(),
-                    "output": combined.chars().take(4000).collect::<String>(),
-                    "command": format!("{} {}", cmd, args.join(" ")),
-                }), if output.status.success() {
-                    "Build succeeded".to_string()
-                } else {
-                    format!("Build failed: {} error(s)", errors.len())
-                })
+                make_result(
+                    call,
+                    output.status.success(),
+                    serde_json::json!({
+                        "success": output.status.success(),
+                        "exit_code": output.status.code(),
+                        "errors": errors,
+                        "error_count": errors.len(),
+                        "output": combined.chars().take(4000).collect::<String>(),
+                        "command": format!("{} {}", cmd, args.join(" ")),
+                    }),
+                    if output.status.success() {
+                        "Build succeeded".to_string()
+                    } else {
+                        format!("Build failed: {} error(s)", errors.len())
+                    },
+                )
             }
-            Ok(Err(e)) => make_result(call, false, serde_json::json!({"error": e.to_string()}), "Build execution failed".to_string()),
-            Err(_) => make_result(call, false, serde_json::json!({"error": "timeout", "timeout_seconds": timeout}), format!("Build timed out after {}s", timeout)),
+            Ok(Err(e)) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e.to_string()}),
+                "Build execution failed".to_string(),
+            ),
+            Err(_) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": "timeout", "timeout_seconds": timeout}),
+                format!("Build timed out after {}s", timeout),
+            ),
         }
     }
 }
@@ -140,10 +159,16 @@ async fn detect_build_command(root: &PathBuf) -> (String, Vec<String>) {
         if root.join("yarn.lock").exists() {
             return ("yarn".to_string(), vec!["build".to_string()]);
         }
-        return ("npm".to_string(), vec!["run".to_string(), "build".to_string()]);
+        return (
+            "npm".to_string(),
+            vec!["run".to_string(), "build".to_string()],
+        );
     }
     if root.join("go.mod").exists() {
-        return ("go".to_string(), vec!["build".to_string(), "./...".to_string()]);
+        return (
+            "go".to_string(),
+            vec!["build".to_string(), "./...".to_string()],
+        );
     }
     if root.join("Makefile").exists() {
         return ("make".to_string(), vec![]);
@@ -208,7 +233,8 @@ mod tests {
 
     #[test]
     fn parse_rust_errors() {
-        let output = "error[E0308]: mismatched types\n  --> src/main.rs:10:5\nerror: could not compile";
+        let output =
+            "error[E0308]: mismatched types\n  --> src/main.rs:10:5\nerror: could not compile";
         let errors = parse_build_errors(output);
         assert!(errors.len() >= 2);
     }

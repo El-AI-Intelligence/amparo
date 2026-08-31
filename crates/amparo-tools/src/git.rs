@@ -81,22 +81,42 @@ impl ToolExecutor for GitStatusTool {
         match run_git(&["status", "--porcelain", "-b"], &root).await {
             Ok(output) => {
                 let lines: Vec<&str> = output.lines().collect();
-                let modified = lines.iter().filter(|l| l.starts_with(" M") || l.starts_with("M ")).count();
-                let added = lines.iter().filter(|l| l.starts_with("A ") || l.starts_with("??")).count();
-                let deleted = lines.iter().filter(|l| l.starts_with(" D") || l.starts_with("D ")).count();
-                let branch = lines.first()
+                let modified = lines
+                    .iter()
+                    .filter(|l| l.starts_with(" M") || l.starts_with("M "))
+                    .count();
+                let added = lines
+                    .iter()
+                    .filter(|l| l.starts_with("A ") || l.starts_with("??"))
+                    .count();
+                let deleted = lines
+                    .iter()
+                    .filter(|l| l.starts_with(" D") || l.starts_with("D "))
+                    .count();
+                let branch = lines
+                    .first()
                     .and_then(|l| l.strip_prefix("## "))
                     .unwrap_or("unknown");
-                make_result(call, true, serde_json::json!({
-                    "branch": branch,
-                    "modified": modified,
-                    "added": added,
-                    "deleted": deleted,
-                    "raw": output,
-                    "total_changes": modified + added + deleted,
-                }), format!("{} changes on {}", modified + added + deleted, branch))
+                make_result(
+                    call,
+                    true,
+                    serde_json::json!({
+                        "branch": branch,
+                        "modified": modified,
+                        "added": added,
+                        "deleted": deleted,
+                        "raw": output,
+                        "total_changes": modified + added + deleted,
+                    }),
+                    format!("{} changes on {}", modified + added + deleted, branch),
+                )
             }
-            Err(e) => make_result(call, false, serde_json::json!({"error": e}), "Git status failed".to_string()),
+            Err(e) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e}),
+                "Git status failed".to_string(),
+            ),
         }
     }
 }
@@ -180,14 +200,28 @@ impl ToolExecutor for GitDiffTool {
                 } else {
                     output.clone()
                 };
-                make_result(call, true, serde_json::json!({
-                    "diff": display,
-                    "total_lines": lines.len(),
-                    "truncated": truncated,
-                    "staged": staged,
-                }), format!("Diff: {} lines{}", lines.len(), if truncated { " (truncated)" } else { "" }))
+                make_result(
+                    call,
+                    true,
+                    serde_json::json!({
+                        "diff": display,
+                        "total_lines": lines.len(),
+                        "truncated": truncated,
+                        "staged": staged,
+                    }),
+                    format!(
+                        "Diff: {} lines{}",
+                        lines.len(),
+                        if truncated { " (truncated)" } else { "" }
+                    ),
+                )
             }
-            Err(e) => make_result(call, false, serde_json::json!({"error": e}), "Git diff failed".to_string()),
+            Err(e) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e}),
+                "Git diff failed".to_string(),
+            ),
         }
     }
 }
@@ -245,7 +279,14 @@ impl ToolExecutor for GitCommitTool {
         let root = self.policy.workspace_root.clone();
         let message = match arg_str(call, "message") {
             Some(m) => m,
-            None => return make_result(call, false, serde_json::json!({"error": "missing message"}), "Commit failed".to_string()),
+            None => {
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "missing message"}),
+                    "Commit failed".to_string(),
+                )
+            }
         };
 
         // Stage files
@@ -259,23 +300,43 @@ impl ToolExecutor for GitCommitTool {
         };
 
         if let Err(e) = stage_result {
-            return make_result(call, false, serde_json::json!({"error": e}), "Stage failed".to_string());
+            return make_result(
+                call,
+                false,
+                serde_json::json!({"error": e}),
+                "Stage failed".to_string(),
+            );
         }
 
         // Commit
         match run_git(&["commit", "-m", message], &root).await {
             Ok(output) => {
                 // Get the commit hash
-                let hash = run_git(&["rev-parse", "--short", "HEAD"], &root).await
+                let hash = run_git(&["rev-parse", "--short", "HEAD"], &root)
+                    .await
                     .unwrap_or_else(|_| "unknown".to_string());
                 let hash = hash.trim().to_string();
-                make_result(call, true, serde_json::json!({
-                    "commit_hash": hash,
-                    "message": message,
-                    "output": output.trim(),
-                }), format!("Committed: {} ({})", message.lines().next().unwrap_or(""), hash))
+                make_result(
+                    call,
+                    true,
+                    serde_json::json!({
+                        "commit_hash": hash,
+                        "message": message,
+                        "output": output.trim(),
+                    }),
+                    format!(
+                        "Committed: {} ({})",
+                        message.lines().next().unwrap_or(""),
+                        hash
+                    ),
+                )
             }
-            Err(e) => make_result(call, false, serde_json::json!({"error": e}), "Commit failed".to_string()),
+            Err(e) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e}),
+                "Commit failed".to_string(),
+            ),
         }
     }
 }
@@ -343,18 +404,28 @@ impl ToolExecutor for GitLogTool {
         match run_git(&args, &root).await {
             Ok(output) => {
                 let commits: Vec<&str> = output.lines().collect();
-                make_result(call, true, serde_json::json!({
-                    "commits": commits.iter().map(|line| {
-                        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                        serde_json::json!({
-                            "hash": parts.first().unwrap_or(&""),
-                            "message": parts.get(1).unwrap_or(&""),
-                        })
-                    }).collect::<Vec<_>>(),
-                    "count": commits.len(),
-                }), format!("{} commits", commits.len()))
+                make_result(
+                    call,
+                    true,
+                    serde_json::json!({
+                        "commits": commits.iter().map(|line| {
+                            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+                            serde_json::json!({
+                                "hash": parts.first().unwrap_or(&""),
+                                "message": parts.get(1).unwrap_or(&""),
+                            })
+                        }).collect::<Vec<_>>(),
+                        "count": commits.len(),
+                    }),
+                    format!("{} commits", commits.len()),
+                )
             }
-            Err(e) => make_result(call, false, serde_json::json!({"error": e}), "Git log failed".to_string()),
+            Err(e) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e}),
+                "Git log failed".to_string(),
+            ),
         }
     }
 }
@@ -393,7 +464,11 @@ impl ToolExecutor for GitBranchTool {
                     name: "action".to_string(),
                     description: "Action: 'list' (default), 'create', or 'switch'".to_string(),
                     param_type: "string".to_string(),
-                    enum_values: Some(vec!["list".to_string(), "create".to_string(), "switch".to_string()]),
+                    enum_values: Some(vec![
+                        "list".to_string(),
+                        "create".to_string(),
+                        "switch".to_string(),
+                    ]),
                     required: false,
                 },
                 ToolParam {
@@ -415,18 +490,36 @@ impl ToolExecutor for GitBranchTool {
         match action {
             "list" => match run_git(&["branch", "--list"], &root).await {
                 Ok(output) => {
-                    let branches: Vec<&str> = output.lines().map(|l| l.trim_start_matches("* ")).collect();
-                    make_result(call, true, serde_json::json!({
-                        "branches": branches,
-                        "count": branches.len(),
-                    }), format!("{} branches", branches.len()))
+                    let branches: Vec<&str> =
+                        output.lines().map(|l| l.trim_start_matches("* ")).collect();
+                    make_result(
+                        call,
+                        true,
+                        serde_json::json!({
+                            "branches": branches,
+                            "count": branches.len(),
+                        }),
+                        format!("{} branches", branches.len()),
+                    )
                 }
-                Err(e) => make_result(call, false, serde_json::json!({"error": e}), "Branch list failed".to_string()),
+                Err(e) => make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": e}),
+                    "Branch list failed".to_string(),
+                ),
             },
             "create" | "switch" => {
                 let name = match arg_str(call, "name") {
                     Some(n) => n,
-                    None => return make_result(call, false, serde_json::json!({"error": "missing branch name"}), "Branch operation failed".to_string()),
+                    None => {
+                        return make_result(
+                            call,
+                            false,
+                            serde_json::json!({"error": "missing branch name"}),
+                            "Branch operation failed".to_string(),
+                        )
+                    }
                 };
                 let args = if action == "create" {
                     vec!["checkout", "-b", name]
@@ -434,15 +527,30 @@ impl ToolExecutor for GitBranchTool {
                     vec!["checkout", name]
                 };
                 match run_git(&args, &root).await {
-                    Ok(output) => make_result(call, true, serde_json::json!({
-                        "branch": name,
-                        "action": action,
-                        "output": output.trim(),
-                    }), format!("{} branch: {}", action, name)),
-                    Err(e) => make_result(call, false, serde_json::json!({"error": e}), format!("Branch {} failed", action)),
+                    Ok(output) => make_result(
+                        call,
+                        true,
+                        serde_json::json!({
+                            "branch": name,
+                            "action": action,
+                            "output": output.trim(),
+                        }),
+                        format!("{} branch: {}", action, name),
+                    ),
+                    Err(e) => make_result(
+                        call,
+                        false,
+                        serde_json::json!({"error": e}),
+                        format!("Branch {} failed", action),
+                    ),
                 }
             }
-            _ => make_result(call, false, serde_json::json!({"error": "unknown action"}), "Invalid action".to_string()),
+            _ => make_result(
+                call,
+                false,
+                serde_json::json!({"error": "unknown action"}),
+                "Invalid action".to_string(),
+            ),
         }
     }
 }
@@ -500,7 +608,14 @@ impl ToolExecutor for GitBlameTool {
         let root = self.policy.workspace_root.clone();
         let file = match arg_str(call, "file") {
             Some(f) => f,
-            None => return make_result(call, false, serde_json::json!({"error": "missing file"}), "Blame failed".to_string()),
+            None => {
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "missing file"}),
+                    "Blame failed".to_string(),
+                )
+            }
         };
 
         let mut args = vec!["blame", "--porcelain", file];
@@ -513,13 +628,23 @@ impl ToolExecutor for GitBlameTool {
         match run_git(&args, &root).await {
             Ok(output) => {
                 let lines: Vec<&str> = output.lines().collect();
-                make_result(call, true, serde_json::json!({
-                    "file": file,
-                    "blame_output": output,
-                    "lines": lines.len(),
-                }), format!("Blame for {} ({} lines)", file, lines.len()))
+                make_result(
+                    call,
+                    true,
+                    serde_json::json!({
+                        "file": file,
+                        "blame_output": output,
+                        "lines": lines.len(),
+                    }),
+                    format!("Blame for {} ({} lines)", file, lines.len()),
+                )
             }
-            Err(e) => make_result(call, false, serde_json::json!({"error": e}), "Git blame failed".to_string()),
+            Err(e) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e}),
+                "Git blame failed".to_string(),
+            ),
         }
     }
 }

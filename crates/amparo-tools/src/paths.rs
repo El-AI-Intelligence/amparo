@@ -357,8 +357,7 @@ mod tests {
 
     #[test]
     fn from_root_uses_the_given_root() {
-        let root =
-            std::env::temp_dir().join(format!("amparo-from-root-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("amparo-from-root-{}", std::process::id()));
         let p = PathPolicy::from_root(root.clone());
         let resolved = p.resolve_workspace_path("notes/ideas.md").unwrap();
         assert!(resolved.starts_with(&root));
@@ -367,12 +366,15 @@ mod tests {
 
     #[test]
     fn from_root_keeps_defaults() {
-        let root = std::env::temp_dir()
-            .join(format!("amparo-from-root-defaults-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("amparo-from-root-defaults-{}", std::process::id()));
         let p = PathPolicy::from_root(root.clone());
         assert_eq!(p.workspace_root, root);
         assert_eq!(p.max_execution_seconds, 120);
-        assert!(p.read_only_paths.iter().any(|p| p == &PathBuf::from("/usr")));
+        assert!(p
+            .read_only_paths
+            .iter()
+            .any(|p| p == &PathBuf::from("/usr")));
         assert!(!p.blocked_patterns.is_empty());
     }
 }

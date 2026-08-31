@@ -78,15 +78,22 @@ impl ToolExecutor for RunTestsTool {
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
         let root = self.policy.workspace_root.clone();
-        let timeout = call.arg_u64("timeout_seconds")
-            .unwrap_or(120);
+        let timeout = call.arg_u64("timeout_seconds").unwrap_or(120);
 
         let (cmd, args) = if let Some(explicit) = arg_str(call, "command") {
             let parts: Vec<&str> = explicit.split_whitespace().collect();
             if parts.is_empty() {
-                return make_result(call, false, serde_json::json!({"error": "empty command"}), "Test failed".to_string());
+                return make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": "empty command"}),
+                    "Test failed".to_string(),
+                );
             }
-            (parts[0].to_string(), parts[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            (
+                parts[0].to_string(),
+                parts[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
         } else {
             detect_test_command(&root).await
         };
@@ -97,10 +104,7 @@ impl ToolExecutor for RunTestsTool {
             .kill_on_drop(true)
             .output();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout),
-            output,
-        ).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout), output).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -109,31 +113,55 @@ impl ToolExecutor for RunTestsTool {
                 let combined = format!("{}\n{}", stdout, stderr);
                 let parsed = parse_test_output(&combined);
 
-                make_result(call, output.status.success(), serde_json::json!({
-                    "success": output.status.success(),
-                    "exit_code": output.status.code(),
-                    "passed": parsed.passed,
-                    "failed": parsed.failed,
-                    "skipped": parsed.skipped,
-                    "total": parsed.total,
-                    "duration_ms": parsed.duration_ms,
-                    "failures": parsed.failures,
-                    "output": combined.chars().take(4000).collect::<String>(),
-                    "command": format!("{} {}", cmd, args.join(" ")),
-                }), format!("Tests: {}/{} passed{}",
-                    parsed.passed, parsed.total,
-                    if parsed.failed > 0 { format!(", {} failed", parsed.failed) } else { String::new() }
-                ))
+                make_result(
+                    call,
+                    output.status.success(),
+                    serde_json::json!({
+                        "success": output.status.success(),
+                        "exit_code": output.status.code(),
+                        "passed": parsed.passed,
+                        "failed": parsed.failed,
+                        "skipped": parsed.skipped,
+                        "total": parsed.total,
+                        "duration_ms": parsed.duration_ms,
+                        "failures": parsed.failures,
+                        "output": combined.chars().take(4000).collect::<String>(),
+                        "command": format!("{} {}", cmd, args.join(" ")),
+                    }),
+                    format!(
+                        "Tests: {}/{} passed{}",
+                        parsed.passed,
+                        parsed.total,
+                        if parsed.failed > 0 {
+                            format!(", {} failed", parsed.failed)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                )
             }
-            Ok(Err(e)) => make_result(call, false, serde_json::json!({"error": e.to_string()}), "Test execution failed".to_string()),
-            Err(_) => make_result(call, false, serde_json::json!({"error": "timeout", "timeout_seconds": timeout}), format!("Tests timed out after {}s", timeout)),
+            Ok(Err(e)) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": e.to_string()}),
+                "Test execution failed".to_string(),
+            ),
+            Err(_) => make_result(
+                call,
+                false,
+                serde_json::json!({"error": "timeout", "timeout_seconds": timeout}),
+                format!("Tests timed out after {}s", timeout),
+            ),
         }
     }
 }
 
 async fn detect_test_command(root: &PathBuf) -> (String, Vec<String>) {
     if root.join("Cargo.toml").exists() {
-        return ("cargo".to_string(), vec!["test".to_string(), "--no-fail-fast".to_string()]);
+        return (
+            "cargo".to_string(),
+            vec!["test".to_string(), "--no-fail-fast".to_string()],
+        );
     }
     if root.join("package.json").exists() {
         if root.join("pnpm-lock.yaml").exists() {
@@ -145,10 +173,16 @@ async fn detect_test_command(root: &PathBuf) -> (String, Vec<String>) {
         return ("npm".to_string(), vec!["test".to_string()]);
     }
     if root.join("go.mod").exists() {
-        return ("go".to_string(), vec!["test".to_string(), "./...".to_string()]);
+        return (
+            "go".to_string(),
+            vec!["test".to_string(), "./...".to_string()],
+        );
     }
     if root.join("pytest.ini").exists() || root.join("pyproject.toml").exists() {
-        return ("python".to_string(), vec!["-m".to_string(), "pytest".to_string(), "-v".to_string()]);
+        return (
+            "python".to_string(),
+            vec!["-m".to_string(), "pytest".to_string(), "-v".to_string()],
+        );
     }
     ("cargo".to_string(), vec!["test".to_string()])
 }
@@ -181,15 +215,23 @@ fn parse_test_output(output: &str) -> ParsedTestOutput {
                 for (i, tok) in tokens.iter().enumerate() {
                     if let Ok(n) = tok.parse::<usize>() {
                         if let Some(next) = tokens.get(i + 1) {
-                            if next.contains("passed") { passed = n; }
-                            else if next.contains("failed") { failed = n; }
-                            else if next.contains("ignored") { skipped = n; }
+                            if next.contains("passed") {
+                                passed = n;
+                            } else if next.contains("failed") {
+                                failed = n;
+                            } else if next.contains("ignored") {
+                                skipped = n;
+                            }
                         }
                         if i > 0 {
                             let prev = tokens[i - 1];
-                            if prev.contains("passed") { passed = n; }
-                            else if prev.contains("failed") { failed = n; }
-                            else if prev.contains("ignored") { skipped = n; }
+                            if prev.contains("passed") {
+                                passed = n;
+                            } else if prev.contains("failed") {
+                                failed = n;
+                            } else if prev.contains("ignored") {
+                                skipped = n;
+                            }
                         }
                     }
                 }
@@ -214,8 +256,11 @@ fn parse_test_output(output: &str) -> ParsedTestOutput {
                 if let Some(first) = tokens.first() {
                     if let Ok(n) = first.parse::<usize>() {
                         let joined = tokens[1..].join(" ");
-                        if joined.contains("passed") { passed = n; }
-                        else if joined.contains("failed") { failed = n; }
+                        if joined.contains("passed") {
+                            passed = n;
+                        } else if joined.contains("failed") {
+                            failed = n;
+                        }
                     }
                 }
             }
@@ -230,9 +275,13 @@ fn parse_test_output(output: &str) -> ParsedTestOutput {
                 if let Some(first) = tokens.first() {
                     if let Ok(n) = first.parse::<usize>() {
                         let rest = tokens[1..].join(" ");
-                        if rest.contains("passed") { passed = n; }
-                        else if rest.contains("failed") { failed = n; }
-                        else if rest.contains("skipped") { skipped = n; }
+                        if rest.contains("passed") {
+                            passed = n;
+                        } else if rest.contains("failed") {
+                            failed = n;
+                        } else if rest.contains("skipped") {
+                            skipped = n;
+                        }
                     }
                 }
                 if let Some(s_pos) = part.find(" in ") {
@@ -246,8 +295,11 @@ fn parse_test_output(output: &str) -> ParsedTestOutput {
 
         // Go test: "ok  	mypackage	0.123s" / "FAIL	mypackage	0.456s"
         if line.starts_with("ok\t") || line.starts_with("FAIL\t") {
-            if line.starts_with("ok\t") { passed += 1; }
-            else { failed += 1; }
+            if line.starts_with("ok\t") {
+                passed += 1;
+            } else {
+                failed += 1;
+            }
         }
 
         // Duration patterns
@@ -262,7 +314,14 @@ fn parse_test_output(output: &str) -> ParsedTestOutput {
     }
 
     let total = passed + failed + skipped;
-    ParsedTestOutput { passed, failed, skipped, total, duration_ms, failures }
+    ParsedTestOutput {
+        passed,
+        failed,
+        skipped,
+        total,
+        duration_ms,
+        failures,
+    }
 }
 
 #[cfg(test)]

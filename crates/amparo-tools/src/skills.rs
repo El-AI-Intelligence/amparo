@@ -11,7 +11,9 @@
 //! through the gate chain individually. A skill can never grant its steps an
 //! exemption.
 
-use super::{ToolCall, ToolExecutor, ToolParam, ToolResult, ToolRegistry, ToolSchema, ToolTrustTier};
+use super::{
+    ToolCall, ToolExecutor, ToolParam, ToolRegistry, ToolResult, ToolSchema, ToolTrustTier,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -105,7 +107,10 @@ impl SkillSpec {
             ));
         }
         if self.description.trim().is_empty() {
-            return Err(format!("skill {:?} description must be non-empty", self.name));
+            return Err(format!(
+                "skill {:?} description must be non-empty",
+                self.name
+            ));
         }
         if self.expected_outcome.trim().is_empty() {
             return Err(format!(
@@ -243,8 +248,9 @@ impl ToolExecutor for UseSkillTool {
                 "error": "skills expand inside the agent loop; direct execution is not supported",
                 "skill_name": name,
             }),
-            display_summary: "use_skill expands inside the agent loop; direct execution is not supported"
-                .to_string(),
+            display_summary:
+                "use_skill expands inside the agent loop; direct execution is not supported"
+                    .to_string(),
             duration_ms: 0,
         }
     }
@@ -313,7 +319,11 @@ mod tests {
         for bad in ["Bad_Name", "-leading", "UPPER", ""] {
             let mut s = spec("valid");
             s.name = bad.to_string();
-            assert!(s.validate(&registry).is_err(), "slug {:?} must be rejected", bad);
+            assert!(
+                s.validate(&registry).is_err(),
+                "slug {:?} must be rejected",
+                bad
+            );
         }
     }
 
@@ -322,15 +332,24 @@ mod tests {
         let registry = default_registry();
         let mut s = spec("ok-name");
         s.description = "  ".to_string();
-        assert!(s.validate(&registry).is_err(), "blank description must be rejected");
+        assert!(
+            s.validate(&registry).is_err(),
+            "blank description must be rejected"
+        );
 
         let mut s = spec("ok-name");
         s.expected_outcome = String::new();
-        assert!(s.validate(&registry).is_err(), "blank outcome must be rejected");
+        assert!(
+            s.validate(&registry).is_err(),
+            "blank outcome must be rejected"
+        );
 
         let mut s = spec("ok-name");
         s.steps.clear();
-        assert!(s.validate(&registry).is_err(), "empty steps must be rejected");
+        assert!(
+            s.validate(&registry).is_err(),
+            "empty steps must be rejected"
+        );
     }
 
     #[test]
@@ -368,7 +387,11 @@ mod tests {
         let text = UseSkillTool::render_description(&names, 2);
         assert!(text.contains("skill-0 — does thing 0"));
         assert!(text.contains("skill-1 — does thing 1"));
-        assert!(!text.contains("skill-2 — does thing 2"), "cap must trim: {}", text);
+        assert!(
+            !text.contains("skill-2 — does thing 2"),
+            "cap must trim: {}",
+            text
+        );
         assert!(text.contains("(1 more)"), "got: {}", text);
     }
 
@@ -391,7 +414,10 @@ mod tests {
         assert_eq!(param.name, "skill_name");
         assert_eq!(param.param_type, "string");
         assert!(param.required);
-        let enums = param.enum_values.as_ref().expect("names must be enumerated");
+        let enums = param
+            .enum_values
+            .as_ref()
+            .expect("names must be enumerated");
         assert_eq!(enums, &vec!["alpha".to_string(), "beta".to_string()]);
         assert!(schema.description.contains("alpha — reads a file"));
         assert!(schema.description.contains("beta — reads a file"));
@@ -415,8 +441,7 @@ mod tests {
         let result = tool.execute(&call).await;
         assert!(!result.success);
         assert_eq!(result.tool_call_id, "1");
-        assert!(result
-            .output["error"]
+        assert!(result.output["error"]
             .as_str()
             .unwrap()
             .contains("expand inside the agent loop"));

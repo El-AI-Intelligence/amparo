@@ -48,7 +48,9 @@ fn apply_delta(line: &str, turn: &mut SseTurn, calls: &mut Vec<AccumCall>) {
     if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
         turn.finish_reason = Some(fr.to_string());
     }
-    let Some(delta) = choice.get("delta") else { return };
+    let Some(delta) = choice.get("delta") else {
+        return;
+    };
     if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
         turn.content.push_str(text);
     }
@@ -86,7 +88,10 @@ fn finalize_calls(calls: Vec<AccumCall>) -> Vec<AssistantToolCall> {
         .map(|c| AssistantToolCall {
             id: c.id.unwrap_or_else(|| format!("call_{}", c.index)),
             call_type: "function".to_string(),
-            function: FunctionCall { name: c.name, arguments: c.arguments },
+            function: FunctionCall {
+                name: c.name,
+                arguments: c.arguments,
+            },
         })
         .collect()
 }
