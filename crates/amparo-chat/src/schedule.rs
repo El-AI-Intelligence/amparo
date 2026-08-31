@@ -384,6 +384,12 @@ impl ToolExecutor for ScheduleTool {
 mod tests {
     use super::*;
 
+    /// An RFC 3339 instant an hour out — the schedule tool compares
+    /// against the wall clock, so hardcoded dates expire.
+    fn future_at() -> String {
+        (Utc::now() + Duration::hours(1)).to_rfc3339()
+    }
+
     fn task(id: &str, at: &str, status: ScheduledStatus) -> ScheduledTask {
         ScheduledTask {
             id: id.to_string(),
@@ -496,7 +502,7 @@ mod tests {
             id: "call_1".to_string(),
             name: SCHEDULE.to_string(),
             arguments: serde_json::json!({
-                "at": "2026-08-31T12:00:00Z",
+                "at": future_at(),
                 "task": "remind me to email alice@example.com"
             }),
         };
@@ -560,7 +566,7 @@ mod tests {
             "{missing_at:?}"
         );
         let missing_task = tool
-            .execute(&call(serde_json::json!({"at": "2026-08-31T12:00:00Z"})))
+            .execute(&call(serde_json::json!({"at": future_at()})))
             .await;
         assert!(!missing_task.success);
         assert!(
@@ -597,7 +603,7 @@ mod tests {
         let call = ToolCall {
             id: "call_1".to_string(),
             name: SCHEDULE.to_string(),
-            arguments: serde_json::json!({"at": "2026-08-31T12:00:00Z", "task": "x"}),
+            arguments: serde_json::json!({"at": future_at(), "task": "x"}),
         };
         let result = tool.execute(&call).await;
         assert!(!result.success);

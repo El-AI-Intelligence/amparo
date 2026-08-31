@@ -70,7 +70,7 @@ SUBCOMMANDS:
   privacy    read the privacy ledger: a summary plus the most recent
              network-call and PII-strip rows
   doctor     the operator's QA pass: workspace, ledger, sessions, notebook,
-             skills, schedule, policy reachability, chat-config
+             skills, schedule, policy, engram, chat-config
   schedule   inspect the schedule queue: list every persisted promise or
              cancel a pending one (a status change, never a deletion)
   version    print the version

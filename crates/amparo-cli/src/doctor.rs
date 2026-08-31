@@ -5,7 +5,9 @@
 //! writability, the privacy ledger, session checkpoints (stale `Running`
 //! files older than 7 days), the notebook/skills/schedule JSONL files
 //! (parseability, never contents), policy-engine reachability (a TCP dial,
-//! or one real `/check` probe with `--probe`), and the chat TOML config.
+//! or one real `/check` probe with `--probe` — which also reports
+//! audit-mode verdicts), the Engram daemon (one `GET /health` probe when
+//! the memory backend is configured), and the chat TOML config.
 //!
 //! Reading never creates, rewrites or rotates anything — the only write is
 //! the workspace writability probe, which creates and removes one
@@ -22,10 +24,10 @@ use amparo_notebook::{
     notebook_dir, skills_dir, ADOPTED_FILE, HOT_FILE, HOT_HASHES_FILE, PROMOTED_FILE,
     PROPOSALS_FILE, RECHECKS_FILE, ROLLUP_STATE_FILE,
 };
-use amparo_policy::wire::WirePolicyEngine;
+use amparo_policy::wire::{WirePolicyEngine, AUDIT_ONLY_MARKER};
 use amparo_policy::{PolicyEngine, PolicyVerdict};
 use amparo_privacy::privacy_dir;
-use amparo_tools::PathPolicy;
+use amparo_tools::{EngramStore, PathPolicy, DEFAULT_ENGRAM_URL};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,7 +37,7 @@ amparo doctor — the operator's QA pass (M9)
 
 USAGE:
   amparo doctor [--workspace DIR] [--policy-url URL] [--probe]
-                [--chat-config PATH]
+                [--engram-url URL] [--chat-config PATH]
 
 Runs deterministic, read-only checks against a workspace and the
 configured surfaces, printing one [doctor] line per check and one
@@ -51,7 +53,10 @@ CHECKS:
   notebook      records/hot/hot-hashes/promoted JSONL + rollup.json parse
   skills        adopted/proposals/rechecks JSONL parse
   schedule      queue files parse; status counts
-  policy        TCP dial to the engine; --probe sends one real /check
+  policy        TCP dial to the engine; --probe sends one real /check and
+                reports audit-mode verdicts
+  engram        GET /health probe to the Engram daemon; a configured
+                backend with an unreachable daemon is a problem
   chat-config   --chat-config TOML parses
 
 FLAGS:
@@ -59,6 +64,8 @@ FLAGS:
   --policy-url URL   policy engine to reachability-check
   --probe            one real /check round trip (consumes one engine
                      check); requires --policy-url
+  --engram-url URL   Engram daemon to probe (GET /health); also read
+                     from AMPARO_ENGRAM_URL
   --chat-config PATH TOML chat config to parse-check";
 
 /// A `Running` checkpoint older than this is reported as stale.
@@ -76,6 +83,7 @@ struct DoctorFlags {
     workspace: Option<String>,
     policy_url: Option<String>,
     probe: bool,
+    engram_url: Option<String>,
     chat_config: Option<String>,
 }
 
@@ -85,6 +93,7 @@ impl Default for DoctorFlags {
             workspace: None,
             policy_url: None,
             probe: false,
+            engram_url: None,
             chat_config: None,
         }
     }
@@ -117,6 +126,10 @@ fn parse(args: Vec<String>) -> ParsedDoctor {
                 None => return ParsedDoctor::Error("--policy-url requires a URL".into()),
             },
             "--probe" => flags.probe = true,
+            "--engram-url" => match iter.next() {
+                Some(url) => flags.engram_url = Some(url),
+                None => return ParsedDoctor::Error("--engram-url requires a URL".into()),
+            },
             "--chat-config" => match iter.next() {
                 Some(path) => flags.chat_config = Some(path),
                 None => return ParsedDoctor::Error("--chat-config requires a path".into()),
@@ -218,6 +231,7 @@ async fn run_checks(workspace: &Path, flags: &DoctorFlags) -> bool {
     }
     check_schedule(workspace, &mut problems);
     check_policy(flags, &mut problems).await;
+    check_engram(flags, &mut problems).await;
     check_chat_config(flags, &mut problems);
 
     for problem in &problems {
@@ -439,6 +453,17 @@ async fn check_policy(flags: &DoctorFlags, problems: &mut Vec<String>) {
             PolicyVerdict::Escalate => "escalate",
         };
         println!("[doctor] policy: {url} answered {verdict} — {detail}");
+        // The wire client only carries the audit marker when the engine
+        // predicted deny/escalate under `enforced:false` — that is the
+        // mode being made visible here, not a finding (audit mode is a
+        // mode, the trial-bundle contract makes it visible, never fatal).
+        if decision
+            .fired
+            .iter()
+            .any(|f| f.starts_with(AUDIT_ONLY_MARKER))
+        {
+            println!("[doctor] policy: {url} in audit mode — verdicts are advisory");
+        }
         if failed {
             problems.push(format!(
                 "policy engine {url} answered through the fail-safe path: {detail}"
@@ -447,6 +472,54 @@ async fn check_policy(flags: &DoctorFlags, problems: &mut Vec<String>) {
     } else {
         println!("[doctor] policy: {url} reachable (tcp)");
     }
+}
+
+/// The Engram daemon probe (M11 W2): when Engram is part of the
+/// deployment — the flag, `AMPARO_ENGRAM_URL`, or the memory backend
+/// — one `GET /health` through the adapter proves the daemon answers.
+/// An unreachable daemon is a problem, not a crash: the agent degrades
+/// to the built-in store, and the operator should know it happened.
+async fn check_engram(flags: &DoctorFlags, problems: &mut Vec<String>) {
+    let env_url = std::env::var("AMPARO_ENGRAM_URL").ok();
+    let backend = std::env::var("AMPARO_MEMORY_BACKEND").ok();
+    let Some(url) = resolve_engram_url(
+        flags.engram_url.as_deref(),
+        env_url.as_deref(),
+        backend.as_deref(),
+    ) else {
+        println!("[doctor] engram: not configured (--engram-url or AMPARO_ENGRAM_URL)");
+        return;
+    };
+    let store = EngramStore::new(url.clone(), std::env::var("AMPARO_ENGRAM_KEY").ok());
+    if store.probe().await {
+        println!("[doctor] engram: {url} reachable (/health)");
+    } else {
+        problems.push(format!(
+            "engram daemon {url} unreachable — memory degrades to the built-in store"
+        ));
+    }
+}
+
+/// Which engramd URL the sweep probes, or `None` when Engram is not part
+/// of the deployment: the flag wins, then `AMPARO_ENGRAM_URL`, then the
+/// default local daemon address when `AMPARO_MEMORY_BACKEND=engram`.
+/// Pure — callers pass the env reads in, so it is testable without
+/// mutating process env.
+fn resolve_engram_url(
+    flag: Option<&str>,
+    env_url: Option<&str>,
+    backend: Option<&str>,
+) -> Option<String> {
+    if let Some(url) = flag {
+        return Some(url.to_string());
+    }
+    if let Some(url) = env_url {
+        return Some(url.to_string());
+    }
+    if backend == Some("engram") {
+        return Some(DEFAULT_ENGRAM_URL.to_string());
+    }
+    None
 }
 
 /// The chat TOML config, when one is named: `ChatConfig::load` applies
@@ -599,17 +672,24 @@ mod tests {
             "--policy-url",
             "https://engine.example",
             "--probe",
+            "--engram-url",
+            "http://engram.example:8787",
             "--chat-config",
             "/tmp/chat.toml",
         ]);
         assert_eq!(flags.workspace.as_deref(), Some("/tmp/ws"));
         assert_eq!(flags.policy_url.as_deref(), Some("https://engine.example"));
         assert!(flags.probe);
+        assert_eq!(
+            flags.engram_url.as_deref(),
+            Some("http://engram.example:8787")
+        );
         assert_eq!(flags.chat_config.as_deref(), Some("/tmp/chat.toml"));
 
         let flags = parse_ok(&[]);
         assert!(flags.workspace.is_none());
         assert!(!flags.probe);
+        assert!(flags.engram_url.is_none());
     }
 
     #[test]
@@ -617,9 +697,34 @@ mod tests {
         assert!(parse_error(&["--nonsense"]).contains("unknown flag --nonsense"));
         assert!(parse_error(&["--workspace"]).contains("requires a directory"));
         assert!(parse_error(&["--policy-url"]).contains("requires a URL"));
+        assert!(parse_error(&["--engram-url"]).contains("requires a URL"));
         assert!(parse_error(&["--chat-config"]).contains("requires a path"));
         assert!(parse_error(&["--probe"]).contains("--probe requires --policy-url"));
         assert!(parse_error(&["list"]).contains("takes no positional arguments, got 'list'"));
+    }
+
+    #[test]
+    fn engram_url_resolution_is_flag_then_env_then_backend_default() {
+        assert_eq!(
+            resolve_engram_url(Some("http://flag"), Some("http://env"), Some("engram")),
+            Some("http://flag".to_string())
+        );
+        assert_eq!(
+            resolve_engram_url(None, Some("http://env"), Some("engram")),
+            Some("http://env".to_string())
+        );
+        assert_eq!(
+            resolve_engram_url(None, None, Some("engram")),
+            Some(DEFAULT_ENGRAM_URL.to_string())
+        );
+        // The env is a configuration in itself — probed even without the
+        // backend switch.
+        assert_eq!(
+            resolve_engram_url(None, Some("http://env"), None),
+            Some("http://env".to_string())
+        );
+        assert_eq!(resolve_engram_url(None, None, None), None);
+        assert_eq!(resolve_engram_url(None, None, Some("inmemory")), None);
     }
 
     #[test]
@@ -837,5 +942,80 @@ mod tests {
         let healthy = run_checks(&root, &flags).await;
         assert!(healthy, "an answered probe is a healthy engine");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_mode_probe_is_visible_not_a_problem() {
+        // An engine in audit mode answers `enforced:false` — the wire
+        // client allows through the fail-safe path with the audit-only
+        // marker. The doctor reports the mode; it is not a finding.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                let body =
+                    r#"{"verdict":"deny","reason":"rm with destructive flags","enforced":false}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+            }
+        });
+
+        let root = temp_workspace();
+        let mut flags = flags();
+        flags.policy_url = Some(format!("http://{addr}"));
+        flags.probe = true;
+        let healthy = run_checks(&root, &flags).await;
+        assert!(healthy, "audit mode is a mode, not a problem");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reachable_engram_is_healthy() {
+        // One-request engramd stand-in answering `GET /health`, the
+        // wire.rs test pattern. The sweep probes once and stops.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let body = r#"{"status":"ok"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+        });
+
+        let root = temp_workspace();
+        let mut flags = flags();
+        flags.engram_url = Some(format!("http://{addr}"));
+        let healthy = run_checks(&root, &flags).await;
+        assert!(healthy, "a daemon that answers /health is healthy");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreachable_engram_is_a_problem() {
+        let root = temp_workspace();
+        let mut flags = flags();
+        // Nothing listens here — the probe must fail fast.
+        flags.engram_url = Some("http://127.0.0.1:1".to_string());
+        let healthy = run_checks(&root, &flags).await;
+        assert!(!healthy, "a configured backend with a dead daemon degrades");
     }
 }

@@ -1,8 +1,10 @@
 # Trial bundle — Amparo download, one month of Engram + Guardrail, then graceful degradation
 
-Status: plan (2026-08-28). Cross-product: the Amparo side is thin by
-design; the real work lives in Engram and Guardrail. Facts verified
-against the repos on 2026-08-28.
+Status: plan (2026-08-28); Amparo side executed 2026-08-31 (M11 W2,
+v0.10.0) — see the execution note in the Amparo section below.
+Cross-product: the Amparo side is thin by design; the real work lives
+in Engram and Guardrail. Facts verified against the repos on
+2026-08-28.
 
 ## The offer
 
@@ -83,6 +85,24 @@ Mostly documentation and first-run UX, no degradation code:
    expiry behavior, in the voice of §7.
 3. The one-line stderr notice when a wire policy engine reports
    audit-mode verdicts (visible mode, not silent).
+
+Execution status (2026-08-31):
+
+- **Item 3 landed first** (M9 W3, v0.8.0): the audit-mode stderr notice
+  — one line, once per process, in `amparo run`, `amparo chat`, and
+  `mcp-serve` when a wire engine first returns `enforced:false`.
+- **Items 1 and 2 landed in M11 W2 (v0.10.0)**: the probes now live in
+  `amparo doctor` — the Engram check does a real `GET /health`
+  (`--engram-url`, or `AMPARO_ENGRAM_URL`, or the default
+  `127.0.0.1:8787` when `AMPARO_MEMORY_BACKEND=engram`), and the
+  Guardrail check's `--probe` does a real `/check` that prints the
+  audit mode when the engine reports `enforced:false`. The README
+  "Native integrations" section describes the offer, the degradation,
+  and the expiry. A trial-pointer banner at `amparo run` startup is
+  not shipped — the doctor probes are the first-run surface, and the
+  bundle itself launches at the reveal.
+- **The Engram/Guardrail entitlement work above is unchanged** — still
+  plan, still launches at the reveal, not before.
 
 ## Redemption flow
 

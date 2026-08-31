@@ -479,6 +479,36 @@ its own or anyone else's.
 **Deployable anywhere.** A standalone server, a container, a systemd unit, a
 chat bot. Not welded to a desktop session, not dependent on a GUI.
 
+## Native integrations
+
+Amparo is built so its companions are recommended, never required — the
+degradation path is the "never required" path, exercised by design.
+
+**Engram memory backend.** With `AMPARO_MEMORY_BACKEND=engram`, the
+memory-search tool answers from an Engram vault over engramd's REST surface
+(`AMPARO_ENGRAM_URL`, default `http://127.0.0.1:8787`; optional
+`AMPARO_ENGRAM_KEY` for keyed daemons). The daemon is probed once at startup —
+down means one warning and the built-in store, and a mid-run outage degrades
+searches to empty rather than crashing the loop.
+
+**Guardrail policy engine.** Point `--policy-url` at a Guardrail engine (or
+any wire-protocol engine) with `AMPARO_POLICY_KEY`, and every tool call is
+checked there before it runs. Audit-mode verdicts (`enforced:false`) are
+visible, never silent — one stderr line names the mode ("policy engine is in
+audit mode; verdicts are advisory") — and an unreachable engine escalates
+through the fail-safe path: it never fails open.
+
+**Graceful degradation.** Remove both companions and Amparo still runs: the
+built-in memory store and the local default engine (deny-by-default).
+`amparo doctor --engram-url … --policy-url … --probe` sweeps both surfaces for
+the operator.
+
+**The trial bundle.** [docs/trial-bundle.md](docs/trial-bundle.md) pairs the
+public reveal with one month of Engram's personal tier and Guardrail's policy
+enforcement, degrading to the existing free tiers at expiry — nothing breaks,
+nothing is silently waived. Amparo's side of that promise is the degradation
+above, already exercised.
+
 ## Roadmap
 
 | # | Milestone | State |

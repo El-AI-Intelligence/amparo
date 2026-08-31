@@ -37,8 +37,8 @@ use amparo_policy::{
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{
-    default_registry_with_memory, resolve_memory_backend, InMemoryStore, Memory, PathPolicy,
-    SendNotificationTool, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool,
+    default_registry_with_memory, resolve_memory_backend, Memory, PathPolicy, SendNotificationTool,
+    SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool,
 };
 use std::sync::{Arc, Mutex};
 
@@ -995,6 +995,7 @@ async fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amparo_tools::InMemoryStore;
 
     fn parse(args: &[&str]) -> ParseRunResult {
         parse_run_flags(args.iter().map(|s| s.to_string()))

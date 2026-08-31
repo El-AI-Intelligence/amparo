@@ -21,7 +21,8 @@ use std::time::Duration;
 
 /// The default engramd base URL, used when `AMPARO_MEMORY_BACKEND=engram`
 /// but `AMPARO_ENGRAM_URL` is unset — the documented local daemon address.
-const DEFAULT_ENGRAM_URL: &str = "http://127.0.0.1:8787";
+/// Shared with `amparo doctor`'s Engram probe.
+pub const DEFAULT_ENGRAM_URL: &str = "http://127.0.0.1:8787";
 
 /// Per-request timeout: a hung daemon must degrade the search (to an
 /// empty result), never hang the agent loop.

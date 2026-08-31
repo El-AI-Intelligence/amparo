@@ -24,7 +24,7 @@ pub use blackboard::{
     BlackboardEntry, BlackboardReadTool, BlackboardStore, BlackboardWriteTool, BLACKBOARD_DIR,
     BLACKBOARD_FILE, BLACKBOARD_READ, BLACKBOARD_WRITE,
 };
-pub use engram_store::{resolve_memory_backend, EngramStore};
+pub use engram_store::{resolve_memory_backend, EngramStore, DEFAULT_ENGRAM_URL};
 pub use memory::{InMemoryStore, Memory, MemoryEntry, MemorySearchTool, MemoryWriteTool};
 pub use notification::{
     Notification, NotificationTransport, SendNotificationTool, StderrTransport, WebhookTransport,
