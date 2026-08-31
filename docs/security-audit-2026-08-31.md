@@ -182,6 +182,25 @@ to the box; the `.gitignore` decision for `web/` is the operator's.
   follows the last `@` reaches a ledger row), LOW-5 (`EngramStore::new`
   warns on stderr when the engramd URL is non-loopback plaintext http;
   127/8, `localhost` and `[::1]` stay quiet).
+- **e03bb43** — MED-10 (SSE auth: the operator token never rides a URL —
+  `POST /api/tickets` issues a one-shot 30-second ticket over the authed
+  API and the events endpoint consumes exactly one; the `?token=` path is
+  gone; the SPA re-issues on drop with bounded retries), MED-11 (the
+  `/approvals` POST rejects non-pollable `call_id`s with 400, duplicates
+  with 409, and caps the pending queue at 64 with 429 — the gate fails
+  closed on every refusal, verified in `web_approval.rs`), LOW-13 (POSTs
+  on `/approvals` and the authed API rate-limited per source address,
+  120/min → 429), MED-9 + LOW-11 (contract bumped to v4: the binary pin
+  moves v0.7.0 → v0.10.0 in the contract and the deploy docs, the mock
+  wording is retired, the contract stamps agree at v4, and the deploy
+  README's rollback text no longer prescribes a `git checkout` that an
+  untracked `web/` cannot serve), LOW-9 (`deploy.sh` aborts loudly when
+  the unit is not active after restart). The `web/` tree itself is
+  untracked by design and edited on disk only (server.mjs, app.js,
+  deploy files, test harness) — verified by the local smoke acceptance
+  plus a drill of the new semantics (ticket one-shot 401 on replay,
+  `?token=` rejected, duplicate 409, rate limit 429) and deployed to
+  the box.
 
 ## Operator note
 
