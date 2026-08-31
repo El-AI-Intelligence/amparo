@@ -8,6 +8,39 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-31
+
+M11, landed: adoption — Engram and Guardrail go native, and the web
+surface goes live (see the README "Native integrations" section and
+`docs/trial-bundle.md`).
+
+### Added
+
+- **The Engram memory backend** (`amparo-tools/src/engram_store.rs`):
+  `EngramStore` implements the `Memory` trait over engramd's REST
+  surface (`POST /memories/search` → `MemoryEntry`, `POST /memories`,
+  `GET /health` probe). Env-gated behind `AMPARO_MEMORY_BACKEND=engram`
+  with `AMPARO_ENGRAM_URL` (default `http://127.0.0.1:8787`) and an
+  optional `AMPARO_ENGRAM_KEY`; wired at all four registry sites (CLI
+  run, MCP serve, chat driver + dispatch). Engram stays behind the
+  trait — recommended, never a dependency. A daemon that is down at
+  startup or mid-run degrades to the built-in store with one
+  `[memory]` warn; never fatal.
+- **`amparo doctor` probes both companions**: the Engram check
+  (`--engram-url`, `AMPARO_ENGRAM_URL`, or the default when the engram
+  backend is configured) does one real `GET /health`; an unreachable
+  daemon is a problem that names the degradation. The Guardrail
+  check's `--probe` does one real `/check` and reports audit mode
+  ("policy: … in audit mode — verdicts are advisory") when the engine
+  answers `enforced: false` — a visible mode, never a finding.
+- **The web surface went live** at `amparo.ellmstack.dev` — the
+  deployment promised in `docs/web-surface.md`: the thin MCP bridge on
+  the site box against the v0.9.0 approval seam
+  (`--approval-endpoint`, 60 s fail-closed), sandboxed systemd unit,
+  Caddy vhost, grey-cloud DNS, Let's Encrypt. The app holds no policy
+  keys — the spawned `amparo mcp-serve` process holds them.
+  Deployment-only: no crate surface changed beyond the probes above.
+
 ## [0.9.0] — 2026-08-31
 
 M10, landed: coordination & surfaces — the blackboard, notifications,

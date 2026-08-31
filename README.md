@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M9 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed, M8 (sub-agents & scheduling: `spawn_agent` + `schedule` behind the gate chain) landed, M9 (verification & QA: QC council beside policy, `amparo doctor`, the audit-mode notice + session tagging) landed, M10 (coordination & surfaces: the blackboard, `send_notification`, rollback hints, the web-approval seam, MCP spawn + the CLI scheduler) landed
+## Status: pre-alpha, M11 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed, M8 (sub-agents & scheduling: `spawn_agent` + `schedule` behind the gate chain) landed, M9 (verification & QA: QC council beside policy, `amparo doctor`, the audit-mode notice + session tagging) landed, M10 (coordination & surfaces: the blackboard, `send_notification`, rollback hints, the web-approval seam, MCP spawn + the CLI scheduler) landed, M11 (adoption: the Engram memory backend, Guardrail-native policy checks, and the web surface live) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -524,6 +524,7 @@ above, already exercised.
 | 9 | Sub-agents & scheduling | ✅ landed — `spawn_agent` (a sub-agent is the same loop, gate chain, and ceiling; the delegation chain is in the ids, checkpoints, ledger rows, and approval copy; the shared budget fails closed) and `schedule` (a persisted promise re-entering the gate chain as its requester; missed = fail-closed), plus the swarm report with the cost line |
 | 10 | Verification & QA | ✅ landed — the QC council (deterministic rule auditors beside policy: findings feed the verification prompt, verification stays the model's call), `amparo doctor` (the operator's read-only workspace sweep, exit 0/1/2), and the audit-mode stderr notice + session tagging (`--session-id`, defaulting to the task id) |
 | 11 | Coordination & surfaces | ✅ landed — the blackboard (`blackboard_read`/`blackboard_write`, `[bus]` rows), `send_notification` (transport seam — stderr or webhook), rollback groups (display-only undo hints + `.amparo-bak` backups), the web-approval seam (`--approval-endpoint`, 60 s fail-closed), MCP spawn (`--max-sub-agents`, opt-in, shared budget), and the CLI scheduler (due promises fire at run start, best-effort) |
+| 12 | Engram + Guardrail native, web surface | ✅ landed — the Engram memory backend (`AMPARO_MEMORY_BACKEND=engram`, one probe + one warn, mid-run degradation to the built-in store), Guardrail-native policy (`amparo doctor` probes both companions and reports audit mode; the wire engine already conformed), and the web surface live at amparo.ellmstack.dev (thin MCP bridge + web-approval seam; the app holds no policy keys) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant

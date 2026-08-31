@@ -52,6 +52,12 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
   web-approval seam (`WebApprovalGate` POST/poll, 60 s fail-closed,
   `--approval-endpoint`), and MCP spawn + the CLI scheduler
   (`--max-sub-agents`, due promises firing at run start).
+- **0.10.0 (2026-08-31)** — adoption: the Engram memory backend (the
+  `Memory` trait over engramd, env-gated, degradation to the built-in
+  store), Guardrail-native policy checks with `amparo doctor` probing
+  both companions and reporting audit mode, and the web surface live
+  at `amparo.ellmstack.dev` (deployment against the v0.9.0 approval
+  seam).
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 
