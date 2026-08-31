@@ -35,8 +35,8 @@ use amparo_inference::{
 use amparo_policy::{PolicyEngine, PolicyVerdict};
 use amparo_privacy::{DataCategory, PiiPlaceholder};
 use amparo_tools::{
-    PathPolicy, SkillLibrary, ToolCall, ToolExecutor, ToolRegistry, ToolResult, ToolTrustTier,
-    BLACKBOARD_WRITE, USE_SKILL,
+    PathPolicy, RollbackSpec, SkillLibrary, ToolCall, ToolExecutor, ToolRegistry, ToolResult,
+    ToolTrustTier, BLACKBOARD_WRITE, USE_SKILL,
 };
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -394,8 +394,16 @@ pub async fn dry_run_gate(
 /// One batch item, in model order: either a direct call still to execute,
 /// or an already-expanded skill result.
 enum ExecItem {
-    /// A gated model call, executed concurrently with the rest of the batch.
-    Call(ToolCall),
+    /// A gated model call, executed concurrently with the rest of the
+    /// batch. `rollback` is the tool's own hint, computed here — before
+    /// execution — so the undo describes exactly what the call is about
+    /// to change (M10 W3).
+    Call {
+        /// The gated call.
+        call: ToolCall,
+        /// The pre-execution rollback hint, when the tool declares one.
+        rollback: Option<RollbackSpec>,
+    },
     /// A `use_skill` expansion result, already in hand.
     Skill(ToolResult),
 }
@@ -785,6 +793,24 @@ impl Agent {
                 self.events.emit(&AgentEvent::BlackboardWrite {
                     key: key.to_string(),
                     written_by: self.task_id.clone(),
+                });
+            }
+        }
+    }
+
+    /// Emit the `[rollback]` row for a successful call that carries a
+    /// rollback hint (M10 W3). The spec was computed against the
+    /// *pre-call* state at the gate site, so it never claims a backup
+    /// the call itself is about to create. Failed calls changed nothing,
+    /// so they emit no row. Display-only: Amparo never executes a
+    /// rollback itself (I1).
+    fn emit_rollback_row(&self, result: &ToolResult, spec: Option<&RollbackSpec>) {
+        if result.success {
+            if let Some(spec) = spec {
+                self.events.emit(&AgentEvent::Rollback {
+                    call_id: result.tool_call_id.clone(),
+                    tool_name: result.tool_name.clone(),
+                    spec: spec.clone(),
                 });
             }
         }
@@ -1337,7 +1363,15 @@ impl Agent {
                                 }
                                 ready.push(ExecItem::Skill(result));
                             } else {
-                                ready.push(ExecItem::Call(call.clone()));
+                                // The rollback hint is computed here,
+                                // before execution (M10 W3): the undo must
+                                // describe the pre-call state, not the
+                                // state the call itself is about to create.
+                                let rollback = self.registry.rollback_for(call);
+                                ready.push(ExecItem::Call {
+                                    call: call.clone(),
+                                    rollback,
+                                });
                             }
                         }
                     }
@@ -1348,20 +1382,27 @@ impl Agent {
                 // rebuilds `exec_results` in model order so everything
                 // downstream sees one result per call, batch position intact.
                 let exec_futures = ready.iter().filter_map(|item| match item {
-                    ExecItem::Call(call) => {
+                    ExecItem::Call { call, .. } => {
                         let call = call.clone();
                         Some(async move { self.execute_call(&call).await })
                     }
                     ExecItem::Skill(_) => None,
                 });
                 let mut exec_results: Vec<ToolResult> = Vec::with_capacity(ready.len());
+                // The per-item rollback hint, parallel to `exec_results`
+                // (M10 W3): `None` for expanded skill results.
+                let mut exec_rollbacks: Vec<Option<RollbackSpec>> = Vec::with_capacity(ready.len());
                 let mut call_results = join_all(exec_futures).await.into_iter();
                 for item in &ready {
                     match item {
-                        ExecItem::Call(_) => {
-                            exec_results.push(call_results.next().expect("one result per call"))
+                        ExecItem::Call { rollback, .. } => {
+                            exec_results.push(call_results.next().expect("one result per call"));
+                            exec_rollbacks.push(rollback.clone());
                         }
-                        ExecItem::Skill(result) => exec_results.push(result.clone()),
+                        ExecItem::Skill(result) => {
+                            exec_results.push(result.clone());
+                            exec_rollbacks.push(None);
+                        }
                     }
                 }
 
@@ -1391,12 +1432,16 @@ impl Agent {
                         .map(|r| r.display_summary.clone())
                         .collect::<Vec<_>>()
                         .join(". ");
-                    for result in exec_results {
+                    for (i, result) in exec_results.iter().enumerate() {
                         steps.push(AgentStep::ToolResult(result.clone()));
                         self.events.emit(&AgentEvent::ToolExecuted {
                             result: result.clone(),
                         });
-                        self.emit_bus_row(&result);
+                        self.emit_bus_row(result);
+                        self.emit_rollback_row(
+                            result,
+                            exec_rollbacks.get(i).and_then(|s| s.as_ref()),
+                        );
                         if !executed_tools.contains(&result.tool_name) {
                             executed_tools.push(result.tool_name.clone());
                         }
@@ -1444,13 +1489,14 @@ impl Agent {
                 }
 
                 let mut all_obs: Vec<String> = blocked_obs;
-                for result in &exec_results {
+                for (i, result) in exec_results.iter().enumerate() {
                     let result_step = AgentStep::ToolResult(result.clone());
                     steps.push(result_step);
                     self.events.emit(&AgentEvent::ToolExecuted {
                         result: result.clone(),
                     });
                     self.emit_bus_row(result);
+                    self.emit_rollback_row(result, exec_rollbacks.get(i).and_then(|s| s.as_ref()));
                     if !executed_tools.contains(&result.tool_name) {
                         executed_tools.push(result.tool_name.clone());
                     }
@@ -1925,6 +1971,11 @@ impl Agent {
                 reasons: ask_reasons.clone(),
                 blast_radius,
                 session_label: session_label.map(str::to_string),
+                // The rollback hint is computed here, before execution
+                // (M10 W3): the undo in the approval copy must describe
+                // the pre-call state, not the state the call itself is
+                // about to create.
+                rollback: self.registry.rollback_for(call),
             };
             self.events.emit(&AgentEvent::ApprovalRequested {
                 call_id: call.id.clone(),
@@ -2087,6 +2138,10 @@ impl Agent {
                         decision: "allowed".to_string(),
                         reasons,
                     });
+                    // The rollback hint is computed here, before
+                    // execution (M10 W3) — same contract as the batch
+                    // path: the undo describes the pre-call state.
+                    let step_spec = self.registry.rollback_for(&step_call);
                     let result = self.execute_call(&step_call).await;
                     if !executed_steps.contains(&step_call.name) {
                         executed_steps.push(step_call.name.clone());
@@ -2100,6 +2155,7 @@ impl Agent {
                         "output": result.output,
                     }));
                     self.emit_bus_row(&result);
+                    self.emit_rollback_row(&result, step_spec.as_ref());
                     self.events.emit(&AgentEvent::ToolExecuted { result });
                 }
             }
@@ -2271,6 +2327,7 @@ mod tests {
     use crate::qc::{QcVerdict, UNEXECUTED_TOOL_CLAIM};
     use amparo_inference::InferenceError;
     use amparo_policy::PolicyDecision;
+    use amparo_tools::filesystem::WriteFileTool;
     use amparo_tools::{SkillLibrary, SkillOrigin, SkillSpec, SkillStep, UseSkillTool};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -3093,6 +3150,133 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, AgentStep::ToolResult(r) if r.success)));
+    }
+
+    /// A unique temp workspace root for the W3 rollback tests, mirroring
+    /// the filesystem tests' harness (no tempfile dep).
+    fn w3_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "amparo-agent-w3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn write_file_success_emits_a_rollback_row_with_the_backup_marker() {
+        let root = w3_root();
+        std::fs::write(root.join("note.txt"), "old contents").unwrap();
+
+        let registry = registry_with(Arc::new(WriteFileTool::with_policy(Arc::new(
+            PathPolicy::from_root(root.clone()),
+        ))));
+
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            "write_file",
+            r#"{"path":"note.txt","content":"new contents"}"#,
+        ));
+
+        let sink = Arc::new(InMemoryEventSink::new());
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_events(sink.clone());
+
+        let report = agent.run("update the note").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+
+        // The write went through, and the previous contents are preserved
+        // at the backup marker.
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "new contents"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt.amparo-bak")).unwrap(),
+            "old contents"
+        );
+
+        // The [rollback] row carries the undo path and the backup marker.
+        let events = sink.snapshot();
+        let rollback = events.iter().find_map(|e| match e {
+            AgentEvent::Rollback {
+                call_id,
+                tool_name,
+                spec,
+            } => Some((call_id.clone(), tool_name.clone(), spec.clone())),
+            _ => None,
+        });
+        let (call_id, tool_name, spec) = rollback.expect("successful write emits a rollback row");
+        assert_eq!(call_id, "call_1");
+        assert_eq!(tool_name, "write_file");
+        assert!(
+            spec.undo.contains("restore the previous contents of"),
+            "{}",
+            spec.undo
+        );
+        assert_eq!(spec.markers.len(), 1, "{:?}", spec.markers);
+        assert!(
+            spec.markers[0].contains("note.txt.amparo-bak"),
+            "{}",
+            spec.markers[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn escalated_write_file_carries_the_rollback_hint_into_the_approval_copy() {
+        let root = w3_root();
+        std::fs::write(root.join("note.txt"), "old contents").unwrap();
+
+        let registry = registry_with(Arc::new(WriteFileTool::with_policy(Arc::new(
+            PathPolicy::from_root(root.clone()),
+        ))));
+
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call(
+            "call_1",
+            "write_file",
+            r#"{"path":"note.txt","content":"new contents"}"#,
+        ));
+
+        let policy = RecordingPolicy::new(&[("write_file", PolicyVerdict::Escalate)]);
+        let gate = RecordingGate::new(true);
+        let sink = Arc::new(InMemoryEventSink::new());
+        let agent = Agent::new(provider.clone(), registry, policy)
+            .with_approval(gate.clone())
+            .with_events(sink.clone());
+
+        let report = agent.run("update the note").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+
+        // The gate saw the pre-execution rollback hint: the undo path plus
+        // the backup marker the write will create.
+        let request = &gate.requests()[0];
+        let spec = request
+            .rollback
+            .as_ref()
+            .expect("escalated write carries a rollback hint");
+        assert!(
+            spec.undo.contains("restore the previous contents of"),
+            "{}",
+            spec.undo
+        );
+        assert!(
+            spec.markers
+                .iter()
+                .any(|m| m.contains("note.txt.amparo-bak")),
+            "{:?}",
+            spec.markers
+        );
+
+        // Approved → executed → the [rollback] row fires for the write.
+        let events = sink.snapshot();
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Rollback { tool_name, .. } if tool_name == "write_file")));
     }
 
     #[tokio::test]

@@ -68,8 +68,8 @@ pub mod preflight;
 pub mod qc;
 pub mod session;
 pub mod spawn;
-pub mod tokens;
 mod sse;
+pub mod tokens;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -80,13 +80,16 @@ pub use agent::{
 };
 pub use approval::{ApprovalGate, ApprovalRequest, AutoApprove, AutoDeny};
 pub use cases::{evidence_section, CaseLibrary, EvidenceCase};
-pub use events::{format_event, truncate, AgentEvent, EventSink, FanoutSink, InMemoryEventSink, TRUNCATE};
+pub use events::{
+    format_event, format_rollback, truncate, AgentEvent, EventSink, FanoutSink, InMemoryEventSink,
+    TRUNCATE,
+};
 pub use ledger_sink::{LedgerSink, NETWORK_TOOLS};
 pub use preflight::{classify, BlastRadius};
 pub use qc::{QcCouncil, QcFinding, QcInput, QcReport, QcStats, QcVerdict};
 pub use session::{
-    continuity_context, Checkpoint, CheckpointStore, JsonCheckpointStore, LoopState,
-    SessionStatus, CONTINUITY_TAIL,
+    continuity_context, Checkpoint, CheckpointStore, JsonCheckpointStore, LoopState, SessionStatus,
+    CONTINUITY_TAIL,
 };
 pub use spawn::{SpawnAgentTool, SubAgentSummary, SPAWN_AGENT};
 pub use tokens::{estimate_tokens, format_cost_line};

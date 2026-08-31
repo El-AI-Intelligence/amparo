@@ -57,7 +57,10 @@ enum GwStep {
     Send(Value),
     /// Read frames until `op` arrives (stray heartbeats are auto-acked),
     /// then run `check` on the frame — a failed check fails the script.
-    Expect { op: u8, check: Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync> },
+    Expect {
+        op: u8,
+        check: Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync>,
+    },
     /// Close the current connection, accept the next one, and send HELLO;
     /// the following steps run on the new connection.
     Reconnect,
@@ -67,11 +70,11 @@ enum GwStep {
 }
 
 /// An `Expect` step with a plain check closure.
-fn expect(
-    op: u8,
-    check: impl Fn(&Value) -> Result<(), String> + Send + Sync + 'static,
-) -> GwStep {
-    GwStep::Expect { op, check: Arc::new(check) }
+fn expect(op: u8, check: impl Fn(&Value) -> Result<(), String> + Send + Sync + 'static) -> GwStep {
+    GwStep::Expect {
+        op,
+        check: Arc::new(check),
+    }
 }
 
 /// A `WaitRest` step with a plain predicate.
@@ -113,7 +116,9 @@ struct MockRest {
 
 impl MockRest {
     async fn start(rate_limited_first: bool) -> Arc<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock rest");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock rest");
         let addr = listener.local_addr().expect("mock rest addr");
         let this = Arc::new(Self {
             log: Arc::new(Mutex::new(Vec::new())),
@@ -124,10 +129,14 @@ impl MockRest {
         let me = Arc::clone(&this);
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let me = Arc::clone(&me);
                 tokio::spawn(async move {
-                    let Some(request) = read_request(&mut sock).await else { return };
+                    let Some(request) = read_request(&mut sock).await else {
+                        return;
+                    };
                     let response = me.response_for(&request);
                     me.log.lock().expect("rest log").push(request);
                     let _ = sock.write_all(response.as_bytes()).await;
@@ -151,10 +160,13 @@ impl MockRest {
             // One increment per message post; the pre-increment value is
             // the post's number — the first one gets the 429, the retry
             // becomes mock_msg_1.
-            let n = self.message_posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = self
+                .message_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.rate_limited_first && n == 0 {
-                let body = json!({ "message": "rate limited", "retry_after": 0.05, "global": false })
-                    .to_string();
+                let body =
+                    json!({ "message": "rate limited", "retry_after": 0.05, "global": false })
+                        .to_string();
                 return format!(
                     "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -192,7 +204,9 @@ struct MockGateway {
 
 impl MockGateway {
     async fn start(steps: Vec<GwStep>, rest_log: Arc<Mutex<Vec<RecordedRequest>>>) -> MockGateway {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock gateway");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock gateway");
         let addr = listener.local_addr().expect("mock gateway addr");
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -213,7 +227,9 @@ impl MockGateway {
         match tokio::time::timeout(SCRIPT_BUDGET, self.result).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => Err("gateway script task vanished".into()),
-            Err(_) => Err(format!("gateway script did not finish within {SCRIPT_BUDGET:?}")),
+            Err(_) => Err(format!(
+                "gateway script did not finish within {SCRIPT_BUDGET:?}"
+            )),
         }
     }
 }
@@ -225,16 +241,26 @@ async fn run_gateway_script(
     rest_log: Arc<Mutex<Vec<RecordedRequest>>>,
     steps: Vec<GwStep>,
 ) -> Result<(), String> {
-    let (sock, _) = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
-    let mut ws = accept_async(sock).await.map_err(|e| format!("ws handshake: {e}"))?;
+    let (sock, _) = listener
+        .accept()
+        .await
+        .map_err(|e| format!("accept: {e}"))?;
+    let mut ws = accept_async(sock)
+        .await
+        .map_err(|e| format!("ws handshake: {e}"))?;
     send_frame(&mut ws, &hello_frame()).await?;
 
     for step in steps {
         match step {
             GwStep::Send(frame) => send_frame(&mut ws, &frame).await?,
             GwStep::Reconnect => {
-                let (sock, _) = listener.accept().await.map_err(|e| format!("re-accept: {e}"))?;
-                ws = accept_async(sock).await.map_err(|e| format!("re-handshake: {e}"))?;
+                let (sock, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|e| format!("re-accept: {e}"))?;
+                ws = accept_async(sock)
+                    .await
+                    .map_err(|e| format!("re-handshake: {e}"))?;
                 send_frame(&mut ws, &hello_frame()).await?;
             }
             GwStep::Expect { op, check } => {
@@ -262,10 +288,13 @@ async fn run_gateway_script(
 
 /// Send one frame, bounded so a stuck socket cannot hang the script.
 async fn send_frame(ws: &mut WebSocketStream<TcpStream>, frame: &Value) -> Result<(), String> {
-    tokio::time::timeout(FRAME_BUDGET, ws.send(WsMessage::Text(frame.to_string().into())))
-        .await
-        .map_err(|_| "send timed out".to_string())?
-        .map_err(|e| format!("ws send: {e}"))
+    tokio::time::timeout(
+        FRAME_BUDGET,
+        ws.send(WsMessage::Text(frame.to_string().into())),
+    )
+    .await
+    .map_err(|_| "send timed out".to_string())?
+    .map_err(|e| format!("ws send: {e}"))
 }
 
 /// Read frames until one with `op` arrives — stray heartbeats are
@@ -279,8 +308,11 @@ async fn wait_for_frame(ws: &mut WebSocketStream<TcpStream>, op: u8) -> Result<V
             .map_err(|_| format!("timeout waiting for op {op}"))?
             .ok_or_else(|| "gateway connection closed".to_string())?
             .map_err(|e| format!("ws read: {e}"))?;
-        let WsMessage::Text(text) = frame else { continue };
-        let value: Value = serde_json::from_str(text.as_str()).map_err(|e| format!("bad frame: {e}"))?;
+        let WsMessage::Text(text) = frame else {
+            continue;
+        };
+        let value: Value =
+            serde_json::from_str(text.as_str()).map_err(|e| format!("bad frame: {e}"))?;
         if value["op"] == op {
             return Ok(value);
         }
@@ -352,7 +384,10 @@ fn deny_all_driver(transport: Arc<dyn ChatTransport>) -> Arc<ChatDriver> {
 
 /// POSTs to one exact path from the recorded log.
 fn posts_to(rest: &MockRest, path: &str) -> Vec<RecordedRequest> {
-    rest.requests().into_iter().filter(|r| r.method == "POST" && r.path == path).collect()
+    rest.requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path == path)
+        .collect()
 }
 
 /// The gateway protocol: identify (token + intents), heartbeat ack,
@@ -364,12 +399,18 @@ async fn gateway_identify_heartbeat_ready_and_resume_after_reconnect() {
     let gw = MockGateway::start(
         vec![
             expect(2, |d| {
-                check(d["token"] == "test-token", "IDENTIFY carried the wrong token")?;
+                check(
+                    d["token"] == "test-token",
+                    "IDENTIFY carried the wrong token",
+                )?;
                 check(d["intents"] == 37376, "IDENTIFY carried the wrong intents")?;
                 Ok(())
             }),
             expect(1, |d| {
-                check(d.is_null() || d.is_number(), "heartbeat seq must be null or a number")?;
+                check(
+                    d.is_null() || d.is_number(),
+                    "heartbeat seq must be null or a number",
+                )?;
                 Ok(())
             }),
             GwStep::Send(ack_frame()),
@@ -385,7 +426,10 @@ async fn gateway_identify_heartbeat_ready_and_resume_after_reconnect() {
             GwStep::Reconnect,
             expect(6, |d| {
                 check(d["token"] == "test-token", "RESUME carried the wrong token")?;
-                check(d["session_id"] == "sess-1", "RESUME carried the wrong session id")?;
+                check(
+                    d["session_id"] == "sess-1",
+                    "RESUME carried the wrong session id",
+                )?;
                 check(d["seq"] == 2, "RESUME carried the wrong sequence")?;
                 Ok(())
             }),
@@ -394,9 +438,16 @@ async fn gateway_identify_heartbeat_ready_and_resume_after_reconnect() {
     )
     .await;
 
-    let transport: Arc<dyn ChatTransport> =
-        Arc::new(DiscordTransport::with_urls("test-token".into(), gw.ws_url(), rest.url()));
-    tokio::spawn(transport.clone().receive(deny_all_driver(Arc::clone(&transport))));
+    let transport: Arc<dyn ChatTransport> = Arc::new(DiscordTransport::with_urls(
+        "test-token".into(),
+        gw.ws_url(),
+        rest.url(),
+    ));
+    tokio::spawn(
+        transport
+            .clone()
+            .receive(deny_all_driver(Arc::clone(&transport))),
+    );
 
     gw.finished().await.expect("gateway script");
     // The refused message (empty allowlist) arrived over the REST mock.
@@ -416,7 +467,11 @@ async fn rest_retries_429_and_carries_approval_components() {
         "ws://127.0.0.1:1".into(), // never contacted — pure REST test
         rest.url(),
     ));
-    let chat = ChatRef { platform: "discord", chat_id: "c1".into(), user_id: "222".into() };
+    let chat = ChatRef {
+        platform: "discord",
+        chat_id: "c1".into(),
+        user_id: "222".into(),
+    };
     let request = ApprovalRequest {
         call_id: "call_1".into(),
         tool_name: "run_command".into(),
@@ -424,42 +479,72 @@ async fn rest_retries_429_and_carries_approval_components() {
         reasons: vec!["external effector".into()],
         blast_radius: Some(BlastRadius::Network),
         session_label: None,
+        rollback: None,
     };
 
-    let msg = transport.send_approval(&chat, &request, "call_1").await.expect("send approval");
+    let msg = transport
+        .send_approval(&chat, &request, "call_1")
+        .await
+        .expect("send approval");
     assert_eq!(msg.chat_id, "c1");
-    assert_eq!(msg.message_id, "mock_msg_1", "the retried request created the message");
+    assert_eq!(
+        msg.message_id, "mock_msg_1",
+        "the retried request created the message"
+    );
 
     // The first POST was 429'd and retried exactly once: two recorded.
     let posts = posts_to(&rest, "/channels/c1/messages");
     assert_eq!(posts.len(), 2, "the 429 must be retried once");
     for post in &posts {
         assert!(
-            post.head.to_lowercase().contains("authorization: bot test-token"),
+            post.head
+                .to_lowercase()
+                .contains("authorization: bot test-token"),
             "message posts carry the bot Authorization header"
         );
-        assert!(post.body.contains("\"approve:call_1\""), "body: {}", post.body);
+        assert!(
+            post.body.contains("\"approve:call_1\""),
+            "body: {}",
+            post.body
+        );
         assert!(post.body.contains("\"deny:call_1\""), "body: {}", post.body);
-        assert!(post.body.contains("\"style\":1"), "approve is a primary button");
+        assert!(
+            post.body.contains("\"style\":1"),
+            "approve is a primary button"
+        );
         assert!(post.body.contains("\"style\":4"), "deny is a danger button");
     }
 
-    transport.edit_approval(&msg, "Approved").await.expect("edit approval");
+    transport
+        .edit_approval(&msg, "Approved")
+        .await
+        .expect("edit approval");
     let edits: Vec<_> = rest
         .requests()
         .into_iter()
         .filter(|r| r.method == "PATCH" && r.path == "/channels/c1/messages/mock_msg_1")
         .collect();
     assert_eq!(edits.len(), 1);
-    assert!(edits[0].body.contains("\"components\":[]"), "buttons removed: {}", edits[0].body);
+    assert!(
+        edits[0].body.contains("\"components\":[]"),
+        "buttons removed: {}",
+        edits[0].body
+    );
     assert!(edits[0].body.contains("Approved"));
 
-    transport.send_text(&chat, &"x".repeat(2500)).await.expect("send text");
+    transport
+        .send_text(&chat, &"x".repeat(2500))
+        .await
+        .expect("send text");
     let texts = posts_to(&rest, "/channels/c1/messages");
     let last = texts.last().expect("truncated text post");
     let parsed: Value = serde_json::from_str(&last.body).expect("json body");
     assert_eq!(
-        parsed["content"].as_str().expect("content field").chars().count(),
+        parsed["content"]
+            .as_str()
+            .expect("content field")
+            .chars()
+            .count(),
         2000,
         "text is truncated to Discord's message limit"
     );
@@ -475,7 +560,10 @@ async fn driver_runs_a_task_through_the_gateway_and_button_press() {
     let gw = MockGateway::start(
         vec![
             expect(2, |d| {
-                check(d["token"] == "test-token", "IDENTIFY carried the wrong token")?;
+                check(
+                    d["token"] == "test-token",
+                    "IDENTIFY carried the wrong token",
+                )?;
                 check(d["intents"] == 37376, "IDENTIFY carried the wrong intents")?;
                 Ok(())
             }),
@@ -496,14 +584,20 @@ async fn driver_runs_a_task_through_the_gateway_and_button_press() {
                     "member": { "user": { "id": "222", "bot": false } }
                 }
             })),
-            wait_rest(|reqs| reqs.iter().any(|r| r.method == "POST" && r.body.contains("Done."))),
+            wait_rest(|reqs| {
+                reqs.iter()
+                    .any(|r| r.method == "POST" && r.body.contains("Done."))
+            }),
         ],
         Arc::clone(&rest.log),
     )
     .await;
 
-    let transport: Arc<dyn ChatTransport> =
-        Arc::new(DiscordTransport::with_urls("test-token".into(), gw.ws_url(), rest.url()));
+    let transport: Arc<dyn ChatTransport> = Arc::new(DiscordTransport::with_urls(
+        "test-token".into(),
+        gw.ws_url(),
+        rest.url(),
+    ));
     let driver = Arc::new(ChatDriver::new(
         Tenants::LegacyAllowlist(HashSet::from(["222".to_string()])),
         StubProvider::new(vec![
@@ -528,7 +622,11 @@ async fn driver_runs_a_task_through_the_gateway_and_button_press() {
         !callbacks[0].head.to_lowercase().contains("authorization"),
         "callback must not carry an Authorization header"
     );
-    assert!(callbacks[0].body.contains("\"type\":6"), "deferred update: {}", callbacks[0].body);
+    assert!(
+        callbacks[0].body.contains("\"type\":6"),
+        "deferred update: {}",
+        callbacks[0].body
+    );
 
     // The gate approved and edited the message in place.
     let edits: Vec<_> = rest
@@ -537,12 +635,22 @@ async fn driver_runs_a_task_through_the_gateway_and_button_press() {
         .filter(|r| r.method == "PATCH" && r.path.starts_with("/channels/c1/messages/"))
         .collect();
     assert_eq!(edits.len(), 1, "the gate is the message's single editor");
-    assert!(edits[0].body.contains("\"Approved\""), "edit body: {}", edits[0].body);
-    assert!(edits[0].body.contains("\"components\":[]"), "buttons removed");
+    assert!(
+        edits[0].body.contains("\"Approved\""),
+        "edit body: {}",
+        edits[0].body
+    );
+    assert!(
+        edits[0].body.contains("\"components\":[]"),
+        "buttons removed"
+    );
 
     // The final answer was delivered as a text send.
     let posts = posts_to(&rest, "/channels/c1/messages");
-    assert!(posts.iter().any(|r| r.body.contains("Done.")), "final answer delivered");
+    assert!(
+        posts.iter().any(|r| r.body.contains("Done.")),
+        "final answer delivered"
+    );
 }
 
 /// A press from a user who did not start the task is refused with a polite
@@ -554,7 +662,10 @@ async fn wrong_user_press_gets_toast_and_requester_still_decides() {
     let gw = MockGateway::start(
         vec![
             expect(2, |d| {
-                check(d["token"] == "test-token", "IDENTIFY carried the wrong token")?;
+                check(
+                    d["token"] == "test-token",
+                    "IDENTIFY carried the wrong token",
+                )?;
                 check(d["intents"] == 37376, "IDENTIFY carried the wrong intents")?;
                 Ok(())
             }),
@@ -579,7 +690,8 @@ async fn wrong_user_press_gets_toast_and_requester_still_decides() {
                 reqs.iter().any(|r| {
                     r.method == "POST"
                         && r.path == "/channels/c1/messages"
-                        && r.body.contains("Only the user who started the task can decide.")
+                        && r.body
+                            .contains("Only the user who started the task can decide.")
                 })
             }),
             GwStep::Send(json!({
@@ -591,15 +703,19 @@ async fn wrong_user_press_gets_toast_and_requester_still_decides() {
                 }
             })),
             wait_rest(|reqs| {
-                reqs.iter().any(|r| r.method == "POST" && r.body.contains("Done."))
+                reqs.iter()
+                    .any(|r| r.method == "POST" && r.body.contains("Done."))
             }),
         ],
         Arc::clone(&rest.log),
     )
     .await;
 
-    let transport: Arc<dyn ChatTransport> =
-        Arc::new(DiscordTransport::with_urls("test-token".into(), gw.ws_url(), rest.url()));
+    let transport: Arc<dyn ChatTransport> = Arc::new(DiscordTransport::with_urls(
+        "test-token".into(),
+        gw.ws_url(),
+        rest.url(),
+    ));
     let driver = Arc::new(ChatDriver::new(
         Tenants::LegacyAllowlist(HashSet::from(["222".to_string()])),
         StubProvider::new(vec![
@@ -619,11 +735,17 @@ async fn wrong_user_press_gets_toast_and_requester_still_decides() {
     // Exactly one wrong-user toast, posted like any authorized message.
     let toasts: Vec<_> = posts_to(&rest, "/channels/c1/messages")
         .into_iter()
-        .filter(|r| r.body.contains("Only the user who started the task can decide."))
+        .filter(|r| {
+            r.body
+                .contains("Only the user who started the task can decide.")
+        })
         .collect();
     assert_eq!(toasts.len(), 1, "one wrong-user toast");
     assert!(
-        toasts[0].head.to_lowercase().contains("authorization: bot test-token"),
+        toasts[0]
+            .head
+            .to_lowercase()
+            .contains("authorization: bot test-token"),
         "the toast is an authorized message post"
     );
 
@@ -635,7 +757,14 @@ async fn wrong_user_press_gets_toast_and_requester_still_decides() {
         .filter(|r| r.method == "PATCH" && r.path.starts_with("/channels/c1/messages/"))
         .collect();
     assert_eq!(edits.len(), 1, "the gate is the message's single editor");
-    assert!(edits[0].body.contains("\"Approved\""), "edit body: {}", edits[0].body);
+    assert!(
+        edits[0].body.contains("\"Approved\""),
+        "edit body: {}",
+        edits[0].body
+    );
     let posts = posts_to(&rest, "/channels/c1/messages");
-    assert!(posts.iter().any(|r| r.body.contains("Done.")), "final answer delivered");
+    assert!(
+        posts.iter().any(|r| r.body.contains("Done.")),
+        "final answer delivered"
+    );
 }

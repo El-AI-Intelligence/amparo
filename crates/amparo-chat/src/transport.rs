@@ -100,6 +100,15 @@ pub fn session_line(request: &ApprovalRequest) -> Option<String> {
         .map(|label| format!("[session] {label} wants to run:"))
 }
 
+/// The one-line M10 W3 rollback hint for an approval message — the
+/// idempotent undo path with any backup markers — or `None` when the
+/// tool declared no hint. Like [`preflight_line`], display-only: the
+/// gate has already decided, and Amparo never executes the rollback
+/// itself (I1).
+pub fn rollback_line(request: &ApprovalRequest) -> Option<String> {
+    request.rollback.as_ref().map(amparo_agent::format_rollback)
+}
+
 /// The seam every chat adapter implements.
 ///
 /// The first three methods are outbound; [`receive`](ChatTransport::receive)
@@ -186,6 +195,7 @@ mod tests {
             reasons: vec![],
             blast_radius: radius,
             session_label: None,
+            rollback: None,
         }
     }
 
@@ -215,6 +225,25 @@ mod tests {
     #[test]
     fn session_line_is_none_for_a_top_level_agent() {
         assert_eq!(session_line(&request(None)), None);
+    }
+
+    #[test]
+    fn rollback_line_formats_the_undo_with_the_marker() {
+        let mut request = request(None);
+        request.rollback = Some(amparo_tools::RollbackSpec {
+            undo: "restore the previous contents of note.txt".into(),
+            markers: vec!["note.txt.amparo-bak".into()],
+        });
+        assert_eq!(
+            rollback_line(&request).unwrap(),
+            "[rollback] restore the previous contents of note.txt \
+             (backup: note.txt.amparo-bak)"
+        );
+    }
+
+    #[test]
+    fn rollback_line_is_none_without_a_hint() {
+        assert_eq!(rollback_line(&request(None)), None);
     }
 
     #[tokio::test]

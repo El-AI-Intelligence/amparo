@@ -142,7 +142,10 @@ impl McpServer {
             capabilities: ServerCapabilities {
                 tools: ServerToolsCapabilities { listChanged: false },
             },
-            serverInfo: ClientInfo { name: self.name.clone(), version: self.version.clone() },
+            serverInfo: ClientInfo {
+                name: self.name.clone(),
+                version: self.version.clone(),
+            },
             instructions: Some(
                 "Amparo tools execute behind a policy gate. Denied and escalated \
                  calls return isError results with the reasons."
@@ -154,7 +157,12 @@ impl McpServer {
     }
 
     fn handle_list(&self, id: &Value) -> String {
-        let tools: Vec<_> = self.registry.list_schemas().iter().map(to_mcp_tool).collect();
+        let tools: Vec<_> = self
+            .registry
+            .list_schemas()
+            .iter()
+            .map(to_mcp_tool)
+            .collect();
         let result =
             serde_json::to_value(ListToolsResult { tools }).unwrap_or(serde_json::json!({}));
         jsonrpc::success(id, result)
@@ -173,8 +181,10 @@ impl McpServer {
                 &jsonrpc::RpcError::invalid_params("tools/call requires a string name"),
             );
         };
-        let arguments =
-            params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
         let call = ToolCall {
             id: format!("mcp_{}", self.next_call_id.fetch_add(1, Ordering::Relaxed)),
             name: name.to_string(),
@@ -183,7 +193,10 @@ impl McpServer {
         let result = self.gate_and_dispatch(&call).await;
         let text = serde_json::to_string_pretty(&result.output).unwrap_or_default();
         let mcp_result = CallToolResult {
-            content: vec![ContentBlock { block_type: "text".to_string(), text }],
+            content: vec![ContentBlock {
+                block_type: "text".to_string(),
+                text,
+            }],
             isError: !result.success,
         };
         jsonrpc::success(id, serde_json::to_value(mcp_result).unwrap_or(Value::Null))
@@ -204,11 +217,19 @@ impl McpServer {
         };
 
         if self.registry.get_executor(&call.name).is_none() {
-            let available: Vec<String> =
-                self.registry.list_schemas().iter().map(|s| s.name.clone()).collect();
+            let available: Vec<String> = self
+                .registry
+                .list_schemas()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
             return fail(
                 call,
-                format!("Unknown tool: {}. Available: {}", call.name, available.join(", ")),
+                format!(
+                    "Unknown tool: {}. Available: {}",
+                    call.name,
+                    available.join(", ")
+                ),
             );
         }
 
@@ -219,9 +240,14 @@ impl McpServer {
         }
 
         let (target, params) = amparo_agent::extract_target(call);
-        let param_refs: Vec<(&str, &str)> =
-            params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let decision = self.policy.judge_tool(&call.name, &target, &param_refs).await;
+        let param_refs: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let decision = self
+            .policy
+            .judge_tool(&call.name, &target, &param_refs)
+            .await;
         match decision.verdict {
             PolicyVerdict::Deny => {
                 return fail(
@@ -243,12 +269,17 @@ impl McpServer {
                     reasons,
                     // The MCP server runs no agent loop — no preflight
                     // classification or delegation label (display-only
-                    // context).
+                    // context). Rollback classification lands with W4's
+                    // preflight wiring.
                     blast_radius: None,
                     session_label: None,
+                    rollback: None,
                 };
                 if !self.approval.request(&request).await {
-                    return fail(call, "User denied the action or approval timed out".to_string());
+                    return fail(
+                        call,
+                        "User denied the action or approval timed out".to_string(),
+                    );
                 }
                 let _ = tier;
             }
@@ -267,9 +298,13 @@ impl McpServer {
                 reasons: vec![format!("tool tier {:?} requires human approval", tier)],
                 blast_radius: None,
                 session_label: None,
+                rollback: None,
             };
             if !self.approval.request(&request).await {
-                return fail(call, "User denied the action or approval timed out".to_string());
+                return fail(
+                    call,
+                    "User denied the action or approval timed out".to_string(),
+                );
             }
         }
 
@@ -328,8 +363,13 @@ mod tests {
     fn echo_server() -> (McpServer, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(EchoTool { calls: calls.clone() }));
-        (McpServer::new(registry, Arc::new(DenyAllPolicyEngine::new("test"))), calls)
+        registry.register(Arc::new(EchoTool {
+            calls: calls.clone(),
+        }));
+        (
+            McpServer::new(registry, Arc::new(DenyAllPolicyEngine::new("test"))),
+            calls,
+        )
     }
 
     struct AllowAll;
@@ -388,8 +428,7 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
-        let tools: Vec<McpTool> =
-            serde_json::from_value(v["result"]["tools"].clone()).unwrap();
+        let tools: Vec<McpTool> = serde_json::from_value(v["result"]["tools"].clone()).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
         assert_eq!(tools[0].inputSchema.required, vec!["message"]);
@@ -408,20 +447,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Policy denied echo"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "denied tools never execute");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "denied tools never execute"
+        );
     }
 
     #[tokio::test]
     async fn allowed_call_executes_and_returns_content() {
         let (server, calls) = echo_server();
-        let server = server.with_policy(Arc::new(AllowAll)).with_approval(Arc::new(AutoApprove));
+        let server = server
+            .with_policy(Arc::new(AllowAll))
+            .with_approval(Arc::new(AutoApprove));
         let out = server
             .handle_line(&call_line(4, "echo", serde_json::json!({"message": "hi"})))
             .await
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["result"]["isError"], false);
-        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("hi"));
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("hi"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -471,12 +519,7 @@ mod tests {
     struct EscalateAll;
     #[async_trait]
     impl PolicyEngine for EscalateAll {
-        async fn judge_tool(
-            &self,
-            _t: &str,
-            _x: &str,
-            _p: &[(&str, &str)],
-        ) -> PolicyDecision {
+        async fn judge_tool(&self, _t: &str, _x: &str, _p: &[(&str, &str)]) -> PolicyDecision {
             PolicyDecision::escalate("test escalate")
         }
     }
@@ -484,9 +527,13 @@ mod tests {
     fn escalate_server(answer: bool) -> (McpServer, Arc<RecordingGate>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(EchoTool { calls: calls.clone() }));
-        let gate =
-            Arc::new(RecordingGate { requests: Mutex::new(Vec::new()), answer });
+        registry.register(Arc::new(EchoTool {
+            calls: calls.clone(),
+        }));
+        let gate = Arc::new(RecordingGate {
+            requests: Mutex::new(Vec::new()),
+            answer,
+        });
         let server = McpServer::new(registry, Arc::new(EscalateAll)).with_approval(gate.clone());
         (server, gate, calls)
     }
@@ -500,13 +547,20 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["result"]["isError"], true);
-        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("denied"));
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("denied"));
         assert_eq!(gate.requests.lock().unwrap().len(), 1);
         assert!(gate.requests.lock().unwrap()[0]
             .reasons
             .iter()
             .any(|r| r.contains("test escalate")));
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "denied escalated call never executes");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "denied escalated call never executes"
+        );
     }
 
     #[tokio::test]

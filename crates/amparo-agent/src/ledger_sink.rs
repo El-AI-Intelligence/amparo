@@ -264,6 +264,10 @@ impl EventSink for LedgerSink {
             // write's `[bus]` row lives in the event stream, and the
             // notebook records the call itself.
             AgentEvent::BlackboardWrite { .. } => {}
+            // Rollback (M10): display-only undo advice — the ledger
+            // records actions, not hints about how a human could undo
+            // them. The `[rollback]` row lives in the event stream.
+            AgentEvent::Rollback { .. } => {}
             _ => {}
         }
     }

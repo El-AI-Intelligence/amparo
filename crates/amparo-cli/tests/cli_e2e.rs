@@ -293,16 +293,41 @@ impl MockLlm {
 // ── Mock policy engine ────────────────────────────────────────────────────────
 
 /// A hand-rolled HTTP responder for the wire policy protocol: every
-/// `POST /check` gets one canned audit-mode response (`enforced: false` —
-/// advisory, never a block; M9 W3). Request bodies are recorded so tests
-/// can assert what the wire client actually sent (session ids, tool names).
+/// `POST /check` gets one canned verdict. Request bodies are recorded so
+/// tests can assert what the wire client actually sent (session ids, tool
+/// names).
 struct MockPolicy {
     addr: std::net::SocketAddr,
     bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 impl MockPolicy {
+    /// Audit-mode responder (M9 W3): `deny` with `enforced: false` —
+    /// advisory, never a block.
     async fn start() -> MockPolicy {
+        Self::start_with(json!({
+            "verdict": "deny",
+            "reason": "audit test",
+            "enforced": false,
+            "engine_verdict": "deny"
+        }))
+        .await
+    }
+
+    /// Escalating responder (M10 W3 e2e): every check escalates to a
+    /// human, enforced.
+    async fn start_escalating() -> MockPolicy {
+        Self::start_with(json!({
+            "verdict": "escalate",
+            "reason": "new tool, no classification",
+            "enforced": true,
+            "engine_verdict": "escalate"
+        }))
+        .await
+    }
+
+    /// One canned `verdict` body for every `/check`.
+    async fn start_with(verdict: Value) -> MockPolicy {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -318,6 +343,7 @@ impl MockPolicy {
                     break;
                 };
                 let recorded = Arc::clone(&recorded);
+                let verdict = verdict.clone();
                 tokio::spawn(async move {
                     // Read the request head, then the body by Content-Length
                     // (the MockLlm pattern).
@@ -357,13 +383,7 @@ impl MockPolicy {
                     if let Ok(value) = serde_json::from_slice::<Value>(&body) {
                         recorded.lock().await.push(value);
                     }
-                    let b = json!({
-                        "verdict": "deny",
-                        "reason": "audit test",
-                        "enforced": false,
-                        "engine_verdict": "deny"
-                    })
-                    .to_string();
+                    let b = verdict.to_string();
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                          Content-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1036,6 +1056,111 @@ async fn run_approval_prompt_shows_the_blast_radius() {
     // name the concrete consequence before the reasons.
     assert!(err.contains("[preflight] blast radius: network"), "{err}");
     assert!(err.contains("[approval] granted"), "{err}");
+}
+
+#[tokio::test]
+async fn write_over_an_existing_file_emits_the_rollback_row_and_backs_up() {
+    let _guard = LOCK.lock().await;
+    let ws = workspace();
+    let note = ws.join("rollback-note.txt");
+    let marker = ws.join("rollback-note.txt.amparo-bak");
+    std::fs::remove_file(&marker).ok();
+    std::fs::write(&note, "old e2e contents").unwrap();
+
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "write_file",
+            r#"{"path":"rollback-note.txt","content":"new e2e contents"}"#,
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+
+    // Closed stdin: write_file is LocalMutating, so nothing may gate —
+    // the run completes and the [rollback] row still fires on stderr.
+    let out = run_with(&["run", "--allow-all", "rewrite the note"]).await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // The row names the idempotent undo and the backup marker.
+    assert!(
+        err.contains("[rollback] restore the previous contents of"),
+        "{err}"
+    );
+    assert!(err.contains("(backup: "), "{err}");
+    assert!(
+        err.contains("rollback-note.txt.amparo-bak"),
+        "the row names the marker: {err}"
+    );
+
+    // The write landed and the previous contents were preserved.
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "new e2e contents");
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "old e2e contents"
+    );
+    let _ = std::fs::remove_file(&note);
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[tokio::test]
+async fn escalated_write_approval_copy_carries_the_rollback_hint() {
+    let _guard = LOCK.lock().await;
+    let ws = workspace();
+    let note = ws.join("rollback-note.txt");
+    let marker = ws.join("rollback-note.txt.amparo-bak");
+    std::fs::remove_file(&marker).ok();
+    std::fs::write(&note, "old e2e contents").unwrap();
+
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "write_file",
+            r#"{"path":"rollback-note.txt","content":"new e2e contents"}"#,
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let policy = MockPolicy::start_escalating().await;
+    let (env, prior) = mock_env(&mock).await;
+
+    // The wire engine escalates the write; the human approves.
+    let out = run_with_stdin(
+        &["run", "--policy-url", &policy.url(), "rewrite the note"],
+        b"y\n",
+    )
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // The approval copy shows the undo path with the backup marker,
+    // and the approved write executes with its [rollback] row.
+    assert!(
+        err.contains("[rollback] restore the previous contents of"),
+        "the approval copy carries the rollback hint: {err}"
+    );
+    assert!(
+        err.contains("(backup: "),
+        "the copy names the backup marker: {err}"
+    );
+    assert!(err.contains("[approval] granted"), "{err}");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "new e2e contents");
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "old e2e contents"
+    );
+    let _ = std::fs::remove_file(&note);
+    let _ = std::fs::remove_file(&marker);
 }
 
 #[tokio::test]

@@ -6,7 +6,7 @@
 //! hang waiting for a human. `--auto-approve`/`--auto-deny` never construct
 //! this gate at all.
 
-use amparo_agent::{ApprovalGate, ApprovalRequest};
+use amparo_agent::{format_rollback, ApprovalGate, ApprovalRequest};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::Mutex;
@@ -130,6 +130,12 @@ fn prompt_text(request: &ApprovalRequest) -> String {
             radius.note()
         ));
     }
+    // M10 W3: the rollback hint rides right under the preflight line —
+    // the human sees what a call could touch and how to undo it before
+    // deciding. Display-only (I1): Amparo never executes the rollback.
+    if let Some(spec) = &request.rollback {
+        lines.push(format_rollback(spec));
+    }
     for reason in &request.reasons {
         lines.push(format!("  because: {reason}"));
     }
@@ -152,6 +158,7 @@ mod tests {
             reasons: vec!["reaches outside the process".into()],
             blast_radius: Some(BlastRadius::Network),
             session_label: None,
+            rollback: None,
         }
     }
 
@@ -188,6 +195,45 @@ mod tests {
             panic!("expected both lines, got: {text}");
         };
         assert!(preflight < because, "preflight must come first: {text}");
+    }
+
+    #[test]
+    fn rollback_line_rides_under_the_preflight_line() {
+        // M10 W3: the approval copy shows the undo path with the backup
+        // marker, between the preflight classification and the reasons.
+        let mut request = request();
+        request.rollback = Some(amparo_tools::RollbackSpec {
+            undo: "restore the previous contents of note.txt".into(),
+            markers: vec!["note.txt.amparo-bak".into()],
+        });
+        let text = prompt_text(&request);
+        let preflight = text.find("[preflight] blast radius: network");
+        let rollback = text.find("[rollback] restore the previous contents of note.txt");
+        let because = text.find("  because:");
+        let Some((preflight, rollback)) = preflight.zip(rollback) else {
+            panic!("expected preflight and rollback lines, got: {text}");
+        };
+        assert!(
+            preflight < rollback,
+            "rollback must follow preflight: {text}"
+        );
+        assert!(
+            rollback < because.unwrap(),
+            "rollback must lead the reasons: {text}"
+        );
+        assert!(
+            text.contains("(backup: note.txt.amparo-bak)"),
+            "the copy names the marker: {text}"
+        );
+    }
+
+    #[test]
+    fn no_rollback_hint_omits_the_rollback_line() {
+        assert!(
+            !prompt_text(&request()).contains("[rollback]"),
+            "{}",
+            prompt_text(&request())
+        );
     }
 
     #[test]

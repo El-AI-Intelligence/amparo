@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use amparo_tools::{ToolCall, ToolResult};
+use amparo_tools::{RollbackSpec, ToolCall, ToolResult};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -109,6 +109,21 @@ pub enum AgentEvent {
         /// delegation chain.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_by: Option<String>,
+    },
+    /// A successful call carried a rollback hint (M10 W3): the
+    /// `[rollback]` row. The spec is the tool's own
+    /// [`RollbackSpec`], computed against the *pre-call* file state,
+    /// and is emitted only for successful calls (a failed call changed
+    /// nothing). Display-only — Amparo never executes a rollback itself
+    /// (that would be auto-policy, I1).
+    Rollback {
+        /// The call this row annotates.
+        call_id: String,
+        /// The tool that ran.
+        tool_name: String,
+        /// The idempotent undo a human can take, with any file-backup
+        /// markers the tool created.
+        spec: RollbackSpec,
     },
     /// The self-verification turn decided.
     Verification {
@@ -241,6 +256,23 @@ pub fn truncate(s: &str) -> String {
     }
 }
 
+/// Render one [`RollbackSpec`] as its `[rollback]` line (M10 W3).
+///
+/// Shared by [`format_event`] and the approval-copy renderers so the
+/// undo hint reads the same everywhere. The backup-marker suffix
+/// appears only when the spec names markers.
+pub fn format_rollback(spec: &RollbackSpec) -> String {
+    if spec.markers.is_empty() {
+        format!("[rollback] {}", truncate(&spec.undo))
+    } else {
+        format!(
+            "[rollback] {} (backup: {})",
+            truncate(&spec.undo),
+            truncate(&spec.markers.join(", "))
+        )
+    }
+}
+
 /// Render one event as one `[tag]` line. Pure — unit-testable without a sink.
 ///
 /// This is the canonical human-readable form of an [`AgentEvent`]: the CLI
@@ -321,6 +353,7 @@ pub fn format_event(event: &AgentEvent) -> String {
             Some(writer) => format!("[bus] {} by {}", truncate(key), writer),
             None => format!("[bus] {}", truncate(key)),
         },
+        AgentEvent::Rollback { spec, .. } => format_rollback(spec),
         AgentEvent::Verification { decision, feedback } => {
             let detail = feedback
                 .as_ref()
@@ -534,6 +567,28 @@ mod tests {
                 }),
             ),
             (
+                "[rollback] restore the previous contents",
+                format_event(&AgentEvent::Rollback {
+                    call_id: "c1".into(),
+                    tool_name: "write_file".into(),
+                    spec: RollbackSpec {
+                        undo: "restore the previous contents of note.txt".into(),
+                        markers: vec!["note.txt.amparo-bak".into()],
+                    },
+                }),
+            ),
+            (
+                "[rollback] delete the file",
+                format_event(&AgentEvent::Rollback {
+                    call_id: "c1".into(),
+                    tool_name: "write_file".into(),
+                    spec: RollbackSpec {
+                        undo: "delete the file this call creates".into(),
+                        markers: vec![],
+                    },
+                }),
+            ),
+            (
                 "[verify]",
                 format_event(&AgentEvent::Verification {
                     decision: "complete".into(),
@@ -603,6 +658,25 @@ mod tests {
             content: "short".into(),
         });
         assert_eq!(line, "[answer] short");
+    }
+
+    #[test]
+    fn rollback_lines_carry_the_backup_suffix_only_when_markers_exist() {
+        assert_eq!(
+            format_rollback(&RollbackSpec {
+                undo: "restore the previous contents of note.txt".into(),
+                markers: vec!["note.txt.amparo-bak".into()],
+            }),
+            "[rollback] restore the previous contents of note.txt \
+             (backup: note.txt.amparo-bak)"
+        );
+        assert_eq!(
+            format_rollback(&RollbackSpec {
+                undo: "delete the file this call creates (note.txt)".into(),
+                markers: vec![],
+            }),
+            "[rollback] delete the file this call creates (note.txt)"
+        );
     }
 
     #[test]

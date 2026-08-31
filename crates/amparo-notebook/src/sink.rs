@@ -252,13 +252,17 @@ impl EventSink for NotebookSink {
             // findings live in the event stream and the verification
             // prompt, not in the run record. BlackboardWrite (M10): the
             // write already lands in the record as its tool call — the
-            // `[bus]` row is the event stream's rendering of it.
+            // `[bus]` row is the event stream's rendering of it. Rollback
+            // (M10): display-only undo advice — the call itself already
+            // lands in the record; the `[rollback]` row is the event
+            // stream's rendering.
             AgentEvent::AssistantTurn { .. }
             | AgentEvent::FinalAnswer { .. }
             | AgentEvent::PrivacyStripped { .. }
             | AgentEvent::QcAudit { .. }
             | AgentEvent::SubAgentSpawned { .. }
             | AgentEvent::BlackboardWrite { .. }
+            | AgentEvent::Rollback { .. }
             | AgentEvent::TaskResumed { .. } => {}
         }
     }

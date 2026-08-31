@@ -30,7 +30,7 @@ pub use notification::{
 };
 pub use paths::PathPolicy;
 pub use registry::{
-    default_registry, ToolCall, ToolExecutor, ToolParam, ToolRegistry, ToolResult, ToolSchema,
-    ToolTrustTier,
+    default_registry, RollbackSpec, ToolCall, ToolExecutor, ToolParam, ToolRegistry, ToolResult,
+    ToolSchema, ToolTrustTier,
 };
 pub use skills::{SkillLibrary, SkillOrigin, SkillSpec, SkillStep, UseSkillTool, USE_SKILL};

@@ -12,6 +12,7 @@
 //! human, no execution) and [`AutoApprove`] (the operator has deliberately
 //! chosen unattended execution).
 
+use amparo_tools::RollbackSpec;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -40,6 +41,14 @@ pub struct ApprovalRequest {
     /// and at the non-agent construction sites. Display-only, like
     /// [`ApprovalRequest::blast_radius`] — never a gate input (I1).
     pub session_label: Option<String>,
+    /// The tool-declared rollback hint (M10 W3): the idempotent undo
+    /// path for this call, with any file-backup markers the tool
+    /// created. Computed against the *pre-call* state and carried so
+    /// the approval copy can show the human how to undo the call.
+    /// Display-only, like [`ApprovalRequest::blast_radius`] — Amparo
+    /// never executes a rollback itself (that would be auto-policy,
+    /// I1).
+    pub rollback: Option<RollbackSpec>,
 }
 
 /// The approval seam.

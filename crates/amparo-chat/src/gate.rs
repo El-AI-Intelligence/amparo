@@ -191,6 +191,7 @@ mod tests {
             reasons: vec!["tool tier external_effector requires human approval".into()],
             blast_radius: Some(BlastRadius::Network),
             session_label: None,
+            rollback: None,
         }
     }
 

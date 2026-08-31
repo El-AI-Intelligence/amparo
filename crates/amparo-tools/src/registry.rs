@@ -175,6 +175,26 @@ pub struct ToolResult {
     pub duration_ms: u64,
 }
 
+/// A tool-declared rollback hint (M10 W3): how a human can undo a call
+/// after it ran.
+///
+/// **Display-only by design (I1).** Nothing executes a rollback
+/// automatically — that would be auto-policy. The spec rides on the
+/// approval copy and the `[rollback]` event row so a human always
+/// knows the undo path. `undo` must describe an *idempotent* action
+/// (running it twice changes nothing further); `markers` name the
+/// file-backup artifacts the call preserved for that undo, when any.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackSpec {
+    /// The idempotent undo action, in plain language.
+    pub undo: String,
+    /// File-backup markers the call created (for example the
+    /// `.amparo-bak` copy of the pre-call state), empty when the undo
+    /// needs none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<String>,
+}
+
 // ─────────────────────────────────────────────────────── ToolExecutor trait ──
 
 /// Every tool implements this trait.
@@ -185,6 +205,18 @@ pub trait ToolExecutor: Send + Sync {
     fn schema(&self) -> ToolSchema;
     /// Executes a tool call and returns its result.
     async fn execute(&self, call: &ToolCall) -> ToolResult;
+
+    /// The rollback hint for `call` (M10 W3), or `None` when the call
+    /// has no meaningful idempotent undo.
+    ///
+    /// Computed from the call's arguments against the *pre-call*
+    /// state — callers must invoke this before execution so the undo
+    /// describes exactly what the call is about to change. The default
+    /// is `None`; destructive-class tools (file writes and deletes)
+    /// override it.
+    fn rollback(&self, _call: &ToolCall) -> Option<RollbackSpec> {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────── ToolRegistry ────────────────
@@ -263,6 +295,14 @@ impl ToolRegistry {
     /// releasing the registry lock (avoids holding a Mutex across an .await).
     pub fn get_executor(&self, name: &str) -> Option<Arc<dyn ToolExecutor>> {
         self.tools.get(name).map(Arc::clone)
+    }
+
+    /// The rollback hint the registered tool declares for `call`
+    /// (M10 W3), or `None` when no tool is registered or the tool
+    /// declares none. See [`ToolExecutor::rollback`] — compute this
+    /// before execution, while the pre-call state still holds.
+    pub fn rollback_for(&self, call: &ToolCall) -> Option<RollbackSpec> {
+        self.tools.get(&call.name).and_then(|t| t.rollback(call))
     }
 }
 
