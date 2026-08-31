@@ -166,6 +166,22 @@ to the box; the `.gitignore` decision for `web/` is the operator's.
   to the final file through the write-tmp-then-rename pattern. Residual:
   state directories created by pre-fix versions keep their old modes
   until recreated; the cold archive's content bytes are untouched).
+- **6f1886f** — MED-8 (wasmtime 16 → 34.0.2: the newest release whose
+  `rust-version` (1.85) still matches the workspace MSRV — 35+ needs
+  1.86 and 48.0.1 needs 1.95, so "latest" would break the standing MSRV
+  claim; the embedder API is feature-gated behind `runtime` since v18,
+  added beside `cranelift`; 26 sandbox tests green on 34), MED-7
+  (verified and closed without a code change: the quinn entries in
+  `Cargo.lock` are reqwest's optional `http3` feature dependencies
+  recorded by cargo's feature-independent lockfile — no manifest
+  enables the feature and `cargo tree -i quinn` is empty across all
+  targets, so the HTTP/3 stack never compiles and the lock cannot be
+  pruned; the entries stay byte-identical), LOW-10 (every crate
+  manifest carries `rust-version.workspace = true` inheriting the 1.85
+  MSRV), LOW-1 (`site_host_only` strips URL userinfo — only what
+  follows the last `@` reaches a ledger row), LOW-5 (`EngramStore::new`
+  warns on stderr when the engramd URL is non-loopback plaintext http;
+  127/8, `localhost` and `[::1]` stay quiet).
 
 ## Operator note
 
