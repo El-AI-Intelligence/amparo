@@ -279,10 +279,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A unique board root per test — the sequence counter makes the
+    /// directory unique by construction: concurrent tests can draw the
+    /// same clock reading, and the counter cannot collide within the
+    /// process (M10 W6 hardening).
     fn temp_root() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "amparo-blackboard-{}-{}",
+            "amparo-blackboard-{}-{}-{}",
             std::process::id(),
+            n,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())

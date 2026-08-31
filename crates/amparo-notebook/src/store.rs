@@ -35,8 +35,9 @@ impl JsonlStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create notebook directory {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("cannot create notebook directory {}: {e}", parent.display())
+            })?;
         }
         let file = OpenOptions::new()
             .create(true)
@@ -104,7 +105,10 @@ impl Memory for JsonlStore {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         let line = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
-        let mut file = self.file.lock().map_err(|_| "notebook store lock poisoned".to_string())?;
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| "notebook store lock poisoned".to_string())?;
         writeln!(file, "{line}").map_err(|e| format!("cannot write notebook store: {e}"))?;
         file.flush()
             .map_err(|e| format!("cannot flush notebook store: {e}"))?;
@@ -116,10 +120,16 @@ impl Memory for JsonlStore {
 mod tests {
     use super::*;
 
+    /// A unique dir per test — the sequence counter makes it unique by
+    /// construction (concurrent tests can draw the same clock reading;
+    /// M10 W6 hardening).
     fn temp_dir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "amparo-notebook-test-{}-{}",
+            "amparo-notebook-test-{}-{}-{}",
             std::process::id(),
+            n,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())

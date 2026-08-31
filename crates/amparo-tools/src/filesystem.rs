@@ -968,11 +968,19 @@ mod tests {
     // ── M10 W3: rollback backups and specs ─────────────────────────────────
 
     /// A per-test workspace: unique root so no test shares state.
+    ///
+    /// The sequence counter (not the clock alone) makes the root unique
+    /// by construction: two concurrent tests can draw the same clock
+    /// reading, and the counter cannot collide within the process
+    /// (M10 W6 hardening).
     fn test_root(tag: &str) -> (Arc<crate::paths::PathPolicy>, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "amparo-w3-{}-{}-{}",
+            "amparo-w3-{}-{}-{}-{}",
             std::process::id(),
             tag,
+            n,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

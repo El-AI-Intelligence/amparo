@@ -3153,11 +3153,16 @@ mod tests {
     }
 
     /// A unique temp workspace root for the W3 rollback tests, mirroring
-    /// the filesystem tests' harness (no tempfile dep).
+    /// the filesystem tests' harness (no tempfile dep). The sequence
+    /// counter makes the root unique by construction — concurrent tests
+    /// can draw the same clock reading (M10 W6 hardening).
     fn w3_root() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "amparo-agent-w3-{}-{}",
+            "amparo-agent-w3-{}-{}-{}",
             std::process::id(),
+            n,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

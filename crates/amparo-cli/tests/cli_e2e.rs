@@ -846,6 +846,55 @@ async fn mcp_serve_spawns_agents_within_the_shared_budget() {
     drop(env);
 }
 
+#[tokio::test]
+async fn mcp_serve_denies_a_spawn_without_an_approver() {
+    let _guard = LOCK.lock().await;
+    // The inference env is only needed to BUILD the spawn tool — no
+    // child may run, so the mock never receives a request.
+    let mock = MockLlm::start(vec![vec![content_frame("unused")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let client =
+        amparo_mcp::McpClient::spawn(bin(), ["mcp-serve", "--allow-all", "--max-sub-agents", "1"])
+            .await
+            .unwrap();
+    assert!(
+        client.tools().iter().any(|t| t.name == "spawn_agent"),
+        "spawn_agent is registered when the budget is on"
+    );
+
+    // spawn_agent is ExternalEffector: without an approver (no
+    // --auto-approve, no --approval-endpoint) the gate is AutoDeny and
+    // the spawn fails closed — and the server survives the denial.
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.call_tool("spawn_agent", json!({"task": "never runs"})),
+    )
+    .await
+    .expect("call_tool timed out")
+    .unwrap();
+    let text = result
+        .content
+        .iter()
+        .find(|c| c.block_type == "text")
+        .map(|c| c.text.as_str())
+        .unwrap_or_default();
+    assert!(
+        result.isError,
+        "no approver: the spawn must fail closed: {text}"
+    );
+    assert!(
+        text.contains("User denied the action or approval timed out"),
+        "{text}"
+    );
+
+    // The server is still serving after the denial.
+    assert!(!client.tools().is_empty(), "the server survives the denial");
+
+    restore_workspace_env(prior);
+    drop(env);
+}
+
 // ── Doctor exit-code matrix ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -3792,6 +3841,151 @@ async fn a_due_cli_promise_fires_at_run_start() {
         result.contains("Done."),
         "the fire's answer lands on the promise: {result}"
     );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn a_due_cli_promise_fires_through_the_gate_chain() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("w6-due-fire-gate");
+    let at = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    seed_cli_promise(&ws, "sched-fire-1", &at);
+
+    // Two write_file turns then two answers: the fire and the main task
+    // each make exactly one gated write_file call (the queue hands the
+    // tools out first, whichever task arrives), then both finish — so
+    // the fire's call is provably among the gated rows below.
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "write_file",
+            r#"{"path":"fire.txt","content":"fire content"}"#,
+        ),
+        tool_script(
+            "write_file",
+            r#"{"path":"main.txt","content":"main content"}"#,
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    let ws_prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--allow-all", "say hello"]).await;
+    restore_workspace_env(ws_prior);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(
+        err.matches("[gate] write_file: allowed").count(),
+        2,
+        "both gated calls go through the chain: {err}"
+    );
+    assert_eq!(err.matches("[exec] write_file").count(), 2, "{err}");
+    // The two gated calls actually executed — both files landed.
+    assert!(ws.join("fire.txt").exists(), "{err}");
+    assert!(ws.join("main.txt").exists(), "{err}");
+    assert!(err.contains("[schedule] sched-fire-1 fired"), "{err}");
+    let task = JsonScheduleStore::new(schedule_dir(&ws))
+        .load("sched-fire-1")
+        .unwrap()
+        .expect("the promise record exists");
+    assert_eq!(task.status, ScheduledStatus::Fired);
+    assert!(
+        task.result.clone().unwrap_or_default().contains("Done."),
+        "the fire's answer lands on the promise: {:?}",
+        task.result
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn a_due_fire_that_needs_approval_is_denied_and_executes_nothing() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("w6-due-fire-denied");
+    let at = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    seed_cli_promise(&ws, "sched-fire-1", &at);
+
+    // Two send_notification turns (ExternalEffector — always asks a
+    // human), then two answers. stdin is closed and no --auto-* flag:
+    // both calls must be denied and neither may execute — an unattended
+    // fire never runs ahead of the gate (I1).
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "send_notification",
+            r#"{"destination":"ops","message":"fire one"}"#,
+        ),
+        tool_script(
+            "send_notification",
+            r#"{"destination":"ops","message":"fire two"}"#,
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    let ws_prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--allow-all", "say hello"]).await;
+    restore_workspace_env(ws_prior);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(
+        err.matches("[gate] send_notification: approval_denied")
+            .count(),
+        2,
+        "both calls are denied: {err}"
+    );
+    assert!(
+        !err.contains("[exec] send_notification"),
+        "denied calls never execute: {err}"
+    );
+    assert!(err.contains("[schedule] sched-fire-1 fired"), "{err}");
+    let task = JsonScheduleStore::new(schedule_dir(&ws))
+        .load("sched-fire-1")
+        .unwrap()
+        .expect("the promise record exists");
+    assert_eq!(task.status, ScheduledStatus::Fired);
+    assert!(
+        task.result.clone().unwrap_or_default().contains("Done."),
+        "the fire's answer lands on the promise: {:?}",
+        task.result
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn a_due_cli_promise_fires_on_resume_too() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("w6-due-fire-resume");
+    let at = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    seed_cli_promise(&ws, "sched-fire-1", &at);
+    write_checkpoint(&ws, "sess-1", unix_now(), 1);
+
+    let mock = MockLlm::start(vec![vec![content_frame("Resumed and done.")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let ws_prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--resume", "--allow-all"]).await;
+    restore_workspace_env(ws_prior);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Resumed and done.");
+    assert!(
+        err.contains("[schedule] sched-fire-1 fired"),
+        "the resume path scans and fires like a fresh run: {err}"
+    );
+    let task = JsonScheduleStore::new(schedule_dir(&ws))
+        .load("sched-fire-1")
+        .unwrap()
+        .expect("the promise record exists");
+    assert_eq!(task.status, ScheduledStatus::Fired);
 
     let _ = std::fs::remove_dir_all(&ws);
 }
