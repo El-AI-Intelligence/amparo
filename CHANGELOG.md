@@ -8,6 +8,72 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-31
+
+M10, landed: coordination & surfaces — the blackboard, notifications,
+rollback hints, the web-approval seam, and the CLI scheduler (see
+`docs/m10-coordination-surfaces.md`).
+
+### Added
+
+- **The blackboard** (`amparo-tools/src/blackboard.rs`):
+  `blackboard_read` (Observational) / `blackboard_write`
+  (LocalMutating) over `<workspace>/.amparo/blackboard/board.jsonl` —
+  append-only rows, last write per key wins on read, every row kept.
+  Shared across the delegation chain via the registry clone; rows
+  carry no writer identity (arguments are model-chosen) — the trusted
+  writer (the loop's task id) rides in the `[bus]` event.
+- **`send_notification`** (`amparo-tools/src/notification.rs`): an
+  ExternalEffector tool behind a `NotificationTransport` seam —
+  `StderrTransport` (default: `[notification] to <destination>:
+  <message>`) and `WebhookTransport` (POSTs `{"destination",
+  "message"}` JSON). `amparo run --webhook-url URL` wires the
+  webhook; the chat hosts wire platform transports; the approval copy
+  names the destination; a transport failure is a failed tool
+  result, never a task crash.
+- **Rollback groups** (W3): `ToolExecutor::rollback(&call)` returns a
+  display-only `RollbackSpec { undo, markers }` — computed
+  pre-execution, rendered as a `[rollback]` line and in the
+  destructive-call approval copy, never executed. Destructive file
+  calls back up the previous contents to `<path>.amparo-bak` before
+  writing (fail-closed: no backup, no write).
+- **WebApprovalGate + `--approval-endpoint`** (W4,
+  `amparo-agent/src/web_approval.rs`): the web-approval seam per
+  `docs/web-surface.md` (contract v3) — POST the full
+  `ApprovalRequest` (arguments, reasons, blast_radius,
+  session_label, rollback hint) and poll `{endpoint}/{call_id}` for
+  the decision; 60 s timeout, 1 s poll interval, every failure mode
+  fails closed. Flag on `amparo run` and `amparo mcp-serve`
+  (http(s) validated; mutually exclusive with `--auto-approve`); the
+  MCP server's `gate_and_dispatch` gained preflight classification +
+  session label so web payloads over MCP carry them.
+- **MCP spawn + CLI scheduler** (W5): `amparo mcp-serve
+  --max-sub-agents N` registers `spawn_agent` (opt-in; absent or `0`
+  = no spawn tool) under one shared budget across the spawn chain;
+  `amparo run` always registers `schedule` (top-level tasks only),
+  and `due_scan` fires due `cli` promises at run start — concurrently
+  with the main task, through the same gate chain, sharing
+  provider/policy/approval/flags; `--resume` is a run start too.
+  Missed past the grace window = fail-closed. A fire is a fresh task
+  with a reduced tool set (no `spawn_agent`, no `schedule`).
+- **M10 test sweep (W6)**: the W4 append one-off closed as an
+  environmental one-off (24 clean runs, no in-code mechanism); the
+  four nanos-based test-root helpers gained per-process sequence
+  counters; four new e2e tests (gate-chain fire, denied fire
+  executes nothing, resume fire, MCP spawn denied without an
+  approver) — 739 tests across the workspace at the W7 gate.
+
+### Changed
+
+- `spawn_agent` is no longer absent from every non-chat surface: the
+  MCP server exposes it as an explicit opt-in (`--max-sub-agents N`,
+  shared budget, still gated, still denied without an approver). It
+  remains absent from `amparo chat dispatch` (no session, no
+  delegation chain, no audit).
+- `schedule` is no longer chat-only: `amparo run` registers it with
+  the process-scoped scheduler — best-effort by design (fires at run
+  start only; the chat host keeps the 30 s ticker).
+
 ## [0.8.0] — 2026-08-30
 
 M9, landed: verification & QA — the QC council beside policy, the

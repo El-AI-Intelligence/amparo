@@ -7,7 +7,7 @@ An open agent that acts under policy. Bring your own LLM.
 
 ---
 
-## Status: pre-alpha, M9 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed, M8 (sub-agents & scheduling: `spawn_agent` + `schedule` behind the gate chain) landed, M9 (verification & QA: QC council beside policy, `amparo doctor`, the audit-mode notice + session tagging) landed
+## Status: pre-alpha, M9 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed, M8 (sub-agents & scheduling: `spawn_agent` + `schedule` behind the gate chain) landed, M9 (verification & QA: QC council beside policy, `amparo doctor`, the audit-mode notice + session tagging) landed, M10 (coordination & surfaces: the blackboard, `send_notification`, rollback hints, the web-approval seam, MCP spawn + the CLI scheduler) landed
 
 This repository was created on 2026-08-27. **Milestone 1 is in** (the
 BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
@@ -358,7 +358,9 @@ burned — tool calls and a cost line with its method attached
 (`~$0.04 in inference (estimate, chars/4, $3/1M tokens)`) — as
 `[swarm]` in the CLI, appended to the final answer in chat.
 
-**`schedule`** is a promise, not an execution (chat only, per-tenant):
+**`schedule`** is a promise, not an execution (per-tenant in chat;
+M10 adds it to `amparo run` as a process-scoped, best-effort queue —
+see Coordination & surfaces):
 the model commits to an RFC 3339 instant, the promise is written
 PII-stripped to `<workspace>/.amparo/schedule/`, and the chat driver's
 30 s ticker fires each due promise back through the full gate chain as
@@ -378,9 +380,11 @@ schedule = true        # opens the schedule tool for this tenant
 ```
 
 A model is never the approver: supervisor agents are excluded by
-design, and `spawn_agent` is deliberately absent from the MCP and
-`amparo chat dispatch` surfaces — those paths have no session, no
-delegation chain, no audit.
+design. `spawn_agent` stays absent from `amparo chat dispatch` — that
+path has no session, no delegation chain, no audit — and M10 opens it
+on the MCP surface as an explicit opt-in: `amparo mcp-serve
+--max-sub-agents N` registers it under the shared budget (see
+Coordination & surfaces).
 
 ## Verification & QA
 
@@ -402,6 +406,50 @@ answers `enforced: false` — `policy engine is in audit mode;
 verdicts are advisory` — and **session tagging**
 (`--session-id`, defaulting to the task id) attaches the caller to
 every engine-side audit row.
+
+## Coordination & surfaces
+
+M10 adds the surfaces M8 deferred and the seam the web surface builds
+on (see `docs/m10-coordination-surfaces.md`). **The one rule holds:
+no member exits the gate chain.**
+
+**The blackboard** — `blackboard_read`/`blackboard_write` over
+`<workspace>/.amparo/blackboard/board.jsonl`: an append-only
+coordination board every member of the delegation chain shares (last
+write per key wins on read; every row kept). Rows carry no writer
+identity — the trusted writer (the loop's task id) rides in the
+`[bus]` event.
+
+**`send_notification`** — an ExternalEffector tool behind a transport
+seam: stderr by default, a webhook with `amparo run --webhook-url URL`
+(POSTs `{"destination", "message"}` JSON); the chat hosts wire their
+platform transports. The approval copy names the destination; a
+transport failure is a failed tool result, never a task crash.
+
+**Rollback groups** — display-only undo hints: destructive file calls
+back up the previous contents to `<path>.amparo-bak` (fail-closed —
+no backup, no write) and the approval copy shows the undo
+(`[rollback]` lines in the event stream). Nothing executes an undo
+automatically — that would be auto-policy (I1).
+
+**The web-approval seam** — `--approval-endpoint URL` on
+`amparo run` and `amparo mcp-serve` asks a web UI for the human's
+decision: the gate POSTs the full approval request (tool, arguments,
+reasons, blast radius, session label, rollback hint) and polls for
+the decision — 60 s fail-closed, mutually exclusive with
+`--auto-approve`. The web never holds policy keys and never changes
+verdict logic (`docs/web-surface.md`, contract v3).
+
+**MCP spawn + CLI scheduling** — `amparo mcp-serve
+--max-sub-agents N` registers `spawn_agent` (opt-in; absent or `0` =
+no spawn tool) under the shared spawn budget. `amparo run` always
+registers `schedule`: the CLI is process-scoped (no daemon), so due
+promises fire at run start — concurrently with the main task,
+through the same gate chain, sharing provider/policy/approval/flags;
+`--resume` is a run start too. Missed = fail-closed, never fired
+late — best-effort by design. A fire gets a reduced tool set (no
+`spawn_agent`, no `schedule`): unattended spawn chains would break
+the attribution chain.
 
 ## What Amparo is meant to be
 
@@ -445,6 +493,7 @@ chat bot. Not welded to a desktop session, not dependent on a GUI.
 | 8 | WASM eval sandbox + ledger quota | ✅ landed — the `eval_wasm` tool (fuel-metered, deterministic, approval-gated sandbox for untrusted computation; honestly labeled `read_only` in preflight) and the opt-in ledger quota lever (`--ledger-max-bytes`, per-tenant chat quotas; rotation marker rows record exactly what was dropped) |
 | 9 | Sub-agents & scheduling | ✅ landed — `spawn_agent` (a sub-agent is the same loop, gate chain, and ceiling; the delegation chain is in the ids, checkpoints, ledger rows, and approval copy; the shared budget fails closed) and `schedule` (a persisted promise re-entering the gate chain as its requester; missed = fail-closed), plus the swarm report with the cost line |
 | 10 | Verification & QA | ✅ landed — the QC council (deterministic rule auditors beside policy: findings feed the verification prompt, verification stays the model's call), `amparo doctor` (the operator's read-only workspace sweep, exit 0/1/2), and the audit-mode stderr notice + session tagging (`--session-id`, defaulting to the task id) |
+| 11 | Coordination & surfaces | ✅ landed — the blackboard (`blackboard_read`/`blackboard_write`, `[bus]` rows), `send_notification` (transport seam — stderr or webhook), rollback groups (display-only undo hints + `.amparo-bak` backups), the web-approval seam (`--approval-endpoint`, 60 s fail-closed), MCP spawn (`--max-sub-agents`, opt-in, shared budget), and the CLI scheduler (due promises fire at run start, best-effort) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant

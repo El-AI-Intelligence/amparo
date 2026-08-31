@@ -1,7 +1,7 @@
 # Versioning and API stability
 
 Amparo is a workspace of Rust crates that share one version
-(`[workspace.package] version = 0.7.0`). This file is the contract for how
+(`[workspace.package] version = 0.8.0`). This file is the contract for how
 that version moves and what "stable" means at each stage.
 
 ## Semver
@@ -44,6 +44,14 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
   `amparo doctor` (the operator's read-only workspace sweep, exit
   0/1/2), and the audit-mode stderr notice + session tagging
   (`--session-id`, defaulting to the task id).
+- **0.9.0 (2026-08-31)** — coordination & surfaces: the blackboard
+  (`blackboard_read`/`blackboard_write` over a workspace-scoped board,
+  `[bus]` rows), `send_notification` (the transport seam — stderr or
+  webhook, ExternalEffector), rollback groups (display-only undo
+  hints, `.amparo-bak` backups, never auto-executed), the
+  web-approval seam (`WebApprovalGate` POST/poll, 60 s fail-closed,
+  `--approval-endpoint`), and MCP spawn + the CLI scheduler
+  (`--max-sub-agents`, due promises firing at run start).
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 
