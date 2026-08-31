@@ -35,6 +35,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

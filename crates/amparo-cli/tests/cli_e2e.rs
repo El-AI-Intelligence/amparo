@@ -408,6 +408,110 @@ impl MockPolicy {
     }
 }
 
+/// The web-approval endpoint mock (M10 W4): records POST bodies and
+/// serves a canned decision flow — the `poll` closure answers every
+/// decision GET (pending until it returns a decided body).
+struct MockApprovals {
+    addr: std::net::SocketAddr,
+    /// Every POSTed approval request, in arrival order.
+    bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
+}
+
+impl MockApprovals {
+    async fn start(poll: impl Fn() -> Value + Send + Sync + 'static) -> MockApprovals {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock approvals");
+        let addr = listener.local_addr().unwrap();
+        let bodies: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&bodies);
+        let poll = Arc::new(poll);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded);
+                let poll = Arc::clone(&poll);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if buf.len() > 1_000_000 {
+                            break;
+                        }
+                    }
+                    let split = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                        .unwrap_or(buf.len());
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.trim_start()
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let mut body = buf[split..].to_vec();
+                    while body.len() < content_length {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let b = if head.lines().next().unwrap_or_default().starts_with("POST") {
+                        if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                            recorded.lock().await.push(value);
+                        }
+                        json!({"call_id": "call_1", "status": "pending"}).to_string()
+                    } else {
+                        poll().to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        b.len(),
+                        b
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        MockApprovals { addr, bodies }
+    }
+
+    /// Endpoint URL for `--approval-endpoint`.
+    fn url(&self) -> String {
+        format!("http://{}/approvals", self.addr)
+    }
+
+    /// Every POSTed approval request, in arrival order.
+    async fn bodies(&self) -> Vec<Value> {
+        self.bodies.lock().await.clone()
+    }
+}
+
+/// A decision poll body: the human answered.
+fn web_decided(decision: bool) -> Value {
+    json!({"status": "decided", "decision": decision})
+}
+
+/// A pending poll body: the human has not answered yet.
+fn web_pending() -> Value {
+    json!({"status": "pending"})
+}
+
 /// One SSE frame carrying a content delta.
 fn content_frame(text: &str) -> Value {
     json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]})
@@ -1159,6 +1263,171 @@ async fn escalated_write_approval_copy_carries_the_rollback_hint() {
         std::fs::read_to_string(&marker).unwrap(),
         "old e2e contents"
     );
+    let _ = std::fs::remove_file(&note);
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[tokio::test]
+async fn approval_endpoint_approves_an_escalated_call_and_carries_the_rollback_copy() {
+    let _guard = LOCK.lock().await;
+    let ws = workspace();
+    let note = ws.join("web-note.txt");
+    let marker = ws.join("web-note.txt.amparo-bak");
+    std::fs::remove_file(&marker).ok();
+    std::fs::write(&note, "old web contents").unwrap();
+
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "write_file",
+            r#"{"path":"web-note.txt","content":"new web contents"}"#,
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let policy = MockPolicy::start_escalating().await;
+    let approvals = MockApprovals::start(move || web_decided(true)).await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with(&[
+        "run",
+        "--policy-url",
+        &policy.url(),
+        "--approval-endpoint",
+        &approvals.url(),
+        "rewrite the note",
+    ])
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+    // The web decision reached the loop through the gate chain.
+    assert!(err.contains("[approval] granted"), "{err}");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "new web contents");
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "old web contents"
+    );
+
+    // The endpoint saw the full approval copy: the escalated write with
+    // its preflight classification and the rollback hint + marker.
+    let bodies = approvals.bodies().await;
+    let body = bodies.first().expect("one POST body recorded");
+    assert_eq!(body["tool_name"], "write_file");
+    assert!(!body["blast_radius"].is_null());
+    assert!(body["rollback"]["undo"]
+        .as_str()
+        .unwrap()
+        .contains("restore the previous contents of"));
+    assert!(body["rollback"]["markers"][0]
+        .as_str()
+        .unwrap()
+        .contains("web-note.txt.amparo-bak"));
+    let _ = std::fs::remove_file(&note);
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[tokio::test]
+async fn approval_endpoint_denies_and_blocks_the_call() {
+    let _guard = LOCK.lock().await;
+    let ws = workspace();
+    let note = ws.join("web-note.txt");
+    std::fs::write(&note, "old web contents").unwrap();
+
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "write_file",
+            r#"{"path":"web-note.txt","content":"new web contents"}"#,
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let policy = MockPolicy::start_escalating().await;
+    let approvals = MockApprovals::start(move || web_decided(false)).await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with(&[
+        "run",
+        "--policy-url",
+        &policy.url(),
+        "--approval-endpoint",
+        &approvals.url(),
+        "rewrite the note",
+    ])
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    // The denial is reported to the loop, which carries on (the mock LLM
+    // just says "Done.") — the gate itself blocked the call.
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[approval] denied"), "{err}");
+    assert!(err.contains("approval_denied"), "{err}");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "old web contents");
+    let _ = std::fs::remove_file(&note);
+}
+
+#[tokio::test]
+async fn approval_endpoint_polls_until_decided() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _guard = LOCK.lock().await;
+    let ws = workspace();
+    let note = ws.join("web-note.txt");
+    let marker = ws.join("web-note.txt.amparo-bak");
+    std::fs::remove_file(&marker).ok();
+    std::fs::write(&note, "old web contents").unwrap();
+
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "write_file",
+            r#"{"path":"web-note.txt","content":"new web contents"}"#,
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let policy = MockPolicy::start_escalating().await;
+    // First poll: pending (the human is still looking at it); every
+    // later poll: decided. The gate must keep polling past the first
+    // answer.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&polls);
+    let approvals = MockApprovals::start(move || {
+        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            web_pending()
+        } else {
+            web_decided(true)
+        }
+    })
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with(&[
+        "run",
+        "--policy-url",
+        &policy.url(),
+        "--approval-endpoint",
+        &approvals.url(),
+        "rewrite the note",
+    ])
+    .await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+    assert!(
+        polls.load(Ordering::SeqCst) >= 2,
+        "the gate polled past the pending answer"
+    );
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "new web contents");
     let _ = std::fs::remove_file(&note);
     let _ = std::fs::remove_file(&marker);
 }

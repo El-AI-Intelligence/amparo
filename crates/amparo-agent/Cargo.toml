@@ -19,4 +19,5 @@ tokio = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+reqwest = { workspace = true }
 tracing = "0.1"

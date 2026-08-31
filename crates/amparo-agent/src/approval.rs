@@ -14,12 +14,18 @@
 
 use amparo_tools::RollbackSpec;
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::preflight::BlastRadius;
 
 /// A request for human approval before a tool executes.
-#[derive(Debug, Clone)]
+///
+/// Serialization is the web-approval wire shape (M10 W4,
+/// `docs/web-surface.md` §3): the gate POSTs exactly these fields —
+/// `call_id`, `tool_name`, `arguments`, `reasons`, `blast_radius`,
+/// `session_label`, `rollback` — to the approvals endpoint.
+#[derive(Debug, Clone, Serialize)]
 pub struct ApprovalRequest {
     /// The tool call's id — echoed back in the tool-role answer.
     pub call_id: String,

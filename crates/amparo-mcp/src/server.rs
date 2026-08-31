@@ -19,9 +19,10 @@ use crate::types::{
     to_mcp_tool, CallToolResult, ClientInfo, ContentBlock, InitializeResult, ListToolsResult,
     ServerCapabilities, ServerToolsCapabilities, PROTOCOL_VERSION,
 };
+use amparo_agent::preflight::{classify, classify_tier};
 use amparo_agent::{ApprovalGate, ApprovalRequest, AutoDeny};
 use amparo_policy::{PolicyEngine, PolicyVerdict};
-use amparo_tools::{ToolCall, ToolRegistry, ToolResult, ToolTrustTier};
+use amparo_tools::{PathPolicy, ToolCall, ToolRegistry, ToolResult, ToolTrustTier};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -34,6 +35,14 @@ pub struct McpServer {
     policy: Arc<dyn PolicyEngine>,
     approval: Arc<dyn ApprovalGate>,
     trust_ceiling: ToolTrustTier,
+    /// The env-derived path policy the registry's tools captured at
+    /// construction (M10 W4): drives the full preflight classification
+    /// on approval requests. `None` → the tier-seed classification.
+    /// Display-only (I1), like every label.
+    path_policy: Option<Arc<PathPolicy>>,
+    /// The session id attached to approval requests (M10 W4): the web
+    /// approver sees who is asking. Display-only (I1).
+    session_id: Option<String>,
     name: String,
     version: String,
     next_call_id: AtomicU64,
@@ -48,6 +57,8 @@ impl McpServer {
             policy,
             approval: Arc::new(AutoDeny),
             trust_ceiling: ToolTrustTier::SystemControl,
+            path_policy: None,
+            session_id: None,
             name: "amparo".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             next_call_id: AtomicU64::new(1),
@@ -70,6 +81,23 @@ impl McpServer {
     /// Tools above this tier are refused outright (default: SystemControl).
     pub fn with_trust_ceiling(mut self, ceiling: ToolTrustTier) -> Self {
         self.trust_ceiling = ceiling;
+        self
+    }
+
+    /// Attach the env-derived path policy the registry's tools captured
+    /// at construction (M10 W4), so approval requests carry the full
+    /// preflight classification — argument inspection included — instead
+    /// of the tier seed alone. Display-only (I1).
+    pub fn with_path_policy(mut self, policy: Arc<PathPolicy>) -> Self {
+        self.path_policy = Some(policy);
+        self
+    }
+
+    /// Tag approval requests with the caller behind this server
+    /// (M10 W4): the web approver sees `[session] mcp session <id>` on
+    /// the copy. Display-only (I1), like the agent loop's label.
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(id.into());
         self
     }
 
@@ -205,8 +233,24 @@ impl McpServer {
     /// The gate chain — the same order and semantics as the agent loop's
     /// per-call path: registry lookup, trust ceiling, policy (deny by
     /// default), human approval for escalated or external-effector calls,
-    /// then execution.
+    /// then execution. Approval requests carry the preflight
+    /// classification, the session label and the rollback hint (M10 W4) —
+    /// all display-only (I1), so a web approver sees the same copy a
+    /// terminal approver would.
     async fn gate_and_dispatch(&self, call: &ToolCall) -> ToolResult {
+        // Preflight (M10 W4): full classification with a path policy,
+        // the tier seed without. Display-only (I1).
+        let blast_radius = Some(match &self.path_policy {
+            Some(policy) => classify(&self.registry, policy, call),
+            None => classify_tier(&self.registry, call),
+        });
+        let session_label = self
+            .session_id
+            .as_ref()
+            .map(|id| format!("mcp session {id}"));
+        // The rollback hint is computed before execution (M10 W3): the
+        // undo in the approval copy must describe the pre-call state.
+        let rollback = self.registry.rollback_for(call);
         let fail = |call: &ToolCall, error: String| ToolResult {
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
@@ -267,13 +311,9 @@ impl McpServer {
                     tool_name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     reasons,
-                    // The MCP server runs no agent loop — no preflight
-                    // classification or delegation label (display-only
-                    // context). Rollback classification lands with W4's
-                    // preflight wiring.
-                    blast_radius: None,
-                    session_label: None,
-                    rollback: None,
+                    blast_radius,
+                    session_label: session_label.clone(),
+                    rollback: rollback.clone(),
                 };
                 if !self.approval.request(&request).await {
                     return fail(
@@ -296,9 +336,9 @@ impl McpServer {
                 tool_name: call.name.clone(),
                 arguments: call.arguments.clone(),
                 reasons: vec![format!("tool tier {:?} requires human approval", tier)],
-                blast_radius: None,
-                session_label: None,
-                rollback: None,
+                blast_radius,
+                session_label,
+                rollback,
             };
             if !self.approval.request(&request).await {
                 return fail(
@@ -321,7 +361,8 @@ mod tests {
     use crate::types::{McpTool, PROTOCOL_VERSION};
     use amparo_agent::{ApprovalGate, AutoApprove};
     use amparo_policy::{DenyAllPolicyEngine, PolicyDecision};
-    use amparo_tools::{ToolExecutor, ToolParam, ToolSchema};
+    use amparo_tools::filesystem::WriteFileTool;
+    use amparo_tools::{PathPolicy, ToolExecutor, ToolParam, ToolSchema};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -574,5 +615,70 @@ mod tests {
         assert_eq!(v["result"]["isError"], false);
         assert_eq!(gate.requests.lock().unwrap().len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn escalated_call_requests_carry_preflight_session_and_rollback() {
+        // M10 W4: an approval request leaving the MCP server carries the
+        // same display-only copy a terminal approver would see — the
+        // preflight classification, the session label and the rollback
+        // hint with its backup marker.
+        let root = std::env::temp_dir().join(format!(
+            "amparo-mcp-w4-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "old contents").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WriteFileTool::with_policy(Arc::new(
+            PathPolicy::from_root(root.clone()),
+        ))));
+        let gate = Arc::new(RecordingGate {
+            requests: Mutex::new(Vec::new()),
+            answer: true,
+        });
+        let server = McpServer::new(registry, Arc::new(EscalateAll))
+            .with_approval(gate.clone())
+            .with_path_policy(Arc::new(PathPolicy::from_root(root.clone())))
+            .with_session_id("web-1");
+
+        let out = server
+            .handle_line(&call_line(
+                8,
+                "write_file",
+                serde_json::json!({"path": "note.txt", "content": "new contents"}),
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+
+        let requests = gate.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.session_label.as_deref(), Some("mcp session web-1"));
+        assert!(matches!(
+            request.blast_radius,
+            Some(amparo_agent::BlastRadius::WorkspaceLocal)
+        ));
+        let rollback = request
+            .rollback
+            .as_ref()
+            .expect("write_file declares a rollback hint");
+        assert!(rollback.undo.contains("restore the previous contents of"));
+        assert!(rollback
+            .markers
+            .iter()
+            .any(|m| m.contains("note.txt.amparo-bak")));
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "new contents"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

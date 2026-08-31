@@ -10,13 +10,13 @@
 //! unless `--auto-approve` is passed — remote MCP clients have no human at
 //! the terminal by default.
 
-use amparo_agent::{ApprovalGate, AutoApprove, AutoDeny};
+use amparo_agent::{ApprovalGate, AutoApprove, AutoDeny, WebApprovalGate};
 use amparo_policy::{
     wire::WirePolicyEngine, AllowAllPolicyEngine, AuditNoticeEngine, DenyAllPolicyEngine,
     PolicyEngine,
 };
 use amparo_sandbox::EvalWasmTool;
-use amparo_tools::{default_registry, ToolRegistry, ToolTrustTier};
+use amparo_tools::{default_registry, PathPolicy, ToolRegistry, ToolTrustTier};
 use std::sync::Arc;
 
 use crate::McpServer;
@@ -35,6 +35,10 @@ pub struct ServeFlags {
     /// Session id attached to every policy check (M9 W3): correlates
     /// engine-side audit rows with the caller behind this server.
     pub session_id: Option<String>,
+    /// Web-approval endpoint (M10 W4): when set, approval requests POST
+    /// to this URL and the gate polls it for the human's decision.
+    /// Mutually exclusive with `--auto-approve`.
+    pub approval_endpoint: Option<String>,
 }
 
 impl Default for ServeFlags {
@@ -45,6 +49,7 @@ impl Default for ServeFlags {
             auto_approve: false,
             trust_ceiling: ToolTrustTier::SystemControl,
             session_id: None,
+            approval_endpoint: None,
         }
     }
 }
@@ -75,6 +80,9 @@ pub const HELP: &str =
      \x20 --allow-all         run without policy checks (explicit opt-in)\n\
      \x20 --auto-approve      approve escalated/external-effector calls\n\
      \x20                      without a human (default: auto-deny)\n\
+     \x20 --approval-endpoint URL  ask a web UI for approvals: POST each\n\
+     \x20                      request to URL, poll URL/<call_id> for the\n\
+     \x20                      decision (60s fail-closed)\n\
      \x20 --trust-ceiling T   observational | local_mutating |\n\
      \x20                      external_effector | system_control (default)\n";
 
@@ -97,6 +105,12 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> ParseResult {
             },
             "--allow-all" => flags.allow_all = true,
             "--auto-approve" => flags.auto_approve = true,
+            "--approval-endpoint" => match args.next() {
+                Some(url) => flags.approval_endpoint = Some(url),
+                None => {
+                    return ParseResult::Error("--approval-endpoint requires a URL".to_string())
+                }
+            },
             "--trust-ceiling" => match args.next() {
                 Some(tier) => match tier.as_str() {
                     "observational" => flags.trust_ceiling = ToolTrustTier::Observational,
@@ -109,6 +123,18 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> ParseResult {
             },
             "--help" | "-h" => return ParseResult::Help,
             other => return ParseResult::Error(format!("unknown flag {other}; see --help")),
+        }
+    }
+    if flags.approval_endpoint.is_some() && flags.auto_approve {
+        return ParseResult::Error(
+            "--approval-endpoint and --auto-approve are mutually exclusive".to_string(),
+        );
+    }
+    if let Some(url) = &flags.approval_endpoint {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return ParseResult::Error(format!(
+                "--approval-endpoint must be an http(s) URL, got '{url}'"
+            ));
         }
     }
     ParseResult::Serve(flags)
@@ -165,19 +191,27 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
         )),
     };
 
-    let approval: Arc<dyn ApprovalGate> = if flags.auto_approve {
-        Arc::new(AutoApprove)
-    } else {
-        Arc::new(AutoDeny)
+    let approval: Arc<dyn ApprovalGate> = match (flags.auto_approve, &flags.approval_endpoint) {
+        (true, Some(_)) => unreachable!("rejected by parse_flags"),
+        (true, None) => Arc::new(AutoApprove),
+        (false, Some(url)) => Arc::new(WebApprovalGate::new(url.clone())),
+        (false, None) => Arc::new(AutoDeny),
     };
 
     let mut registry: ToolRegistry = default_registry();
     // M7b: eval_wasm is served over MCP too; approval defaults to
     // AutoDeny here, so it is refused until an operator allows.
     registry.register(Arc::new(EvalWasmTool::new()));
-    let server = McpServer::new(registry, policy)
+    let mut server = McpServer::new(registry, policy)
         .with_approval(approval)
-        .with_trust_ceiling(flags.trust_ceiling);
+        .with_trust_ceiling(flags.trust_ceiling)
+        // M10 W4: the env-derived path policy (the one the registry's
+        // tools captured at construction) drives the full preflight
+        // classification on approval requests — display-only (I1).
+        .with_path_policy(Arc::new(PathPolicy::from_env()));
+    if let Some(id) = &flags.session_id {
+        server = server.with_session_id(id.clone());
+    }
     server.serve_stdio().await.map_err(ServeError::serve)
 }
 
@@ -271,5 +305,52 @@ mod tests {
     fn help_text_names_the_binary_and_the_ceiling_flag() {
         assert!(HELP.contains("amparo-mcp-serve"));
         assert!(HELP.contains("--trust-ceiling"));
+    }
+
+    #[test]
+    fn parses_the_approval_endpoint() {
+        let f = flags(parse(&["--approval-endpoint", "http://web.test/approvals"]));
+        assert_eq!(
+            f.approval_endpoint.as_deref(),
+            Some("http://web.test/approvals")
+        );
+        assert!(!f.auto_approve);
+        let f = flags(parse(&[]));
+        assert!(f.approval_endpoint.is_none());
+    }
+
+    #[test]
+    fn approval_endpoint_rejects_missing_and_non_http_urls() {
+        match parse(&["--approval-endpoint"]) {
+            ParseResult::Error(m) => assert_eq!(m, "--approval-endpoint requires a URL"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match parse(&["--approval-endpoint", "nonsense"]) {
+            ParseResult::Error(m) => {
+                assert_eq!(
+                    m,
+                    "--approval-endpoint must be an http(s) URL, got 'nonsense'"
+                )
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_endpoint_and_auto_approve_are_mutually_exclusive() {
+        match parse(&["--approval-endpoint", "http://web.test", "--auto-approve"]) {
+            ParseResult::Error(m) => {
+                assert_eq!(
+                    m,
+                    "--approval-endpoint and --auto-approve are mutually exclusive"
+                )
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_text_names_the_approval_endpoint_flag() {
+        assert!(HELP.contains("--approval-endpoint"));
     }
 }

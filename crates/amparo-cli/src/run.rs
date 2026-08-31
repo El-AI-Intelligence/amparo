@@ -18,7 +18,7 @@
 use amparo_agent::{
     format_cost_line, Agent, AgentConfig, AgentReport, ApprovalGate, AutoApprove, AutoDeny,
     CaseLibrary, CheckpointStore, EventSink, FanoutSink, JsonCheckpointStore, LedgerSink,
-    SpawnAgentTool, TaskStatus,
+    SpawnAgentTool, TaskStatus, WebApprovalGate,
 };
 use amparo_inference::{InferenceConfig, MAX_TIMEOUT_SECS};
 use amparo_notebook::{
@@ -70,6 +70,8 @@ FLAGS:
                       marker records the drop (K/M/G suffixes, e.g. 64K)
   --webhook-url URL   deliver send_notification messages by POSTing them
                       as JSON to URL (default: stderr)
+  --approval-endpoint URL  ask a web UI for approvals (60s fail-closed);
+                      replaces the interactive prompt
 
 The task is the joined positional arguments. stdout carries the final answer
 only; progress, gate decisions and the report go to stderr.
@@ -111,7 +113,15 @@ and a non-success status fails the call. Without the flag the default
 stderr transport stands — the notification prints as
 \"[notification] to <destination>: <message>\". Every send asks for
 human approval first (external-effector tier), and the approval prompt
-names the destination.";
+names the destination.
+
+--approval-endpoint wires the human-approval gate to a web UI (M10 W4):
+each escalated/external-effector request is POSTed to the URL as
+{\"call_id\", \"tool_name\", \"arguments\", \"reasons\", \"blast_radius\",
+\"session_label\", \"rollback\"} JSON, and the gate polls URL/<call_id>
+for {\"status\":\"decided\",\"decision\":true|false} under a 60-second
+deadline — no decision means denial (fail closed). Mutually exclusive
+with --auto-approve and --auto-deny.";
 
 /// Parsed `amparo run` flags.
 #[derive(Debug, Clone)]
@@ -142,6 +152,10 @@ pub struct RunFlags {
     /// notification is POSTed there as JSON; `None` = the stderr
     /// transport.
     pub webhook_url: Option<String>,
+    /// Web-approval endpoint (M10 W4): when set, approval requests POST
+    /// to this URL and the gate polls it for the human's decision.
+    /// Mutually exclusive with `--auto-approve`/`--auto-deny`.
+    pub approval_endpoint: Option<String>,
     /// The task — joined positional arguments (empty when resuming).
     pub task: String,
 }
@@ -164,6 +178,7 @@ impl Default for RunFlags {
             max_sub_agents: 4,
             session_id: None,
             webhook_url: None,
+            approval_endpoint: None,
             task: String::new(),
         }
     }
@@ -234,6 +249,10 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
             "--webhook-url" => match args.next() {
                 Some(url) => flags.webhook_url = Some(url),
                 None => return ParseRunResult::Error("--webhook-url requires a URL".into()),
+            },
+            "--approval-endpoint" => match args.next() {
+                Some(url) => flags.approval_endpoint = Some(url),
+                None => return ParseRunResult::Error("--approval-endpoint requires a URL".into()),
             },
             "--allow-all" => flags.allow_all = true,
             "--auto-approve" => flags.auto_approve = true,
@@ -318,6 +337,18 @@ pub fn parse_run_flags(args: impl Iterator<Item = String>) -> ParseRunResult {
         return ParseRunResult::Error(
             "--auto-approve and --auto-deny are mutually exclusive".into(),
         );
+    }
+    if flags.approval_endpoint.is_some() && (flags.auto_approve || flags.auto_deny) {
+        return ParseRunResult::Error(
+            "--approval-endpoint and --auto-approve/--auto-deny are mutually exclusive".into(),
+        );
+    }
+    if let Some(url) = &flags.approval_endpoint {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return ParseRunResult::Error(format!(
+                "--approval-endpoint must be an http(s) URL, got '{url}'"
+            ));
+        }
     }
     if flags.resume && !positional.is_empty() {
         return ParseRunResult::Error(
@@ -490,12 +521,16 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
         (Some(_), true) => unreachable!("rejected by parse_run_flags"),
     };
 
-    let approval: Arc<dyn ApprovalGate> = if flags.auto_approve {
-        Arc::new(AutoApprove)
-    } else if flags.auto_deny {
-        Arc::new(AutoDeny)
-    } else {
-        Arc::new(InteractiveApprovalGate::default())
+    let approval: Arc<dyn ApprovalGate> = match (
+        &flags.approval_endpoint,
+        flags.auto_approve,
+        flags.auto_deny,
+    ) {
+        (Some(url), false, false) => Arc::new(WebApprovalGate::new(url.clone())),
+        (None, true, false) => Arc::new(AutoApprove),
+        (None, false, true) => Arc::new(AutoDeny),
+        (None, false, false) => Arc::new(InteractiveApprovalGate::default()),
+        _ => unreachable!("rejected by parse_run_flags"),
     };
 
     let mut agent_config = AgentConfig::default();
@@ -973,5 +1008,42 @@ mod tests {
             error(parse(&["--max-sub-agents"])),
             "--max-sub-agents requires a number"
         );
+    }
+
+    #[test]
+    fn approval_endpoint_flag_parses_and_validates() {
+        assert_eq!(flags(parse(&["task"])).approval_endpoint, None);
+        let f = flags(parse(&[
+            "--approval-endpoint",
+            "http://web.test/approvals",
+            "task",
+        ]));
+        assert_eq!(
+            f.approval_endpoint.as_deref(),
+            Some("http://web.test/approvals")
+        );
+        assert_eq!(
+            error(parse(&["--approval-endpoint"])),
+            "--approval-endpoint requires a URL"
+        );
+        assert_eq!(
+            error(parse(&["--approval-endpoint", "nonsense", "task"])),
+            "--approval-endpoint must be an http(s) URL, got 'nonsense'"
+        );
+    }
+
+    #[test]
+    fn approval_endpoint_excludes_the_auto_gates() {
+        for extra in ["--auto-approve", "--auto-deny"] {
+            assert_eq!(
+                error(parse(&[
+                    "--approval-endpoint",
+                    "http://web.test",
+                    extra,
+                    "task"
+                ])),
+                "--approval-endpoint and --auto-approve/--auto-deny are mutually exclusive"
+            );
+        }
     }
 }

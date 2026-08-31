@@ -96,20 +96,15 @@ const FILE_TOOLS: &[&str] = &[
 /// shell words (case-insensitive), so `sync` does not trip `nc`.
 const NETWORK_COMMANDS: &[&str] = &["curl", "wget", "nc", "scp", "rsync", "ssh"];
 
-/// Classify one call's blast radius. The trust tier seeds the class;
-/// argument inspection can only raise it (first raise wins):
+/// The trust-tier seed of [`classify`]: the static per-tool overrides
+/// plus the tier mapping, without any argument inspection.
 ///
-/// 1. `run_command` whose command matches
-///    [`PathPolicy::check_command_blocked`] → [`BlastRadius::Destructive`]
-/// 2. `run_command` naming a network-transfer utility → at least
-///    [`BlastRadius::Network`]
-/// 3. a file tool given an absolute path outside the workspace, `/tmp`
-///    and `/dev/shm` → at least [`BlastRadius::SystemWide`]
-///
-/// An unknown tool (never seen in the loop — the gate blocks those
-/// first) is labeled [`BlastRadius::SystemWide`], the honest
-/// worst-case claim short of a destructive match.
-pub fn classify(registry: &ToolRegistry, policy: &PathPolicy, call: &ToolCall) -> BlastRadius {
+/// This is the honest classification when no [`PathPolicy`] is attached
+/// at the construction site (the MCP server runs no workspace loop and
+/// may have no policy wired) — the label still says what the tool *is*,
+/// just not what this call's arguments add. [`classify`] starts here and
+/// can only raise the label from argument inspection.
+pub fn classify_tier(registry: &ToolRegistry, call: &ToolCall) -> BlastRadius {
     // Static override (M7b): eval_wasm computes inside a sealed sandbox —
     // no imports, no WASI — so it observes and modifies nothing outside
     // its own memory. Its tier stays ExternalEffector (untrusted code
@@ -136,13 +131,31 @@ pub fn classify(registry: &ToolRegistry, policy: &PathPolicy, call: &ToolCall) -
         return BlastRadius::SystemWide;
     }
 
-    let mut radius = match registry.get_tier(&call.name) {
+    match registry.get_tier(&call.name) {
         Some(ToolTrustTier::Observational) => BlastRadius::ReadOnly,
         Some(ToolTrustTier::LocalMutating) => BlastRadius::WorkspaceLocal,
         Some(ToolTrustTier::ExternalEffector) => BlastRadius::Network,
         Some(ToolTrustTier::SystemControl) => BlastRadius::SystemWide,
-        None => return BlastRadius::SystemWide,
-    };
+        None => BlastRadius::SystemWide,
+    }
+}
+
+/// Classify one call's blast radius. The trust tier seeds the class
+/// (via [`classify_tier`]); argument inspection can only raise it (first
+/// raise wins):
+///
+/// 1. `run_command` whose command matches
+///    [`PathPolicy::check_command_blocked`] → [`BlastRadius::Destructive`]
+/// 2. `run_command` naming a network-transfer utility → at least
+///    [`BlastRadius::Network`]
+/// 3. a file tool given an absolute path outside the workspace, `/tmp`
+///    and `/dev/shm` → at least [`BlastRadius::SystemWide`]
+///
+/// An unknown tool (never seen in the loop — the gate blocks those
+/// first) is labeled [`BlastRadius::SystemWide`], the honest
+/// worst-case claim short of a destructive match.
+pub fn classify(registry: &ToolRegistry, policy: &PathPolicy, call: &ToolCall) -> BlastRadius {
+    let mut radius = classify_tier(registry, call);
 
     if call.name == "run_command" {
         if let Some(command) = call.arg_str("command") {

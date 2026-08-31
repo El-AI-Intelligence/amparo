@@ -70,6 +70,7 @@ pub mod session;
 pub mod spawn;
 mod sse;
 pub mod tokens;
+pub mod web_approval;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -85,7 +86,7 @@ pub use events::{
     TRUNCATE,
 };
 pub use ledger_sink::{LedgerSink, NETWORK_TOOLS};
-pub use preflight::{classify, BlastRadius};
+pub use preflight::{classify, classify_tier, BlastRadius};
 pub use qc::{QcCouncil, QcFinding, QcInput, QcReport, QcStats, QcVerdict};
 pub use session::{
     continuity_context, Checkpoint, CheckpointStore, JsonCheckpointStore, LoopState, SessionStatus,
@@ -93,3 +94,4 @@ pub use session::{
 };
 pub use spawn::{SpawnAgentTool, SubAgentSummary, SPAWN_AGENT};
 pub use tokens::{estimate_tokens, format_cost_line};
+pub use web_approval::WebApprovalGate;
