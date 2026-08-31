@@ -5,103 +5,160 @@
 
 An open agent that acts under policy. Bring your own LLM.
 
----
+Amparo runs a real tool-use loop — shell, files, git, web, tests, build,
+memory — where **every tool call passes a policy check before it executes**,
+and where the model driving the loop is yours to choose. Current version:
+**v0.10.0** (all twelve roadmap milestones landed — see
+[Roadmap](#roadmap)).
 
-## Status: pre-alpha, M11 landed — M6 (controlled growth: notebook, case library, gated skills, metrics + retirement, rollup + archival) complete, M7 (instrumentation & hardening: privacy ledger, session persistence, preflight blast radius) landed, M7b (WASM eval sandbox + ledger quota) landed, M8 (sub-agents & scheduling: `spawn_agent` + `schedule` behind the gate chain) landed, M9 (verification & QA: QC council beside policy, `amparo doctor`, the audit-mode notice + session tagging) landed, M10 (coordination & surfaces: the blackboard, `send_notification`, rollback hints, the web-approval seam, MCP spawn + the CLI scheduler) landed, M11 (adoption: the Engram memory backend, Guardrail-native policy checks, and the web surface live) landed
+**The one rule: no member exits the gate chain.** The gate chain is
 
-This repository was created on 2026-08-27. **Milestone 1 is in** (the
-BYO-LLM provider layer), **Milestone 2 is in** (the agent loop on native
-`tool_calls` behind the policy gate, MCP first-class in both directions),
-**Milestone 3 is in** (the `amparo` binary installs with
-`cargo install --path crates/amparo-cli`, drives the loop end-to-end from
-the command line, and the workspace carries a versioned release with a
-documented API-stability policy), **Milestone 4 is in**: Telegram,
-Discord and Slack chat adapters behind one transport seam, with
-inline-button approval and a fail-closed operator allowlist,
-**Milestone 5 is in**: a TOML tenant directory with per-user policy
-checks, per-user trust ceilings, per-user workspace directories, and
-requester-only approval presses, and **Milestone 6 is in**: the lab
-notebook — with `--growth`, every completed or failed task is recorded
-as a PII-stripped, tenant-tagged run record (off by default).
-**Milestone 7 is in**: the always-on privacy ledger (every
-network-touching execution attempt and every PII strip, with the human
-gate's answer), session persistence (`amparo run --resume`, per-tenant
-chat continuity), and preflight blast-radius classification in the
-approval copy.
+```
+registry → trust ceiling → policy engine → human approval
+```
 
-### What exists today: the crate set
+and it is deny-by-default and fail-closed at every step: no policy engine
+configured means every call is refused until you explicitly opt in
+(`--allow-all`); an unreachable engine escalates through the fail-safe path,
+never fails open; an unanswered approval auto-denies after 60 s. Sub-agents,
+scheduled promises, MCP-mounted tools, chat-approval presses — every path a
+tool call can take ends in the same chain. A model is never the approver.
 
-- **`amparo-inference`** (M1) — one trait (`InferenceProvider`), two providers:
-  **`OpenAIProvider`** (any OpenAI-compatible endpoint — Ollama, vLLM,
-  OpenRouter, Together, Groq — including an Ollama-native `/api/chat` branch)
-  and **`AnthropicProvider`** (the native Anthropic Messages API, translated to
-  the same OpenAI-shaped contract, including `tool_use`/`tool_result`
-  translation and SSE streaming). Fail-closed by construction: no silent
-  localhost default, per-request timeouts plus a stream idle timeout, a
-  `max_tokens` clamp, and an optional model allowlist enforced at build time.
-- **`amparo-agent`** (M2d) — the loop, ported from Axiom's `run_agent_task`
-  and switched from text-parsed ReAct to native `tool_calls`. The gate chain
-  Amparo owns is the deny-by-default seam: **trust ceiling → policy gate →
-  human approval**, and every tool call — executed or blocked — gets a
-  tool-role answer carrying its `tool_call_id`. Loop mechanics preserved from
-  Axiom: max steps + conversation trimming, parallel tool batches with retry
-  ×2, the one-shot shortcut, the same-tool loop guard, empty-turn recovery,
-  and VERIFIED/INCOMPLETE self-verification. Events flow through an
-  `EventSink` seam; approval gates default to auto-deny; privacy is enforced
-  per turn with Secure Minions PII strip/restore (per-message placeholder
-  namespaces), and nudge/verification messages are stripped too.
-- **`amparo-mcp`** (M2e) — MCP first-class on both sides. `McpServer`
-  speaks JSON-RPC 2.0 over stdio (`initialize`, `tools/list`, `tools/call`,
-  `ping`); the policy engine is a required constructor argument and every
-  call runs the same gate chain as the loop, with auto-deny approval by
-  default. `McpClient` spawns a server process, handshakes, and
-  `mount_into`s its tools as registry executors at `ExternalEffector` by
-  default, so remote tools cannot skip the approval gate. Ships the
-  `amparo-mcp-serve` binary (`--policy-url`, `--allow-all`,
-  `--auto-approve`, `--trust-ceiling`).
-- **`amparo-policy`** (M2b) — the policy seam (`PolicyEngine`) with a
-  deny-all default and `WirePolicyEngine`, a client for the open policy-check
-  wire protocol (`POST /check {tool_name, target} → {verdict, reason,
-  enforced}`). Guardrail is a commercial implementation of that protocol;
-  anyone can write another.
-- **`amparo-tools`** (M2c) — the registry and the portable tool set (web,
-  filesystem, shell, git, tests, build, memory), each with a trust tier that
-  drives the approval gate.
-- **`amparo-sandbox`** (M7b) — the WASM eval sandbox: a fuel-metered,
-  deterministic `SandboxRuntime` (10M fuel, 4 MB module, 4 MB memory,
-  30 s wall clock, no imports, no WASI) and the `eval_wasm` tool that
-  runs a base64 module against it. Hosts register the tool themselves
-  (the `use_skill` precedent) — the default registry stays wasmtime-free.
-- **`amparo-memory`** (M2a) — the memory interface with a built-in default
-  store. Engram is the recommended backend; it is never a dependency.
-- **`amparo-privacy`** (M2a, M7) — privacy policy evaluation, blocked/allowed
-  domain routing, the Secure Minions PII strip/restore primitives the loop
-  uses, and the always-on privacy ledger: an append-only JSONL evidence
-  log at `<workspace>/.amparo/privacy/ledger.jsonl` recording every
+## Install
+
+One line (Linux, macOS, Windows — x86_64 and arm64; installs to
+`~/.local/bin`):
+
+```sh
+curl -fsSL https://downloads.ellmstack.dev/amparo/install.sh | sh
+```
+
+Or from source (Rust 1.85+):
+
+```sh
+cargo install --path crates/amparo-cli
+```
+
+Then point it at any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter,
+Together, Groq) or the native Anthropic API:
+
+```sh
+export AMPARO_INFERENCE_URL=http://localhost:11434/v1   # required
+export AMPARO_INFERENCE_MODEL=qwen2.5:14b               # required
+amparo run "list the files and tell me what's there" --allow-all
+```
+
+Two environment variables are required; everything else is optional —
+`AMPARO_INFERENCE_KEY` (empty for keyless local providers),
+`AMPARO_INFERENCE_PROVIDER` (`openai` default or `anthropic`),
+`AMPARO_WORKSPACE` (the directory tools are confined to),
+`AMPARO_POLICY_KEY` (with `--policy-url`), and the `AMPARO_CHAT_*` tokens
+for the chat adapters. Without `--policy-url` or `--allow-all`, every tool
+call is refused. Approvals ask **y/N at the terminal** with a
+`[preflight] blast radius: …` line naming the consequence; stdout carries
+the final answer only — progress and gate decisions go to stderr, so
+`amparo run` scripts cleanly.
+
+The same agent over Telegram, Discord, or Slack (`amparo chat
+telegram|discord|slack`), with inline Approve/Deny buttons, a TOML tenant
+directory for per-user policy scopes, and a fail-closed operator allowlist
+— see the env table further down for the full surface.
+
+## Three commitments
+
+**Bring your own LLM.** No bundled model, no required sidecar, no vendor
+with a privileged position in the loop.
+
+**Policy is an interface, not a product.** The gate between "the model
+decided to do this" and "this ran" is an open interface with an open wire
+protocol (`POST /check` → `{verdict, reason, enforced}`). Amparo ships a
+deny-all default engine; [Guardrail](https://elai-intelligence.com) is a
+commercial implementation of the same interface, and anyone can write
+another.
+
+**Engram is recommended, never required.** Memory is an interface with a
+built-in default store; [Engram](https://elai-intelligence.com) is the
+recommended memory backend — durable, private, syncable across devices —
+but Amparo runs without it, and hard-depends on no memory product.
+
+**Deployable anywhere.** A standalone binary, a container, a systemd unit,
+a chat bot, an MCP server. Not welded to a desktop session, not dependent
+on a GUI.
+
+## What's in the box
+
+- **The loop** — native `tool_calls` (no text-parsed ReAct), parallel tool
+  batches with retry, conversation trimming, self-verification, and an
+  `EventSink` seam for hosts. Events flow as scientific-voice `[tag]`
+  progress lines.
+- **The gate chain** — trust tiers per tool (`Observational` →
+  `ExternalEffector`), the `PolicyEngine` seam (default: deny all; the
+  `WirePolicyEngine` client speaks the open wire protocol with a 60 s
+  fail-closed timeout), and human approval gates (terminal, chat inline
+  buttons, or the web-approval seam) that fail closed on timeout.
+- **The privacy ledger** — always-on, append-only: every
   network-touching execution attempt (tool, host at most, outcome, human
-  gate answer) and every PII strip as per-category counts.
-- **`amparo-chat`** (M4, M8) — the chat adapter layer: one `ChatTransport`
-  seam, a per-task `ChatDriver` (allowlist, one task per chat, panic-proof
-  task boundary), an `ApprovalRouter` for inline-button presses, a
-  `ChatApprovalGate` (inline Approve/Deny buttons, 60 s auto-deny), and
-  hand-rolled transports for **Telegram** (long polling), **Discord**
-  (gateway websocket) and **Slack** (Socket Mode). M8 adds the schedule
-  queue: a promise store and a 30 s ticker that fires due promises back
-  through the gate chain as their requester.
-- **`amparo-cli`** (M3, M4, M7, M7b, M8) — the one binary: `amparo run "task"`
-  drives the loop end-to-end (fail-closed BYO-LLM env, interactive terminal
-  approval with a `[preflight] blast radius` line, `--auto-approve`/
-  `--auto-deny` overrides, `--ledger-max-bytes` bounds the privacy
-  ledger, `--max-sub-agents` bounds the swarm — default 4, 0 turns it
-  off), `amparo run --resume` resumes the newest
-  incomplete checkpoint for tenant `cli`, `amparo privacy` reads the
-  ledger (summary + tail, incl. quota and rotation counts),
-  `amparo schedule list|cancel` inspects the chat promise queue,
-  `amparo mcp-serve`
-  reuses the same implementation as the standalone `amparo-mcp-serve`
-  binary (same help, errors, exit codes), `amparo chat
-  telegram|discord|slack` serves the agent over a messaging platform,
-  `amparo version` prints the version.
+  gate answer) and every PII strip as per-category counts, never values
+  (`amparo privacy` reads it; `--ledger-max-bytes` bounds it, with
+  rotation itself audited). See `docs/m7-instrumentation.md`.
+- **Sessions** — every task checkpoints once per loop iteration,
+  PII-stripped, written atomically; `amparo run --resume` picks up a
+  crashed run and re-judges every call through the gate chain.
+- **Sub-agents & scheduling** — `spawn_agent` (a sub-agent is the same
+  loop, same gate chain, same ceiling; a shared swarm budget fails closed)
+  and `schedule` (a persisted promise re-entering the gate chain as its
+  requester; missed = fail-closed, never fired late). See
+  `docs/m8-swarms.md`.
+- **The QC council & `amparo doctor`** — deterministic rule auditors run
+  beside policy before verification (advisory findings, verification stays
+  the model's call), and the doctor is a read-only workspace sweep, exit
+  0/1/2, cron-able. See `docs/m9-verification-qa.md`.
+- **The coordination surfaces** — the blackboard
+  (`blackboard_read`/`blackboard_write`), `send_notification` behind a
+  transport seam, display-only rollback hints with fail-closed
+  `.amparo-bak` backups, the web-approval seam (`--approval-endpoint`,
+  60 s fail-closed), MCP spawn, and the CLI scheduler. See
+  `docs/m10-coordination-surfaces.md`.
+- **The WASM eval sandbox** — a fuel-metered, deterministic
+  `SandboxRuntime` for untrusted computation (10M fuel, 4 MB module,
+  4 MB memory, 30 s wall clock, no imports, no WASI), approval-gated and
+  honestly labeled `read_only`. See `docs/m7b-sandbox-quota.md`.
+- **Controlled growth** — opt-in (`--growth`, off by default): the lab
+  notebook (PII-stripped run records), the verification case library,
+  gated skills adopted through the same gate chain, per-skill metrics
+  with policy-drift and performance retirement, and a hot layer over the
+  never-modified cold archive. See `docs/m6-controlled-growth.md`.
+
+### The crate set
+
+- **`amparo-inference`** — one provider trait, two implementations:
+  OpenAI-compatible (Ollama, vLLM, OpenRouter, Together, Groq) and native
+  Anthropic, translated to one contract. Fail-closed by construction: no
+  silent localhost default, per-request + stream idle timeouts, a
+  `max_tokens` clamp, optional model allowlist.
+- **`amparo-agent`** — the loop and the gate chain, extracted from
+  Axiom-OS's working ReAct mechanics and rebuilt on native tool calls.
+- **`amparo-mcp`** — MCP first-class in both directions: `McpServer`
+  (stdio JSON-RPC, every call through the same gate chain) and
+  `McpClient` (spawns a server process, mounts its tools as
+  `ExternalEffector` — remote tools cannot skip the approval gate).
+- **`amparo-policy`** — the policy seam and the wire-protocol client.
+- **`amparo-tools`** — the registry and the portable tool set (web,
+  filesystem, shell, git, tests, build, memory), each with a trust tier
+  that drives the approval gate.
+- **`amparo-sandbox`** — the WASM eval sandbox.
+- **`amparo-memory`** — the memory interface with a built-in default
+  store.
+- **`amparo-privacy`** — PII strip/restore primitives and the privacy
+  ledger.
+- **`amparo-notebook`** — run records, the case library, skills, metrics,
+  rollup.
+- **`amparo-chat`** — one transport seam; hand-rolled Telegram (long
+  polling), Discord (gateway websocket) and Slack (Socket Mode) drivers;
+  the schedule ticker.
+- **`amparo-cli`** — the one binary: `run`, `resume`, `privacy`,
+  `schedule`, `skill`, `notebook`, `doctor`, `chat`, `mcp-serve`,
+  `version`.
 
 ```sh
 cargo test --workspace            # the behavior gate
@@ -110,14 +167,34 @@ cargo doc --workspace --no-deps   # the API-stability gate (missing_docs on ever
 
 Both gates must pass with zero warnings — see [VERSIONING.md](VERSIONING.md).
 
-### Quickstart
+## Native integrations
 
-```sh
-cargo install --path crates/amparo-cli   # or: cargo build --release
-```
+**Engram memory backend.** With `AMPARO_MEMORY_BACKEND=engram`, the
+memory-search tool answers from an Engram vault over engramd's REST
+surface (`AMPARO_ENGRAM_URL`, default `http://127.0.0.1:8787`; optional
+`AMPARO_ENGRAM_KEY`). The daemon is probed once at startup — down means
+one warning and the built-in store; a mid-run outage degrades searches to
+empty rather than crashing the loop.
 
-Environment surface (everything is optional except the two marked
-**required**):
+**Guardrail policy engine.** Point `--policy-url` at a Guardrail engine
+(or any wire-protocol engine) with `AMPARO_POLICY_KEY`, and every tool
+call is checked there before it runs. Audit-mode verdicts
+(`enforced:false`) are visible, never silent — one stderr line names the
+mode ("policy engine is in audit mode; verdicts are advisory") — and an
+unreachable engine escalates through the fail-safe path: it never fails
+open.
+
+**Graceful degradation.** Remove both companions and Amparo still runs:
+the built-in memory store and the local default engine. `amparo doctor
+--engram-url … --policy-url … --probe` sweeps both surfaces for the
+operator.
+
+**The trial bundle.** [docs/trial-bundle.md](docs/trial-bundle.md) pairs
+the public reveal with one month of Engram's personal tier and Guardrail's
+policy enforcement, degrading to the existing free tiers at expiry —
+nothing breaks, nothing is silently waived.
+
+## Environment surface
 
 | Variable | Meaning |
 |---|---|
@@ -130,6 +207,7 @@ Environment surface (everything is optional except the two marked
 | `AMPARO_INFERENCE_MODEL_ALLOWLIST` | Optional comma-separated model allowlist |
 | `AMPARO_WORKSPACE` | Directory the tools are confined to |
 | `AMPARO_POLICY_KEY` | API key for a remote policy engine (with `--policy-url`) |
+| `AMPARO_MEMORY_BACKEND` | `engram` selects the Engram backend (with `AMPARO_ENGRAM_URL` / `AMPARO_ENGRAM_KEY`) |
 | `AMPARO_CHAT_TELEGRAM_TOKEN` | Bot token for `amparo chat telegram` |
 | `AMPARO_CHAT_DISCORD_TOKEN` | Bot token for `amparo chat discord` |
 | `AMPARO_CHAT_SLACK_APP_TOKEN` | Socket Mode app token for `amparo chat slack` (with `AMPARO_CHAT_SLACK_BOT_TOKEN`) |
@@ -137,26 +215,6 @@ Environment surface (everything is optional except the two marked
 | `AMPARO_CHAT_ALLOWLIST` | Comma-separated user ids who may talk to the chat bot — absent or empty refuses everyone; ignored when a chat config is set |
 | `AMPARO_CHAT_CONFIG` | Path to a TOML chat config (the tenant directory); the `--chat-config` flag wins |
 | `AMPARO_CHAT_TELEGRAM_BASE` | Telegram Bot API base URL (self-hosted Bot API servers) |
-
-```sh
-export AMPARO_INFERENCE_URL=http://localhost:11434/v1
-export AMPARO_INFERENCE_MODEL=qwen2.5:14b
-amparo run "list the files and tell me what's there" --allow-all
-```
-
-Same agent, over Telegram (tokens come from the environment, never argv):
-
-```sh
-export AMPARO_CHAT_TELEGRAM_TOKEN=123456:ABC-DEF
-export AMPARO_CHAT_ALLOWLIST=111222333      # your Telegram user id
-amparo chat telegram --allow-all
-```
-
-In chat mode, approvals arrive as inline **Approve/Deny** buttons on the
-approval message; unanswered approvals auto-deny after 60 s. Progress
-lines mirror the terminal's `[tag]` format. `amparo chat discord` and
-`amparo chat slack` work the same way with their `AMPARO_CHAT_*_TOKEN`
-variables; without `AMPARO_CHAT_ALLOWLIST` the bot refuses every message.
 
 Multiple users, each with their own policy scope — a TOML chat config
 (`--chat-config`, or `AMPARO_CHAT_CONFIG`; the flag wins):
@@ -169,362 +227,28 @@ trust_ceiling = "observational"             # per-user ceiling (falls back
 workspace = "team-b"                        #   to --trust-ceiling if absent)
 ```
 
-```sh
-amparo chat telegram --chat-config tenants.toml --allow-all
-```
-
 Each user's workspace is a directory under the workspace root
-(`users/<platform>-<user_id>` by default; a profile `workspace` is a
-relative subpath — absolute and `..` paths are rejected). Each task's
-policy checks carry `session_id = "platform:user_id"`, so a wire policy
-engine sees who asked — the raw platform id goes to the policy server
-with every check, so the operator should choose an engine they trust.
-The config file is read once at startup. While a config is set,
-`AMPARO_CHAT_ALLOWLIST` is ignored. Approval presses are attributed:
-only the user who started a task can decide it; anyone else pressing the
-buttons gets a polite toast and the approval stays pending.
-
-Deny-by-default: without `--policy-url` or `--allow-all`, every tool call is
-refused — `--allow-all` is an explicit opt-in for local experiments. Calls
-that need approval ask **y/N at the terminal** (60s timeout; closed or
-non-terminal stdin auto-denies), with `--auto-approve`/`--auto-deny`
-overrides. stdout carries the final answer only — progress, gate decisions
-and the report go to stderr — so `amparo run` scripts cleanly.
-
-## Controlled growth
-
-The lab notebook (M6a) records how the agent actually behaves, so growth
-is measurable and inspectable instead of silent. With `--growth` (on
-`amparo run` or `amparo chat`; the last `--growth`/`--no-growth` wins),
-every completed or failed task is appended as one JSON line to
-`<workspace>/.amparo/notebook/records.jsonl`: the PII-stripped task text
-(emails become `[EMAIL_1]`, nothing is recoverable — records are
-archival), a hash of the tool sequence, the per-call gate log (decision,
-reasons, escalation, approval, outcome), the verification outcome, a
-truncated final answer, duration and a token-cost estimate. Each record
-carries a tenant tag — `cli` for runs, `platform:user_id` for chat tasks
-— so one notebook can serve many users. Recording is **off by default**:
-without the flag, no record file is ever created. In chat mode the
-workspace root is `AMPARO_WORKSPACE`, or the current directory when it
-is unset (records land in `./.amparo/notebook/`).
-
-With `--growth` the notebook also becomes the verification case library
-(M6b): prior same-tenant records resembling the task are retrieved into
-the self-verification prompt as read-only observations ("Prior cases in
-this tenant…"), formatted as evidence, never as instructions, and never
-shown to the action loop. Growth is write + read — one opt-in, and still
-off by default.
-
-`--growth` also enables gated skills (M6c). A skill is a named
-procedure — preconditions, an ordered list of tool-call steps, an
-expected outcome — managed with `amparo skill add|propose|list|show|
-adopt`. Adoption runs the same gate chain as a tool call (a policy check
-on `use_skill`) plus human approval showing the full step plan; the
-`Proposer` distills recurring VERIFIED tool sequences from the notebook
-into inert candidate proposals, but nothing is adopted automatically. At
-execution the model may call `use_skill`, and the loop expands it into
-its steps — each gated, run and recorded individually, so a skill can
-never grant its steps an exemption. Skills live under
-`<workspace>/.amparo/skills/`; without `--growth` the `use_skill` tool is
-not registered at all. Growth is write + read + act — still one opt-in,
-still off by default.
-
-Adopted skills are falsifiable instruments (M6d): every use, VERIFIED
-rate, mean steps and per-step denial is derived from the run records, and
-a skill that no longer holds retires — disabled with notification, never
-deleted. Two automatic events retire: **policy drift** (a dry-run of the
-step plan through the gate chain — no execution, no approval — would now
-deny a step it previously allowed), re-checked at every `--growth` task
-start with the task's own policy, ceiling and registry; and
-**performance** (VERIFIED rate below 50% over the last 20 uses, with a
-3-use floor so a young skill is never retired early). `amparo skill
-check` runs both on demand (cron-able — exit 0 even when retirements
-fire; `--dry-run` reports without writing; `--min-verified-rate` /
-`--window` / `--trust-ceiling` override the defaults), `amparo skill
-retire <name> [--reason ...]` is the operator lever, `list` shows a
-metrics tail and `show` keeps the full metrics, re-check and retirement
-history — retired skills stay inspectable forever.
-
-The lab notebook has a hot layer over the cold archive (M6e). The cold
-archive (`records.jsonl`) keeps the full record of every `--growth`
-task, untouched. The hot layer — the informative subset the case
-library actually reads — lives beside it under
-`<workspace>/.amparo/notebook/`: `hot.jsonl` (same record ids and
-timestamps as the cold archive, content capped at `--max-bytes`,
-default 4096), `hot-hashes.jsonl` (the dedupe index), `rollup.json`
-(the promotion offset and last-fold stamp), `promoted.jsonl`
-(operator promotions) and `rollup.lock`. Every `--growth` task start
-promotes the cold tail into the hot layer — records with a gate event
-of interest (approval, denial, escalation) or a tool sequence not seen
-before — and folds it daily (rows older than 90 days fold into the
-cold archive; operator-promoted rows are exempt). The operator's
-levers: `amparo notebook list|promote|rollup` — `promote` pins one
-record into the hot layer, `rollup` forces promote + fold on demand
-(cron-able, exit 0; `--dry-run` writes nothing). The cold archive is
-never modified by any of this — it is the record, not a cache.
-
-## Instrumentation & hardening
-
-M7 adds three instruments that make the agent legible while it works —
-answering, for every executed action, *who allowed it and under what
-policy* (see `docs/m7-instrumentation.md`).
-
-**The privacy ledger** is always-on — `--growth` or not — in both
-hosts. Every execution attempt of `web_search`, `fetch_url` or
-`run_command` appends one JSON line to
-`<workspace>/.amparo/privacy/ledger.jsonl`: the tool, the host at most
-(never a path, query or command), the outcome (`ok` / `error` /
-`denied`), and whether a human approved or denied it. A human denial
-writes its row immediately — the denial is itself the answer the
-ledger exists to record. Every PII strip is a row too: per-category
-counts, never values. A ledger failure warns (`[ledger] …`) and never
-fails the task. `amparo privacy [--workspace DIR] [--tenant T]
-[--last N]` is the reviewer's front door — a summary first, then the
-newest rows.
-
-**Session persistence** snapshots every task once per loop iteration
-to `<workspace>/.amparo/sessions/<tenant>/<task>.json` — PII-stripped,
-system-prompt-free, written atomically. A crashed CLI run resumes with
-`amparo run --resume` (newest incomplete checkpoint, no task argument;
-none → exit 1; stale `Running` > 7 days is skipped). The resumed loop
-re-judges every call through the gate chain — nothing carries a
-pre-approved verdict across the restart, and a resume opens no new
-notebook record: the checkpoint is the session trail. In chat, a new
-task receives the previous completed task's tail (last 6
-user/assistant messages + last tool summary) as one user-role context
-message — per-tenant, never a mid-loop resume, and chat never reads a
-`Running` checkpoint.
-
-**Preflight blast radius** labels every gated call before the approval
-question: `read_only` < `workspace_local` < `network` < `system_wide`
-< `destructive`. The label is display-only — classification runs after
-the gate has decided and feeds nothing back, so a wrong label can only
-misdescribe the approval text, never allow or block anything (I1). It
-renders as a `[preflight] blast radius: …` line in CLI approvals and
-the same line in chat approval messages: the human approves a concrete
-consequence, not an abstraction.
-
-## WASM sandbox + ledger quota
-
-M7b adds the two features M7 deliberately excluded (see
-`docs/m7b-sandbox-quota.md`).
-
-**The `eval_wasm` tool** executes an untrusted WebAssembly module the
-model produced, inside a fuel-metered sandbox (10M fuel, 4 MB module,
-4 MB memory, 30 s wall clock; no imports, no WASI — a module that
-passes validation can compute, and nothing else). The module arrives
-base64-encoded and obeys a fixed ABI: export `memory` and
-`axiom_eval(i32, i32, i32, i32) -> i32`, read the input at offset 0,
-write JSON output to the given `output_ptr`, return bytes written or
-−1. Trust tier is `ExternalEffector`, so executing untrusted code
-always asks a human — and the preflight label is honestly
-`read_only` (a pure, bounded computation; the sandbox observes and
-modifies nothing outside itself). `eval_wasm` never leaves the
-machine, so it writes no privacy-ledger row. Hosts register the tool
-themselves: `amparo run`, `amparo chat`, `amparo chat dispatch`, and
-MCP serve (auto-deny there until allowed).
-
-**The ledger quota lever** bounds the always-on privacy ledger when the
-operator asks for it: `--ledger-max-bytes N` on `amparo run` (plain
-bytes or `K`/`M`/`G` suffixes; garbage → exit 2), or
-`ledger_max_bytes` on a chat-config profile (per-tenant). When an
-append would push the file past the quota, the oldest rows rotate off
-and a marker row — newest in the file — records exactly how many rows
-were dropped: the loss of audit completeness is itself an audited
-event, and it only happens because the operator set the quota. The
-default stays unbounded, so the M7 audit guarantee is unchanged for
-anyone who didn't opt in. `amparo privacy` reports the bound, the file
-size, rotations and dropped rows.
-
-## Sub-agents & scheduling
-
-M8 brings the two advanced-system features screened in
-`docs/swarms-advanced.md` behind the same gate chain every Amparo tool
-passes (see `docs/m8-swarms.md`). **The one rule: no member exits the
-gate chain.**
-
-**`spawn_agent`** lets a task decompose itself into sub-agents. A
-sub-agent is the same loop with the same gate chain, the parent's trust
-ceiling, and the parent's config; spawning is itself a gated tool call
-(`ExternalEffector`), so creating an acting entity always asks a human.
-The delegation chain is legible everywhere: child task ids chain
-(`sess-123.1`, `sess-123.1.1`), checkpoints carry `parent_task_id`,
-ledger rows carry `task_id`/`parent_task_id`, and the approval copy
-names who is asking (`[session] sub-agent sess-123.1 of task sess-123
-wants to run:`). A **swarm budget** (`--max-sub-agents`, default 4; `0`
-turns swarms off) is shared across generations and fails closed at the
-limit — past it, no agent exists. Every report states what the swarm
-burned — tool calls and a cost line with its method attached
-(`~$0.04 in inference (estimate, chars/4, $3/1M tokens)`) — as
-`[swarm]` in the CLI, appended to the final answer in chat.
-
-**`schedule`** is a promise, not an execution (per-tenant in chat;
-M10 adds it to `amparo run` as a process-scoped, best-effort queue —
-see Coordination & surfaces):
-the model commits to an RFC 3339 instant, the promise is written
-PII-stripped to `<workspace>/.amparo/schedule/`, and the chat driver's
-30 s ticker fires each due promise back through the full gate chain as
-its original requester — under a timeout wrapper that auto-denies when
-nobody answers, never silently ahead of the gate. A promise past its
-60 s grace window is marked **missed** — fail-closed, never fired
-late; re-scheduling is the operator's call. `amparo schedule
-list|cancel` inspects the queue (cancel is a status change, never a
-deletion).
-
-Per-tenant swarm profiles in the TOML chat config:
-
-```toml
-[users."telegram:444555666".swarm]
-max_sub_agents = 2     # default 4; 0 turns swarms off
-schedule = true        # opens the schedule tool for this tenant
-```
-
-A model is never the approver: supervisor agents are excluded by
-design. `spawn_agent` stays absent from `amparo chat dispatch` — that
-path has no session, no delegation chain, no audit — and M10 opens it
-on the MCP surface as an explicit opt-in: `amparo mcp-serve
---max-sub-agents N` registers it under the shared budget (see
-Coordination & surfaces).
-
-## Verification & QA
-
-M9 makes the agent checkable (see `docs/m9-verification-qa.md`).
-**The QC council** runs deterministic rule auditors beside policy —
-after the loop produces a candidate final answer, before the
-verification prompt. Four rules fire on the run's own records
-(unexecuted-tool claims, evidence left the context, divergent
-inference-cost claims, residual PII shapes as category counts) and
-append **advisory** findings to the verification prompt; verification
-stays the model's call, and nothing the council produces auto-tunes
-anything. **`amparo doctor`** is the operator's QA pass: one
-read-only sweep over the workspace and configured surfaces (ledger,
-checkpoints, notebook, skills, schedule, policy reachability — with
-`--probe` sending one real check — and the chat config), exit 0
-healthy / 1 problems / 2 usage, cron-able. **The audit-mode notice**
-prints exactly once per process when a wire policy engine first
-answers `enforced: false` — `policy engine is in audit mode;
-verdicts are advisory` — and **session tagging**
-(`--session-id`, defaulting to the task id) attaches the caller to
-every engine-side audit row.
-
-## Coordination & surfaces
-
-M10 adds the surfaces M8 deferred and the seam the web surface builds
-on (see `docs/m10-coordination-surfaces.md`). **The one rule holds:
-no member exits the gate chain.**
-
-**The blackboard** — `blackboard_read`/`blackboard_write` over
-`<workspace>/.amparo/blackboard/board.jsonl`: an append-only
-coordination board every member of the delegation chain shares (last
-write per key wins on read; every row kept). Rows carry no writer
-identity — the trusted writer (the loop's task id) rides in the
-`[bus]` event.
-
-**`send_notification`** — an ExternalEffector tool behind a transport
-seam: stderr by default, a webhook with `amparo run --webhook-url URL`
-(POSTs `{"destination", "message"}` JSON); the chat hosts wire their
-platform transports. The approval copy names the destination; a
-transport failure is a failed tool result, never a task crash.
-
-**Rollback groups** — display-only undo hints: destructive file calls
-back up the previous contents to `<path>.amparo-bak` (fail-closed —
-no backup, no write) and the approval copy shows the undo
-(`[rollback]` lines in the event stream). Nothing executes an undo
-automatically — that would be auto-policy (I1).
-
-**The web-approval seam** — `--approval-endpoint URL` on
-`amparo run` and `amparo mcp-serve` asks a web UI for the human's
-decision: the gate POSTs the full approval request (tool, arguments,
-reasons, blast radius, session label, rollback hint) and polls for
-the decision — 60 s fail-closed, mutually exclusive with
-`--auto-approve`. The web never holds policy keys and never changes
-verdict logic (`docs/web-surface.md`, contract v3).
-
-**MCP spawn + CLI scheduling** — `amparo mcp-serve
---max-sub-agents N` registers `spawn_agent` (opt-in; absent or `0` =
-no spawn tool) under the shared spawn budget. `amparo run` always
-registers `schedule`: the CLI is process-scoped (no daemon), so due
-promises fire at run start — concurrently with the main task,
-through the same gate chain, sharing provider/policy/approval/flags;
-`--resume` is a run start too. Missed = fail-closed, never fired
-late — best-effort by design. A fire gets a reduced tool set (no
-`spawn_agent`, no `schedule`): unattended spawn chains would break
-the attribution chain.
-
-## What Amparo is meant to be
-
-An agent that runs a real tool-use loop — shell, files, git, web, tests — where
-**every tool call passes a policy check before it executes**, and where the
-model driving the loop is yours to choose.
-
-Three commitments shape the design:
-
-**Bring your own LLM.** Anthropic, OpenAI, or any OpenAI-compatible endpoint
-(Ollama, vLLM, OpenRouter, Together, Groq). No bundled model, no required
-sidecar, no vendor with a privileged position in the loop.
-
-**Policy is an interface, not a product.** The gate between "the model decided
-to do this" and "this ran" is an open interface with an open wire protocol.
-Amparo ships a default engine; [Guardrail](https://elai-intelligence.com) is a
-commercial implementation of the same interface. Anyone can write another. The
-default is **deny**, not allow — an agent whose policy engine waves everything
-through is worse than one with no policy engine, because it looks safe.
-
-**Engram is recommended, never required.** Memory is an interface with a
-built-in default store; [Engram](https://github.com/El-AI-Intelligence/Engram)
-is the recommended memory backend — durable, private, syncable across devices —
-but Amparo runs without it. Amparo must never hard-depend on a memory product,
-its own or anyone else's.
-
-**Deployable anywhere.** A standalone server, a container, a systemd unit, a
-chat bot. Not welded to a desktop session, not dependent on a GUI.
-
-## Native integrations
-
-Amparo is built so its companions are recommended, never required — the
-degradation path is the "never required" path, exercised by design.
-
-**Engram memory backend.** With `AMPARO_MEMORY_BACKEND=engram`, the
-memory-search tool answers from an Engram vault over engramd's REST surface
-(`AMPARO_ENGRAM_URL`, default `http://127.0.0.1:8787`; optional
-`AMPARO_ENGRAM_KEY` for keyed daemons). The daemon is probed once at startup —
-down means one warning and the built-in store, and a mid-run outage degrades
-searches to empty rather than crashing the loop.
-
-**Guardrail policy engine.** Point `--policy-url` at a Guardrail engine (or
-any wire-protocol engine) with `AMPARO_POLICY_KEY`, and every tool call is
-checked there before it runs. Audit-mode verdicts (`enforced:false`) are
-visible, never silent — one stderr line names the mode ("policy engine is in
-audit mode; verdicts are advisory") — and an unreachable engine escalates
-through the fail-safe path: it never fails open.
-
-**Graceful degradation.** Remove both companions and Amparo still runs: the
-built-in memory store and the local default engine (deny-by-default).
-`amparo doctor --engram-url … --policy-url … --probe` sweeps both surfaces for
-the operator.
-
-**The trial bundle.** [docs/trial-bundle.md](docs/trial-bundle.md) pairs the
-public reveal with one month of Engram's personal tier and Guardrail's policy
-enforcement, degrading to the existing free tiers at expiry — nothing breaks,
-nothing is silently waived. Amparo's side of that promise is the degradation
-above, already exercised.
+(`users/<platform>-<user_id>` by default; absolute and `..` paths are
+rejected). Policy checks carry `session_id = "platform:user_id"`, so a
+wire policy engine sees who asked. Approval presses are attributed: only
+the user who started a task can decide it.
 
 ## Roadmap
 
 | # | Milestone | State |
 |---|---|---|
 | 1 | Provider abstraction — Anthropic + OpenAI-compatible | ✅ done |
-| 2 | Native tool calling (replacing text-parsed ReAct) | ✅ landed — loop + MCP client/server, 260 tests green |
+| 2 | Native tool calling (replacing text-parsed ReAct) | ✅ landed — loop + MCP client/server |
 | 3 | Install path + release — the `amparo` CLI drives the loop end-to-end (headless: no screen/desktop tools in the registry) | ✅ done |
-| 4 | Chat adapters — Telegram first, then Discord and Slack | ✅ done — all three behind one transport seam, inline-button approval |
+| 4 | Chat adapters — Telegram, Discord, Slack | ✅ done — one transport seam, inline-button approval |
 | 5 | Multi-tenant identity and per-user policy | ✅ done — TOML tenant directory, per-user ceilings/workspaces, attributed approvals |
-| 6 | Controlled self-improvement | ✅ done — M6a + M6b + M6c + M6d + M6e landed: the lab notebook (`--growth`, PII-stripped run records), the verification case library (same-tenant evidence in the verification prompt only), gated skills (adopted procedures executed step-by-step through the gate chain), metrics + retirement (running per-skill records, startup drift re-checks, `amparo skill check|retire`), and rollup + archival (the hot layer over the cold archive, `amparo notebook list|promote|rollup`) |
-| 7 | Instrumentation & hardening | ✅ landed — the always-on privacy ledger (every network-touching execution attempt and human denial, every PII strip as counts; `amparo privacy`), session persistence (`amparo run --resume` for crashed runs, per-tenant chat continuity from completed tasks), and preflight blast-radius classification (display-only labels in the approval copy) |
-| 8 | WASM eval sandbox + ledger quota | ✅ landed — the `eval_wasm` tool (fuel-metered, deterministic, approval-gated sandbox for untrusted computation; honestly labeled `read_only` in preflight) and the opt-in ledger quota lever (`--ledger-max-bytes`, per-tenant chat quotas; rotation marker rows record exactly what was dropped) |
-| 9 | Sub-agents & scheduling | ✅ landed — `spawn_agent` (a sub-agent is the same loop, gate chain, and ceiling; the delegation chain is in the ids, checkpoints, ledger rows, and approval copy; the shared budget fails closed) and `schedule` (a persisted promise re-entering the gate chain as its requester; missed = fail-closed), plus the swarm report with the cost line |
-| 10 | Verification & QA | ✅ landed — the QC council (deterministic rule auditors beside policy: findings feed the verification prompt, verification stays the model's call), `amparo doctor` (the operator's read-only workspace sweep, exit 0/1/2), and the audit-mode stderr notice + session tagging (`--session-id`, defaulting to the task id) |
-| 11 | Coordination & surfaces | ✅ landed — the blackboard (`blackboard_read`/`blackboard_write`, `[bus]` rows), `send_notification` (transport seam — stderr or webhook), rollback groups (display-only undo hints + `.amparo-bak` backups), the web-approval seam (`--approval-endpoint`, 60 s fail-closed), MCP spawn (`--max-sub-agents`, opt-in, shared budget), and the CLI scheduler (due promises fire at run start, best-effort) |
-| 12 | Engram + Guardrail native, web surface | ✅ landed — the Engram memory backend (`AMPARO_MEMORY_BACKEND=engram`, one probe + one warn, mid-run degradation to the built-in store), Guardrail-native policy (`amparo doctor` probes both companions and reports audit mode; the wire engine already conformed), and the web surface live at amparo.ellmstack.dev (thin MCP bridge + web-approval seam; the app holds no policy keys) |
+| 6 | Controlled self-improvement | ✅ done — the lab notebook (`--growth`, PII-stripped run records), the verification case library, gated skills, metrics + retirement, rollup + archival |
+| 7 | Instrumentation & hardening | ✅ landed — the always-on privacy ledger, session persistence (`amparo run --resume`), preflight blast-radius classification |
+| 8 | WASM eval sandbox + ledger quota | ✅ landed — the `eval_wasm` tool (fuel-metered, approval-gated) and the opt-in ledger quota lever |
+| 9 | Sub-agents & scheduling | ✅ landed — `spawn_agent` (same loop, gate chain, ceiling; shared budget fails closed) and `schedule` (persisted promise re-entering the gate chain; missed = fail-closed) |
+| 10 | Verification & QA | ✅ landed — the QC council, `amparo doctor`, the audit-mode stderr notice + session tagging |
+| 11 | Coordination & surfaces | ✅ landed — the blackboard, `send_notification`, rollback groups, the web-approval seam, MCP spawn, the CLI scheduler |
+| 12 | Engram + Guardrail native, web surface | ✅ landed — the Engram memory backend, Guardrail-native policy, and the web surface live at amparo.ellmstack.dev |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant
