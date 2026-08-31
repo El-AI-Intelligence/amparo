@@ -199,8 +199,8 @@ to the box; the `.gitignore` decision for `web/` is the operator's.
   untracked by design and edited on disk only (server.mjs, app.js,
   deploy files, test harness) — verified by the local smoke acceptance
   plus a drill of the new semantics (ticket one-shot 401 on replay,
-  `?token=` rejected, duplicate 409, rate limit 429) and deployed to
-  the box.
+  `?token=` rejected, duplicate 409, rate limit 429); the box deploy is
+  the operator's next step.
 
 ## Operator note
 
