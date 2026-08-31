@@ -247,6 +247,11 @@ impl ToolExecutor for MemoryWriteTool {
                 )
             }
         };
+        // Strip PII before persistence (audit 2026-08-31 MED-4) — this is
+        // the one agent-facing path that forwards content to the store,
+        // so it inherits the notebook's discipline: placeholders persist,
+        // originals never do.
+        let content = amparo_privacy::secure_minions_strip(&content).sanitised_text;
         match self.store.store(content.clone()).await {
             Ok(id) => make_result(
                 call,
@@ -312,5 +317,26 @@ mod tests {
         let res = search.execute(&call).await;
         assert!(res.success);
         assert_eq!(res.output["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn memory_store_strips_pii_before_persisting() {
+        // Audit 2026-08-31 MED-4: placeholders persist, originals never
+        // do — including through the store an Engram adapter forwards
+        // over the wire.
+        let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let write = MemoryWriteTool::with_store(Arc::clone(&store));
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "memory_store".to_string(),
+            arguments: serde_json::json!({"content": "reach me at alice@example.com"}),
+        };
+        let res = write.execute(&call).await;
+        assert!(res.success);
+        let hits = store.search("reach", 5).await;
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].content.contains("alice@example.com"));
+        assert!(hits[0].content.contains("[EMAIL_"));
     }
 }

@@ -37,7 +37,9 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
 
 /// Searches the web, trying backends in order (SearXNG, Brave Search,
 /// DuckDuckGo Instant Answers) with automatic fallback when one fails.
-/// Trusted at `Observational`.
+/// Trusted at [`ToolTrustTier::Network`]: the query leaves the machine, so
+/// the tool is policy-decidable rather than purely observational; approval
+/// comes only via Escalate (audit 2026-08-31 MED-2).
 pub struct WebSearchTool;
 
 impl WebSearchTool {
@@ -263,7 +265,7 @@ impl ToolExecutor for WebSearchTool {
                     required: false,
                 },
             ],
-            trust_tier: ToolTrustTier::Observational,
+            trust_tier: ToolTrustTier::Network,
         }
     }
 
@@ -395,7 +397,10 @@ impl ToolExecutor for WebSearchTool {
 // ─────────────────────────────────────────────────── FetchUrlTool ─────────────
 
 /// Fetches a URL and returns its content as readable text, stripping HTML and
-/// requiring an `http://` or `https://` scheme. Trusted at `Observational`.
+/// requiring an `http://` or `https://` scheme. Trusted at
+/// [`ToolTrustTier::ExternalEffector`]: an arbitrary fetch touches the local
+/// network from the agent's machine (SSRF surface) and leaves the machine, so
+/// it requires human approval before execution (audit 2026-08-31 MED-2).
 pub struct FetchUrlTool;
 
 impl FetchUrlTool {
@@ -450,7 +455,7 @@ impl ToolExecutor for FetchUrlTool {
                     required: false,
                 },
             ],
-            trust_tier: ToolTrustTier::Observational,
+            trust_tier: ToolTrustTier::ExternalEffector,
         }
     }
 
@@ -553,5 +558,31 @@ impl ToolExecutor for FetchUrlTool {
                 format!("Fetch failed: {}", e),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit 2026-08-31 MED-2: network I/O is not observational.
+    /// `web_search` is [`ToolTrustTier::Network`] (policy-decidable,
+    /// approval only via Escalate) and `fetch_url` is
+    /// [`ToolTrustTier::ExternalEffector`] (human approval for an
+    /// arbitrary fetch from the agent's machine).
+    #[test]
+    fn web_tools_are_not_observational() {
+        assert_eq!(
+            WebSearchTool::new().schema().trust_tier,
+            ToolTrustTier::Network
+        );
+        assert_eq!(
+            FetchUrlTool::new().schema().trust_tier,
+            ToolTrustTier::ExternalEffector
+        );
+        // The approval gate fires at ≥ ExternalEffector, so neither tier
+        // executes on a bare policy allow the way Observational would.
+        assert!(ToolTrustTier::Network < ToolTrustTier::ExternalEffector);
+        assert!(ToolTrustTier::ExternalEffector >= ToolTrustTier::ExternalEffector);
     }
 }

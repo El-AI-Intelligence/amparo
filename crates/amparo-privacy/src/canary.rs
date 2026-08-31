@@ -49,10 +49,7 @@ impl CanaryToken {
     /// The token is embedded in a natural-language wrapper so it blends into
     /// the system context and is unlikely to be echoed by an honest model.
     pub fn injection_fragment(&self) -> String {
-        format!(
-            "[internal-ref: amparo-ctx-{}]",
-            self.id
-        )
+        format!("[internal-ref: amparo-ctx-{}]", self.id)
     }
 }
 

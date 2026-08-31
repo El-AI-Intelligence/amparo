@@ -28,14 +28,18 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolTrustTier {
-    /// Read-only, no side effects (web search, memory read)
+    /// Read-only, no side effects (memory read, file reads)
     Observational = 0,
+    /// Network reads (web search) — traffic leaves the machine, so not
+    /// purely observational, but no side effects; policy-decidable,
+    /// approval only via Escalate (audit 2026-08-31 MED-2)
+    Network = 1,
     /// Write to local memory/workspace, no external side effects
-    LocalMutating = 1,
+    LocalMutating = 2,
     /// External side effects — requires human approval before execution
-    ExternalEffector = 2,
+    ExternalEffector = 3,
     /// System-level (run command, deploy) — requires human approval
-    SystemControl = 3,
+    SystemControl = 4,
 }
 
 // ─────────────────────────────────────────────────── Tool definition ─────────

@@ -94,7 +94,7 @@ FLAGS:
   --window N              check: evaluate the last N uses (default 20)
   --dry-run               check: report retirements without writing
                           anything (no Retire events, no re-check rows)
-  --trust-ceiling T       check: observational | local_mutating |
+  --trust-ceiling T       check: observational | network | local_mutating |
                           external_effector | system_control (default
                           system_control) — mirror the deployment ceiling
                           for the drift dry-run
@@ -240,6 +240,7 @@ fn parse_flags(args: Vec<String>, extras: FlagExtras) -> Result<(SkillFlags, Vec
             "--trust-ceiling" if extras == FlagExtras::Check => match iter.next() {
                 Some(tier) => match tier.as_str() {
                     "observational" => flags.trust_ceiling = ToolTrustTier::Observational,
+                    "network" => flags.trust_ceiling = ToolTrustTier::Network,
                     "local_mutating" => flags.trust_ceiling = ToolTrustTier::LocalMutating,
                     "external_effector" => flags.trust_ceiling = ToolTrustTier::ExternalEffector,
                     "system_control" => flags.trust_ceiling = ToolTrustTier::SystemControl,

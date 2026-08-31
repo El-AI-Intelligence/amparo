@@ -101,7 +101,11 @@ impl BlackboardStore {
         }
         let entry = BlackboardEntry {
             key: key.to_string(),
-            value: value.to_string(),
+            // Strip PII before persistence (audit 2026-08-31 MED-5) — the
+            // board is shared across the whole delegation chain, so it
+            // follows the same discipline as the notebook: placeholders
+            // persist, originals never do.
+            value: amparo_privacy::secure_minions_strip(value).sanitised_text,
             written_at: chrono::Utc::now().to_rfc3339(),
         };
         if let Some(parent) = self.path.parent() {
@@ -315,6 +319,21 @@ mod tests {
             Some(&Value::String("in progress".into()))
         );
         assert!(store.path().ends_with(".amparo/blackboard/board.jsonl"));
+    }
+
+    #[test]
+    fn write_strips_pii_before_persisting() {
+        // Audit 2026-08-31 MED-5: the board is shared across the whole
+        // delegation chain, so raw values never land on disk.
+        let store = BlackboardStore::new(temp_root());
+        store.write("contact", "call 555-123-4567").unwrap();
+        let board = store.read().unwrap();
+        let value = board
+            .get("contact")
+            .and_then(|v| v.as_str())
+            .expect("contact value present");
+        assert!(!value.contains("555-123-4567"));
+        assert!(value.contains("[PHONE_"));
     }
 
     #[test]

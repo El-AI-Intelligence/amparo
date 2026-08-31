@@ -29,24 +29,23 @@ use thiserror::Error;
 #[derive(Default)]
 pub enum PrivacyLevel {
     /// All processing stays on-device.  Nothing leaves the local machine.
-    StrictLocal  = 0,
+    StrictLocal = 0,
     /// May leave the device for user-controlled infrastructure (e.g. own VPS).
-    Hybrid       = 1,
+    Hybrid = 1,
     /// May be sent to cloud providers (Ollama cloud, OpenAI, etc.).
     #[default]
-    CloudFirst   = 2,
+    CloudFirst = 2,
     /// Enterprise-managed: governed by tenant compliance mode.
-    Enterprise   = 3,
+    Enterprise = 3,
 }
-
 
 impl std::fmt::Display for PrivacyLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::StrictLocal => write!(f, "strict_local"),
-            Self::Hybrid      => write!(f, "hybrid"),
-            Self::CloudFirst  => write!(f, "cloud_first"),
-            Self::Enterprise  => write!(f, "enterprise"),
+            Self::Hybrid => write!(f, "hybrid"),
+            Self::CloudFirst => write!(f, "cloud_first"),
+            Self::Enterprise => write!(f, "enterprise"),
         }
     }
 }
@@ -56,10 +55,10 @@ impl std::str::FromStr for PrivacyLevel {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "strict_local" => Ok(Self::StrictLocal),
-            "hybrid"       => Ok(Self::Hybrid),
-            "cloud_first"  => Ok(Self::CloudFirst),
-            "enterprise"   => Ok(Self::Enterprise),
-            _              => Err(PrivacyError::InvalidLevel(s.to_string())),
+            "hybrid" => Ok(Self::Hybrid),
+            "cloud_first" => Ok(Self::CloudFirst),
+            "enterprise" => Ok(Self::Enterprise),
+            _ => Err(PrivacyError::InvalidLevel(s.to_string())),
         }
     }
 }
@@ -116,9 +115,18 @@ impl Default for PrivacyPolicy {
         Self {
             default_level: PrivacyLevel::CloudFirst,
             category_overrides: vec![
-                CategoryOverride { category: DataCategory::HealthData, level: PrivacyLevel::StrictLocal },
-                CategoryOverride { category: DataCategory::FinancialData, level: PrivacyLevel::Hybrid },
-                CategoryOverride { category: DataCategory::BiometricData, level: PrivacyLevel::StrictLocal },
+                CategoryOverride {
+                    category: DataCategory::HealthData,
+                    level: PrivacyLevel::StrictLocal,
+                },
+                CategoryOverride {
+                    category: DataCategory::FinancialData,
+                    level: PrivacyLevel::Hybrid,
+                },
+                CategoryOverride {
+                    category: DataCategory::BiometricData,
+                    level: PrivacyLevel::StrictLocal,
+                },
             ],
             blocked_domains: Vec::new(),
             allowed_domains: Vec::new(),
@@ -193,9 +201,8 @@ pub fn evaluate(
     // 3. StrictLocal blocks any cloud target
     if effective_level == PrivacyLevel::StrictLocal && target_domain.is_some() {
         let domain = target_domain.unwrap_or("unknown");
-        let is_local = domain.contains("localhost")
-            || domain.contains("127.0.0.1")
-            || domain.contains("::1");
+        let is_local =
+            domain.contains("localhost") || domain.contains("127.0.0.1") || domain.contains("::1");
         if !is_local {
             return PrivacyDecision {
                 allowed: false,
@@ -277,9 +284,44 @@ pub fn secure_minions_strip(text: &str) -> SecureMinionsRequest {
     let mut pii_map = Vec::new();
     let mut counter = 0u32;
 
+    // API key shapes first — a key token may contain digit runs the
+    // phone/SSN/card patterns would otherwise match and fragment, leaking
+    // the rest of the token (audit 2026-08-31 LOW-8). The more specific
+    // prefixes come before the generic `sk-` so each token is consumed
+    // whole.
+    let key_patterns: [(&str, &str); 6] = [
+        (r"sk-ant-[A-Za-z0-9_\-]{16,}", "anthropic"),
+        (r"sk-[A-Za-z0-9_\-]{16,}", "openai_style"),
+        (r"ghp_[A-Za-z0-9]{20,}", "github"),
+        (r"github_pat_[A-Za-z0-9_]{20,}", "github"),
+        (r"xox[bap]-[A-Za-z0-9\-]{16,}", "slack"),
+        (r"\bAKIA[0-9A-Z]{16}\b", "aws"),
+    ];
+    for (pattern, vendor) in key_patterns {
+        let key_re = regex::Regex::new(pattern).unwrap();
+        for cap in key_re.find_iter(text) {
+            // `sk-ant-` tokens also match the generic `sk-` pattern on
+            // the same span — keep one placeholder per key.
+            if pii_map
+                .iter()
+                .any(|p: &PiiPlaceholder| p.original == cap.as_str())
+            {
+                continue;
+            }
+            counter += 1;
+            let token = format!("[APIKEY_{}]", counter);
+            pii_map.push(PiiPlaceholder {
+                token: token.clone(),
+                original: cap.as_str().to_string(),
+                category: format!("api_key:{vendor}"),
+            });
+            sanitised = sanitised.replacen(cap.as_str(), &token, 1);
+        }
+    }
+
     // Email pattern
-    let email_re = regex::Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
-        .unwrap();
+    let email_re =
+        regex::Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b").unwrap();
     for cap in email_re.find_iter(text) {
         counter += 1;
         let token = format!("[EMAIL_{}]", counter);
@@ -292,9 +334,9 @@ pub fn secure_minions_strip(text: &str) -> SecureMinionsRequest {
     }
 
     // Phone pattern (US-style)
-    let phone_re = regex::Regex::new(
-        r"\b(?:\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b",
-    ).unwrap();
+    let phone_re =
+        regex::Regex::new(r"\b(?:\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b")
+            .unwrap();
     for cap in phone_re.find_iter(text) {
         counter += 1;
         let token = format!("[PHONE_{}]", counter);
@@ -320,9 +362,7 @@ pub fn secure_minions_strip(text: &str) -> SecureMinionsRequest {
     }
 
     // Credit card pattern (16-digit with separators)
-    let cc_re = regex::Regex::new(
-        r"\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b",
-    ).unwrap();
+    let cc_re = regex::Regex::new(r"\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b").unwrap();
     for cap in cc_re.find_iter(text) {
         counter += 1;
         let token = format!("[CREDITCARD_{}]", counter);
@@ -335,9 +375,7 @@ pub fn secure_minions_strip(text: &str) -> SecureMinionsRequest {
     }
 
     // Password contextual patterns: "password is X", "password: X", "my password X"
-    let pwd_re = regex::Regex::new(
-        r"(?i)\b(my\s+)?password\s*(?:is|:|=)\s*(\S+)",
-    ).unwrap();
+    let pwd_re = regex::Regex::new(r"(?i)\b(my\s+)?password\s*(?:is|:|=)\s*(\S+)").unwrap();
     for cap in pwd_re.captures_iter(text) {
         if let Some(m) = cap.get(0) {
             counter += 1;
@@ -352,9 +390,8 @@ pub fn secure_minions_strip(text: &str) -> SecureMinionsRequest {
     }
 
     // Address contextual patterns: "my address is X", "I live at X"
-    let addr_re = regex::Regex::new(
-        r"(?i)\b(?:my address is|i live at|address:)\s+([^\n.]{5,60})",
-    ).unwrap();
+    let addr_re =
+        regex::Regex::new(r"(?i)\b(?:my address is|i live at|address:)\s+([^\n.]{5,60})").unwrap();
     for cap in addr_re.captures_iter(text) {
         if let Some(m) = cap.get(0) {
             counter += 1;
@@ -371,7 +408,8 @@ pub fn secure_minions_strip(text: &str) -> SecureMinionsRequest {
     // Medical contextual patterns: "I have [condition]", "diagnosed with [condition]"
     let medical_re = regex::Regex::new(
         r"(?i)\b(?:i have|diagnosed with|i suffer from|my condition is)\s+([a-z][^\n.]{2,50})",
-    ).unwrap();
+    )
+    .unwrap();
     for cap in medical_re.captures_iter(text) {
         if let Some(m) = cap.get(0) {
             counter += 1;
@@ -410,7 +448,12 @@ mod tests {
     #[test]
     fn default_policy_blocks_health_to_cloud() {
         let policy = PrivacyPolicy::default();
-        let decision = evaluate(&policy, None, DataCategory::HealthData, Some("api.openai.com"));
+        let decision = evaluate(
+            &policy,
+            None,
+            DataCategory::HealthData,
+            Some("api.openai.com"),
+        );
         assert!(!decision.allowed);
         assert_eq!(decision.effective_level, PrivacyLevel::StrictLocal);
     }
@@ -429,7 +472,12 @@ mod tests {
             blocked_domains: vec!["evil.com".to_string()],
             ..Default::default()
         };
-        let decision = evaluate(&policy, None, DataCategory::Chat, Some("https://evil.com/api"));
+        let decision = evaluate(
+            &policy,
+            None,
+            DataCategory::Chat,
+            Some("https://evil.com/api"),
+        );
         assert!(!decision.allowed);
     }
 
@@ -447,8 +495,14 @@ mod tests {
 
     #[test]
     fn parse_privacy_level() {
-        assert_eq!("strict_local".parse::<PrivacyLevel>().unwrap(), PrivacyLevel::StrictLocal);
-        assert_eq!("cloud_first".parse::<PrivacyLevel>().unwrap(), PrivacyLevel::CloudFirst);
+        assert_eq!(
+            "strict_local".parse::<PrivacyLevel>().unwrap(),
+            PrivacyLevel::StrictLocal
+        );
+        assert_eq!(
+            "cloud_first".parse::<PrivacyLevel>().unwrap(),
+            PrivacyLevel::CloudFirst
+        );
         assert!("invalid".parse::<PrivacyLevel>().is_err());
     }
 
@@ -478,6 +532,52 @@ mod tests {
         assert!(result.pii_found);
         assert!(!result.sanitised_text.contains("123-45-6789"));
         assert!(result.pii_map.iter().any(|p| p.category == "ssn"));
+    }
+
+    #[test]
+    fn secure_minions_strip_api_keys() {
+        let text = "Use sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234 or \
+                    sk-abcdefghijklmnopqrstuvwxyz123456, then \
+                    ghp_abcdefghijklmnopqrstuvwxyz123456, \
+                    github_pat_abcdefghijklmnopqrstuvwxyz1234567890, \
+                    xoxb-123456789012-abcdefghijklmnop, and \
+                    AKIAIOSFODNN7EXAMPLE as fallback";
+        let result = secure_minions_strip(text);
+        assert!(result.pii_found);
+        for leaked in [
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234",
+            "sk-abcdefghijklmnopqrstuvwxyz123456",
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+            "github_pat_abcdefghijklmnopqrstuvwxyz1234567890",
+            "xoxb-123456789012-abcdefghijklmnop",
+            "AKIAIOSFODNN7EXAMPLE",
+        ] {
+            assert!(
+                !result.sanitised_text.contains(leaked),
+                "key shape survived the strip: {leaked}"
+            );
+        }
+        assert_eq!(
+            result
+                .pii_map
+                .iter()
+                .filter(|p| p.category.starts_with("api_key"))
+                .count(),
+            6,
+            "one api_key placeholder per key: {:?}",
+            result.pii_map
+        );
+        assert!(result.sanitised_text.contains("[APIKEY_"));
+    }
+
+    #[test]
+    fn secure_minions_strip_consumes_keys_before_digit_patterns() {
+        // The token embeds a `123-456-7890` shape; if the phone pattern
+        // ran first it would fragment the token and leak the remainder.
+        let text = "the key is sk-123-456-7890123456789012345";
+        let result = secure_minions_strip(text);
+        assert!(!result.sanitised_text.contains("123-456-7890"));
+        assert!(result.sanitised_text.contains("[APIKEY_"));
     }
 
     #[test]

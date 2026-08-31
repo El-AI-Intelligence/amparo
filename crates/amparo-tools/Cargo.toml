@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Amparo's tool registry: web, filesystem, shell, git, tests, build, memory"
 
 [dependencies]
+amparo-privacy = { path = "../amparo-privacy" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

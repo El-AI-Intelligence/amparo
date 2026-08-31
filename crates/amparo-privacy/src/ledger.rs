@@ -227,7 +227,11 @@ impl LedgerStore {
                 let _ = std::fs::remove_file(&sidecar);
             }
         }
-        Ok(Self { path, file: Mutex::new(file), quota: bound })
+        Ok(Self {
+            path,
+            file: Mutex::new(file),
+            quota: bound,
+        })
     }
 
     /// The path this store appends to.
@@ -240,7 +244,8 @@ impl LedgerStore {
     /// first (see [`LedgerQuota`]) — the appended row is never dropped
     /// by its own rotation.
     pub fn append(&self, row: &LedgerRow) -> Result<(), String> {
-        let line = serde_json::to_string(row).map_err(|e| format!("ledger row serialization failed: {e}"))?;
+        let line = serde_json::to_string(row)
+            .map_err(|e| format!("ledger row serialization failed: {e}"))?;
         let mut file = self.file.lock().unwrap();
         file.write_all(line.as_bytes())
             .and_then(|_| file.write_all(b"\n"))
@@ -349,7 +354,12 @@ impl LedgerStore {
             .create(true)
             .append(true)
             .open(&self.path)
-            .map_err(|e| format!("cannot reopen ledger {} after rotation: {e}", self.path.display()))?;
+            .map_err(|e| {
+                format!(
+                    "cannot reopen ledger {} after rotation: {e}",
+                    self.path.display()
+                )
+            })?;
         **file = reopened;
         Ok(())
     }
@@ -515,7 +525,12 @@ mod tests {
         // Simulate a crash mid-append: an unterminated partial line.
         let partial = serde_json::to_string(&row(LedgerKind::NetworkCall)).unwrap();
         let half: String = partial.chars().take(partial.len() / 2).collect();
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(half.as_bytes()).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(half.as_bytes())
+            .unwrap();
         assert_eq!(store.read_all().unwrap().len(), 1);
     }
 
@@ -574,7 +589,10 @@ mod tests {
                 None => counts.push((p.category.clone(), 1)),
             }
         }
-        let row = LedgerRow { pii_counts: counts, ..row(LedgerKind::PiiStrip) };
+        let row = LedgerRow {
+            pii_counts: counts,
+            ..row(LedgerKind::PiiStrip)
+        };
         let line = serde_json::to_string(&row).unwrap();
         assert!(!line.contains("alice@example.com"));
         assert!(!line.contains("555-123-4567"));
@@ -588,7 +606,10 @@ mod tests {
             site_host_only("https://example.com/a/b?q=1#frag"),
             Some("https://example.com".to_string())
         );
-        assert_eq!(site_host_only("http://127.0.0.1:11434/api"), Some("http://127.0.0.1:11434".to_string()));
+        assert_eq!(
+            site_host_only("http://127.0.0.1:11434/api"),
+            Some("http://127.0.0.1:11434".to_string())
+        );
         assert_eq!(site_host_only("not a url"), None);
     }
 
@@ -620,15 +641,25 @@ mod tests {
             let row = network_row(&format!("tool_{i:03}"));
             written.push(row.clone());
             store.append(&row).unwrap();
-            if store.read_all().unwrap().iter().any(|r| r.kind == LedgerKind::Rotated) {
+            if store
+                .read_all()
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == LedgerKind::Rotated)
+            {
                 break;
             }
         }
-        assert!(written.len() < 1000, "the quota must fire well before 1000 rows");
+        assert!(
+            written.len() < 1000,
+            "the quota must fire well before 1000 rows"
+        );
 
         let rows = store.read_all().unwrap();
         assert_eq!(
-            rows.iter().filter(|r| r.kind == LedgerKind::Rotated).count(),
+            rows.iter()
+                .filter(|r| r.kind == LedgerKind::Rotated)
+                .count(),
             1,
             "exactly one rotation so far"
         );
@@ -638,8 +669,10 @@ mod tests {
 
         // The survivors are exactly a suffix of what was written, in
         // order — oldest dropped, newest kept.
-        let survivors: Vec<&LedgerRow> =
-            rows.iter().filter(|r| r.kind != LedgerKind::Rotated).collect();
+        let survivors: Vec<&LedgerRow> = rows
+            .iter()
+            .filter(|r| r.kind != LedgerKind::Rotated)
+            .collect();
         assert_eq!(
             survivors.len() + marker.dropped_rows.unwrap(),
             written.len(),
@@ -663,7 +696,9 @@ mod tests {
         // first triggers one, and each rotation drops the two rows that
         // came before (the previous row and the previous marker) —
         // `dropped_rows` reports exactly that.
-        let store = LedgerStore::open_with_quota(dir.join("ledger.jsonl"), Some(LedgerQuota::new(160))).unwrap();
+        let store =
+            LedgerStore::open_with_quota(dir.join("ledger.jsonl"), Some(LedgerQuota::new(160)))
+                .unwrap();
         let mut last = network_row("t0");
         store.append(&last).unwrap();
         for i in 1..6 {
@@ -674,7 +709,11 @@ mod tests {
         assert_eq!(rows.len(), 2, "newest row + one marker: {rows:?}");
         assert_eq!(rows[0], last, "the newest row survives alone");
         assert_eq!(rows[1].kind, LedgerKind::Rotated);
-        assert_eq!(rows[1].dropped_rows, Some(2), "the previous row and the previous marker were dropped");
+        assert_eq!(
+            rows[1].dropped_rows,
+            Some(2),
+            "the previous row and the previous marker were dropped"
+        );
     }
 
     #[test]
@@ -686,7 +725,10 @@ mod tests {
             store.append(&network_row(&format!("tool_{i:03}"))).unwrap();
         }
         let rows = store.read_all().unwrap();
-        let rotations = rows.iter().filter(|r| r.kind == LedgerKind::Rotated).count();
+        let rotations = rows
+            .iter()
+            .filter(|r| r.kind == LedgerKind::Rotated)
+            .count();
         assert!(rotations >= 1, "the quota fires");
         assert!(
             rotations <= 40 / 2,
@@ -714,7 +756,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         entries.sort();
-        assert_eq!(entries, vec!["ledger.jsonl".to_string(), QUOTA_SIDECAR.to_string()]);
+        assert_eq!(
+            entries,
+            vec!["ledger.jsonl".to_string(), QUOTA_SIDECAR.to_string()]
+        );
         let content = std::fs::read_to_string(&path).unwrap();
         for line in content.lines() {
             assert!(
@@ -738,13 +783,19 @@ mod tests {
 
     #[test]
     fn summary_counts_rotations_and_dropped_rows() {
-        let first = LedgerRow { dropped_rows: Some(3), ..row(LedgerKind::Rotated) };
+        let first = LedgerRow {
+            dropped_rows: Some(3),
+            ..row(LedgerKind::Rotated)
+        };
         let call = LedgerRow {
             tool: Some("fetch_url".to_string()),
             outcome: Some("ok".to_string()),
             ..row(LedgerKind::NetworkCall)
         };
-        let second = LedgerRow { dropped_rows: Some(1), ..row(LedgerKind::Rotated) };
+        let second = LedgerRow {
+            dropped_rows: Some(1),
+            ..row(LedgerKind::Rotated)
+        };
         let pii = LedgerRow {
             pii_counts: vec![("email".to_string(), 1)],
             ..row(LedgerKind::PiiStrip)

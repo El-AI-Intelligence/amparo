@@ -133,6 +133,9 @@ pub fn classify_tier(registry: &ToolRegistry, call: &ToolCall) -> BlastRadius {
 
     match registry.get_tier(&call.name) {
         Some(ToolTrustTier::Observational) => BlastRadius::ReadOnly,
+        // Audit 2026-08-31 MED-2: network reads are their own tier — the
+        // label says what the tool is: traffic leaves the machine.
+        Some(ToolTrustTier::Network) => BlastRadius::Network,
         Some(ToolTrustTier::LocalMutating) => BlastRadius::WorkspaceLocal,
         Some(ToolTrustTier::ExternalEffector) => BlastRadius::Network,
         Some(ToolTrustTier::SystemControl) => BlastRadius::SystemWide,
