@@ -223,6 +223,22 @@ to the box; the `.gitignore` decision for `web/` is the operator's.
   only the append path flaked); the hand-rolled tokio-File write pattern
   was grep-verified workspace-unique. Verified: 8-way stress 1600/1600
   green (pre-fix ~1%), both gates green.
+- **closure sweep (2026-08-31)** — the final pre-reveal verification at
+  `1bf33eb` (the reveal-facing README rewrite). Both gates green with
+  zero warnings (`cargo test --workspace`, `cargo doc --workspace
+  --no-deps`); the tree is in sync with origin/main — the only untracked
+  paths are `docs/design.md`, `install/`, and `web/`, all untracked by
+  design. The cold archive is workspace-scoped runtime data
+  (`.amparo/notebook/records.jsonl`, written at run time): no tracked
+  fixture exists, so byte-identity is covered by the clean tree plus the
+  green M6e rollup suite. The first-run greeting script (#173) ships
+  untracked at `install/first-run-greeting.sh` as an installer asset.
+  Live web surface re-verified: the unit is active, the authed health
+  endpoint reports `contract: web-surface.md v4` with approval
+  passthrough on, and the public endpoint's 401 is the designed token
+  gate, not a regression. Remaining before the reveal are operator steps
+  only: the env-file cutover (replace the acceptance-phase mock LLM
+  lines with real inference/policy values) and the reveal call itself.
 
 ## Operator note
 
