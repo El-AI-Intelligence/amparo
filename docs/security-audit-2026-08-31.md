@@ -199,8 +199,18 @@ to the box; the `.gitignore` decision for `web/` is the operator's.
   untracked by design and edited on disk only (server.mjs, app.js,
   deploy files, test harness) — verified by the local smoke acceptance
   plus a drill of the new semantics (ticket one-shot 401 on replay,
-  `?token=` rejected, duplicate 409, rate limit 429); the box deploy is
-  the operator's next step.
+  `?token=` rejected, duplicate 409, rate limit 429).
+- **box deploy (2026-08-31)** — the v4 web tree is live on the site box:
+  `rsync` of `web/` to `/srv/amparo/src/web/` followed by the on-box
+  `deploy.sh` (idempotent; the env file is preserved; the unit came back
+  active — the LOW-9 `is-active` check passed). Verified live: the unit
+  is active, `/api/health` reports `contract: 'web-surface.md v4'`, the
+  one-shot ticket drill is green on the deployed server (first use
+  passes auth, replay → 401, `?token=` → 401), and the full on-box
+  acceptance ran **BOX ACCEPTANCE OK** (statics, auth, checkpoint +
+  resume, task e2e, SSE, gate harness approve/deny/double/expire,
+  ledger/sessions/schedule/notebook views, restart survival, Caddy
+  valid). The audit's web-surface findings are closed in production.
 
 ## Operator note
 
