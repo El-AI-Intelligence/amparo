@@ -28,9 +28,12 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
 }
 
 async fn run_git(args: &[&str], cwd: &PathBuf) -> std::result::Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    // Git hooks run arbitrary code — the child must not inherit any
+    // Amparo secret (audit 2026-08-31 MED-3).
+    crate::process_env::secret_free_env(&mut command);
+    let output = command
         .output()
         .await
         .map_err(|e| format!("Failed to run git: {}", e))?;

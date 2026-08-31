@@ -109,12 +109,20 @@ impl BlackboardStore {
             written_at: chrono::Utc::now().to_rfc3339(),
         };
         if let Some(parent) = self.path.parent() {
+            let created = !parent.exists();
             std::fs::create_dir_all(parent).map_err(|e| {
                 format!(
                     "cannot create blackboard directory {}: {e}",
                     parent.display()
                 )
             })?;
+            // Harden only a directory this call created (audit
+            // 2026-08-31 MED-6).
+            if created {
+                amparo_privacy::perms::owner_only(parent).map_err(|e| {
+                    format!("cannot lock blackboard directory {}: {e}", parent.display())
+                })?;
+            }
         }
         let line = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
         let mut file = std::fs::OpenOptions::new()
@@ -122,6 +130,8 @@ impl BlackboardStore {
             .append(true)
             .open(&self.path)
             .map_err(|e| format!("cannot open blackboard {}: {e}", self.path.display()))?;
+        amparo_privacy::perms::owner_only(&self.path)
+            .map_err(|e| format!("cannot lock blackboard {}: {e}", self.path.display()))?;
         writeln!(file, "{line}").map_err(|e| format!("cannot write blackboard: {e}"))?;
         file.flush()
             .map_err(|e| format!("cannot flush blackboard: {e}"))?;
@@ -319,6 +329,30 @@ mod tests {
             Some(&Value::String("in progress".into()))
         );
         assert!(store.path().ends_with(".amparo/blackboard/board.jsonl"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root();
+        let store = BlackboardStore::new(&root);
+        store.write("k", "v").unwrap();
+        let dir = store.path().parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "blackboard dir must be owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "board file must be owner-only"
+        );
     }
 
     #[test]

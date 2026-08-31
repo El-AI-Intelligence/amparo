@@ -262,9 +262,10 @@ fn fits(record: &RunRecord, max_bytes: usize) -> bool {
 /// non-allow decision, or a human approval (spec §4 — approvals, denials,
 /// escalations).
 fn is_interesting(record: &RunRecord) -> bool {
-    record.tool_calls.iter().any(|step| {
-        step.escalated || step.decision != "allowed" || step.approved == Some(true)
-    })
+    record
+        .tool_calls
+        .iter()
+        .any(|step| step.escalated || step.decision != "allowed" || step.approved == Some(true))
 }
 
 // ─────────────────────────────────────────────── Lock ────────────────────────
@@ -289,8 +290,23 @@ impl RollupLock {
     /// is a silent skip (task-start auto rollup) or an error (operator
     /// commands).
     fn acquire(notebook_dir: &Path) -> Result<Option<Self>, String> {
-        std::fs::create_dir_all(notebook_dir)
-            .map_err(|e| format!("cannot create notebook directory {}: {e}", notebook_dir.display()))?;
+        let created = !notebook_dir.exists();
+        std::fs::create_dir_all(notebook_dir).map_err(|e| {
+            format!(
+                "cannot create notebook directory {}: {e}",
+                notebook_dir.display()
+            )
+        })?;
+        // Harden only a directory this call created (audit
+        // 2026-08-31 MED-6).
+        if created {
+            amparo_privacy::perms::owner_only(notebook_dir).map_err(|e| {
+                format!(
+                    "cannot lock notebook directory {}: {e}",
+                    notebook_dir.display()
+                )
+            })?;
+        }
         let path = notebook_dir.join(LOCK_FILE);
         match Self::try_create(&path) {
             Ok(lock) => Ok(Some(lock)),
@@ -313,8 +329,15 @@ impl RollupLock {
     }
 
     fn try_create(path: &Path) -> Result<Self, TryCreateError> {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
             Ok(mut file) => {
+                amparo_privacy::perms::owner_only(path).map_err(|e| {
+                    TryCreateError::Io(format!("cannot lock lock file {}: {e}", path.display()))
+                })?;
                 let stamped = writeln!(
                     file,
                     "pid={} at={}",
@@ -422,14 +445,21 @@ fn atomic_write_lines<T: Serialize>(path: &Path, values: &[T]) -> Result<(), Str
     let tmp = path.with_file_name(tmp_name);
     let mut text = String::new();
     for value in values {
-        text.push_str(
-            &serde_json::to_string(value).map_err(|e| format!("cannot serialize: {e}"))?,
-        );
+        text.push_str(&serde_json::to_string(value).map_err(|e| format!("cannot serialize: {e}"))?);
         text.push('\n');
     }
     std::fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("cannot rename {} over {}: {e}", tmp.display(), path.display()))
+    // Owner-only before the rename — the mode carries over to the
+    // final path (audit 2026-08-31 MED-6).
+    amparo_privacy::perms::owner_only(&tmp)
+        .map_err(|e| format!("cannot lock {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        format!(
+            "cannot rename {} over {}: {e}",
+            tmp.display(),
+            path.display()
+        )
+    })
 }
 
 // ─────────────────────────────────────────────── Promote / fold ──────────────
@@ -463,7 +493,11 @@ fn promote_tail(
         .metadata()
         .map_err(|e| format!("cannot stat {}: {e}", cold.display()))?
         .len();
-    let offset = if state.last_offset > len { 0 } else { state.last_offset };
+    let offset = if state.last_offset > len {
+        0
+    } else {
+        state.last_offset
+    };
     let mut hashes = load_hashes(notebook_dir);
     let mut reader = BufReader::new(file);
     reader
@@ -494,10 +528,8 @@ fn promote_tail(
             Some((entry, record)) => {
                 last_failed_start = None;
                 let interesting = is_interesting(&record);
-                let novel = hashes.insert((
-                    record.tenant_id.clone(),
-                    record.tool_sequence_hash.clone(),
-                ));
+                let novel =
+                    hashes.insert((record.tenant_id.clone(), record.tool_sequence_hash.clone()));
                 if interesting || novel {
                     let hot_entry = MemoryEntry {
                         id: entry.id,
@@ -532,11 +564,7 @@ fn promote_tail(
 /// are exempt. Rows whose `started_at` does not parse fold unless
 /// promoted. The hot file and its hash sidecar are rewritten atomically,
 /// and `last_fold_at` is set. The caller holds the lock.
-fn fold_hot(
-    notebook_dir: &Path,
-    days: u64,
-    now: DateTime<Utc>,
-) -> Result<FoldReport, String> {
+fn fold_hot(notebook_dir: &Path, days: u64, now: DateTime<Utc>) -> Result<FoldReport, String> {
     let hot_path = notebook_dir.join(HOT_FILE);
     let hashes_path = notebook_dir.join(HOT_HASHES_FILE);
     let promoted = promoted_ids(notebook_dir);
@@ -587,10 +615,7 @@ fn fold_hot(
 /// `Ok(None)` means the mutation lock is held by another process — the
 /// caller skips silently and the next task start promotes. Errors are
 /// reported by the caller and must never fail the task.
-pub fn auto_rollup(
-    notebook_dir: &Path,
-    now: DateTime<Utc>,
-) -> Result<Option<AutoReport>, String> {
+pub fn auto_rollup(notebook_dir: &Path, now: DateTime<Utc>) -> Result<Option<AutoReport>, String> {
     let Some(_lock) = RollupLock::acquire(notebook_dir)? else {
         return Ok(None);
     };
@@ -600,7 +625,9 @@ pub fn auto_rollup(
         .as_deref()
         .map(|at| {
             DateTime::parse_from_rfc3339(at)
-                .map(|last| now.signed_duration_since(last) >= chrono::Duration::hours(AUTO_FOLD_HOURS))
+                .map(|last| {
+                    now.signed_duration_since(last) >= chrono::Duration::hours(AUTO_FOLD_HOURS)
+                })
                 .unwrap_or(true)
         })
         .unwrap_or(true);
@@ -627,7 +654,9 @@ pub fn rollup(
     now: DateTime<Utc>,
 ) -> Result<RollupReport, String> {
     let Some(_lock) = RollupLock::acquire(notebook_dir)? else {
-        return Err("the notebook is busy (another rollup holds the lock); retry shortly".to_string());
+        return Err(
+            "the notebook is busy (another rollup holds the lock); retry shortly".to_string(),
+        );
     };
     let fold = fold_hot(notebook_dir, days, now)?;
     let promote = promote_tail(notebook_dir, max_bytes.max(MAX_BYTES_FLOOR), now)?;
@@ -662,7 +691,11 @@ pub fn rollup_dry_run(
                 .metadata()
                 .map_err(|e| format!("cannot stat {}: {e}", cold.display()))?
                 .len();
-            let offset = if state.last_offset > len { 0 } else { state.last_offset };
+            let offset = if state.last_offset > len {
+                0
+            } else {
+                state.last_offset
+            };
             let mut reader = BufReader::new(file);
             reader
                 .seek(SeekFrom::Start(offset))
@@ -683,10 +716,8 @@ pub fn rollup_dry_run(
                 }
                 if let Some((_entry, record)) = parse_entry_and_record(line) {
                     let interesting = is_interesting(&record);
-                    let novel = hashes.insert((
-                        record.tenant_id.clone(),
-                        record.tool_sequence_hash.clone(),
-                    ));
+                    let novel = hashes
+                        .insert((record.tenant_id.clone(), record.tool_sequence_hash.clone()));
                     if interesting || novel {
                         report.promoted += 1;
                     } else {
@@ -737,7 +768,9 @@ pub fn promote_record(
     now: DateTime<Utc>,
 ) -> Result<PromoteOutcome, String> {
     let Some(_lock) = RollupLock::acquire(notebook_dir)? else {
-        return Err("the notebook is busy (another rollup holds the lock); retry shortly".to_string());
+        return Err(
+            "the notebook is busy (another rollup holds the lock); retry shortly".to_string(),
+        );
     };
     if promoted_ids(notebook_dir).contains(record_id) {
         return Ok(PromoteOutcome::AlreadyPromoted);
@@ -746,7 +779,9 @@ pub fn promote_record(
     let text = match std::fs::read_to_string(&cold) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!("unknown record id {record_id} — the cold archive is empty"))
+            return Err(format!(
+                "unknown record id {record_id} — the cold archive is empty"
+            ))
         }
         Err(e) => {
             return Err(format!(
@@ -786,9 +821,7 @@ pub fn promote_record(
         )?;
         return Ok(PromoteOutcome::Promoted);
     }
-    Err(format!(
-        "unknown record id {record_id} in the cold archive"
-    ))
+    Err(format!("unknown record id {record_id} in the cold archive"))
 }
 
 /// Cold-archive summaries for `tenant_id`, newest first, capped at `limit`,
@@ -1015,10 +1048,31 @@ mod tests {
         let dir = temp_dir("promote-basic.jsonl");
         // Two plain rows with the same hash — the first is novel, the
         // second is a duplicate and skipped.
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:00:00Z", &record("cli", "2026-08-28T00:00:00Z", "hash-a")));
-        append_cold(&dir, &entry("rec-2", "2026-08-29T00:00:01Z", &record("cli", "2026-08-28T00:00:01Z", "hash-a")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:00:00Z",
+                &record("cli", "2026-08-28T00:00:00Z", "hash-a"),
+            ),
+        );
+        append_cold(
+            &dir,
+            &entry(
+                "rec-2",
+                "2026-08-29T00:00:01Z",
+                &record("cli", "2026-08-28T00:00:01Z", "hash-a"),
+            ),
+        );
         // An interesting row with the same hash is promoted anyway.
-        append_cold(&dir, &entry("rec-3", "2026-08-29T00:00:02Z", &interesting_record("cli", "2026-08-28T00:00:02Z", "hash-a")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-3",
+                "2026-08-29T00:00:02Z",
+                &interesting_record("cli", "2026-08-28T00:00:02Z", "hash-a"),
+            ),
+        );
 
         let report = promote_tail(&dir, DEFAULT_MAX_BYTES, at("2026-08-29T01:00:00Z")).unwrap();
         assert_eq!(report.scanned, 3);
@@ -1049,15 +1103,36 @@ mod tests {
     #[test]
     fn promote_tail_resumes_from_the_saved_offset() {
         let dir = temp_dir("promote-resume.jsonl");
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:00:00Z", &record("cli", "2026-08-28T00:00:00Z", "hash-a")));
-        append_cold(&dir, &entry("rec-2", "2026-08-29T00:00:01Z", &record("cli", "2026-08-28T00:00:01Z", "hash-b")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:00:00Z",
+                &record("cli", "2026-08-28T00:00:00Z", "hash-a"),
+            ),
+        );
+        append_cold(
+            &dir,
+            &entry(
+                "rec-2",
+                "2026-08-29T00:00:01Z",
+                &record("cli", "2026-08-28T00:00:01Z", "hash-b"),
+            ),
+        );
 
         let first = promote_tail(&dir, DEFAULT_MAX_BYTES, at("2026-08-29T01:00:00Z")).unwrap();
         assert_eq!(first.scanned, 2);
         assert_eq!(first.promoted, 2);
 
         // A third row lands after the first scan.
-        append_cold(&dir, &entry("rec-3", "2026-08-29T00:00:02Z", &record("cli", "2026-08-28T00:00:02Z", "hash-c")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-3",
+                "2026-08-29T00:00:02Z",
+                &record("cli", "2026-08-28T00:00:02Z", "hash-c"),
+            ),
+        );
         let second = promote_tail(&dir, DEFAULT_MAX_BYTES, at("2026-08-29T02:00:00Z")).unwrap();
         assert_eq!(second.scanned, 1, "only the tail is re-read");
         assert_eq!(second.promoted, 1);
@@ -1074,7 +1149,14 @@ mod tests {
     #[test]
     fn promote_tail_skips_garbage_and_stalls_on_a_torn_tail() {
         let dir = temp_dir("promote-torn.jsonl");
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:00:00Z", &record("cli", "2026-08-28T00:00:00Z", "hash-a")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:00:00Z",
+                &record("cli", "2026-08-28T00:00:00Z", "hash-a"),
+            ),
+        );
         std::fs::OpenOptions::new()
             .append(true)
             .open(dir.join("records.jsonl"))
@@ -1093,7 +1175,10 @@ mod tests {
         assert_eq!(report.promoted, 1, "garbage mid-file is skipped");
         let state = load_state(&dir);
         let full_len = std::fs::metadata(dir.join("records.jsonl")).unwrap().len();
-        assert!(state.last_offset < full_len, "the torn tail is not consumed");
+        assert!(
+            state.last_offset < full_len,
+            "the torn tail is not consumed"
+        );
 
         // The next scan starts at the torn line again — and still promotes
         // nothing new.
@@ -1115,9 +1200,21 @@ mod tests {
     #[test]
     fn fold_hot_keeps_recent_and_promoted_and_drops_old() {
         let dir = temp_dir("fold-basic.jsonl");
-        let old = entry("rec-old", "2026-08-29T00:00:00Z", &record("cli", "2026-01-01T00:00:00Z", "hash-old"));
-        let recent = entry("rec-recent", "2026-08-29T00:00:01Z", &record("cli", "2026-08-28T00:00:00Z", "hash-recent"));
-        let pinned = entry("rec-pinned", "2026-08-29T00:00:02Z", &record("cli", "2026-01-01T00:00:01Z", "hash-pinned"));
+        let old = entry(
+            "rec-old",
+            "2026-08-29T00:00:00Z",
+            &record("cli", "2026-01-01T00:00:00Z", "hash-old"),
+        );
+        let recent = entry(
+            "rec-recent",
+            "2026-08-29T00:00:01Z",
+            &record("cli", "2026-08-28T00:00:00Z", "hash-recent"),
+        );
+        let pinned = entry(
+            "rec-pinned",
+            "2026-08-29T00:00:02Z",
+            &record("cli", "2026-01-01T00:00:01Z", "hash-pinned"),
+        );
         append_line(&dir.join(HOT_FILE), &old).unwrap();
         append_line(&dir.join(HOT_FILE), &recent).unwrap();
         append_line(&dir.join(HOT_FILE), &pinned).unwrap();
@@ -1154,8 +1251,16 @@ mod tests {
     #[test]
     fn fold_hot_folds_unparseable_dates_unless_promoted() {
         let dir = temp_dir("fold-baddate.jsonl");
-        let bad = entry("rec-bad", "2026-08-29T00:00:00Z", &record("cli", "not-a-date", "hash-bad"));
-        let pinned = entry("rec-pinned", "2026-08-29T00:00:01Z", &record("cli", "not-a-date-either", "hash-pinned"));
+        let bad = entry(
+            "rec-bad",
+            "2026-08-29T00:00:00Z",
+            &record("cli", "not-a-date", "hash-bad"),
+        );
+        let pinned = entry(
+            "rec-pinned",
+            "2026-08-29T00:00:01Z",
+            &record("cli", "not-a-date-either", "hash-pinned"),
+        );
         append_line(&dir.join(HOT_FILE), &bad).unwrap();
         append_line(&dir.join(HOT_FILE), &pinned).unwrap();
         append_line(
@@ -1179,21 +1284,37 @@ mod tests {
     fn auto_rollup_folds_at_most_once_a_day() {
         let dir = temp_dir("auto-daily.jsonl");
         // A never-folded state folds on the first auto rollup.
-        let first = auto_rollup(&dir, at("2026-08-29T00:00:00Z")).unwrap().unwrap();
-        assert_eq!(first.folded, 0, "empty hot folds nothing, but last_fold_at is set");
+        let first = auto_rollup(&dir, at("2026-08-29T00:00:00Z"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.folded, 0,
+            "empty hot folds nothing, but last_fold_at is set"
+        );
         let state = load_state(&dir);
         let folded_at = at("2026-08-29T00:00:00Z").to_rfc3339();
         assert_eq!(state.last_fold_at.as_deref(), Some(folded_at.as_str()));
 
         // An hour later: promote runs, the fold is gated off. The row is
         // old (January), so the next fold will claim it.
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:01:00Z", &record("cli", "2026-01-01T00:00:00Z", "hash-a")));
-        let second = auto_rollup(&dir, at("2026-08-29T01:00:00Z")).unwrap().unwrap();
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:01:00Z",
+                &record("cli", "2026-01-01T00:00:00Z", "hash-a"),
+            ),
+        );
+        let second = auto_rollup(&dir, at("2026-08-29T01:00:00Z"))
+            .unwrap()
+            .unwrap();
         assert_eq!(second.promoted, 1);
         assert_eq!(second.folded, 0);
 
         // 25 hours later the fold runs again and the old row folds.
-        let third = auto_rollup(&dir, at("2026-08-30T02:00:00Z")).unwrap().unwrap();
+        let third = auto_rollup(&dir, at("2026-08-30T02:00:00Z"))
+            .unwrap()
+            .unwrap();
         assert_eq!(third.folded, 1, "the old hot row folds");
         assert_eq!(third.kept, 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1228,8 +1349,16 @@ mod tests {
     #[test]
     fn rollup_forces_fold_with_explicit_days() {
         let dir = temp_dir("rollup-forced.jsonl");
-        let old = entry("rec-old", "2026-08-29T00:00:00Z", &record("cli", "2026-01-01T00:00:00Z", "hash-old"));
-        let pinned = entry("rec-pinned", "2026-08-29T00:00:01Z", &record("cli", "2026-01-01T00:00:01Z", "hash-pinned"));
+        let old = entry(
+            "rec-old",
+            "2026-08-29T00:00:00Z",
+            &record("cli", "2026-01-01T00:00:00Z", "hash-old"),
+        );
+        let pinned = entry(
+            "rec-pinned",
+            "2026-08-29T00:00:01Z",
+            &record("cli", "2026-01-01T00:00:01Z", "hash-pinned"),
+        );
         append_line(&dir.join(HOT_FILE), &old).unwrap();
         append_line(&dir.join(HOT_FILE), &pinned).unwrap();
         append_line(
@@ -1241,7 +1370,14 @@ mod tests {
             },
         )
         .unwrap();
-        append_cold(&dir, &entry("rec-new", "2026-08-29T00:00:02Z", &record("cli", "2026-08-29T00:00:00Z", "hash-new")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-new",
+                "2026-08-29T00:00:02Z",
+                &record("cli", "2026-08-29T00:00:00Z", "hash-new"),
+            ),
+        );
 
         // days = 0 folds everything except promoted rows.
         let report = rollup(&dir, 0, DEFAULT_MAX_BYTES, at("2026-08-29T00:00:00Z")).unwrap();
@@ -1250,7 +1386,11 @@ mod tests {
         assert_eq!(report.kept, 1);
         let rows = hot_rows(&dir);
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["rec-pinned", "rec-new"], "kept rows first, then the promoted tail");
+        assert_eq!(
+            ids,
+            vec!["rec-pinned", "rec-new"],
+            "kept rows first, then the promoted tail"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1262,8 +1402,13 @@ mod tests {
             .create_new(true)
             .open(dir.join(LOCK_FILE))
             .unwrap();
-        let err = rollup(&dir, DEFAULT_ROLLUP_DAYS, DEFAULT_MAX_BYTES, at("2026-08-29T00:00:00Z"))
-            .unwrap_err();
+        let err = rollup(
+            &dir,
+            DEFAULT_ROLLUP_DAYS,
+            DEFAULT_MAX_BYTES,
+            at("2026-08-29T00:00:00Z"),
+        )
+        .unwrap_err();
         assert!(err.contains("busy"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1271,14 +1416,40 @@ mod tests {
     #[test]
     fn rollup_dry_run_estimates_without_writing() {
         let dir = temp_dir("dry-run.jsonl");
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:00:00Z", &record("cli", "2026-08-28T00:00:00Z", "hash-a")));
-        append_cold(&dir, &entry("rec-2", "2026-08-29T00:00:01Z", &record("cli", "2026-08-28T00:00:01Z", "hash-a")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:00:00Z",
+                &record("cli", "2026-08-28T00:00:00Z", "hash-a"),
+            ),
+        );
+        append_cold(
+            &dir,
+            &entry(
+                "rec-2",
+                "2026-08-29T00:00:01Z",
+                &record("cli", "2026-08-28T00:00:01Z", "hash-a"),
+            ),
+        );
         // One old hot row that a fold would claim.
-        append_line(&dir.join(HOT_FILE), &entry("rec-old", "2026-08-29T00:00:02Z", &record("cli", "2026-01-01T00:00:00Z", "hash-old"))).unwrap();
+        append_line(
+            &dir.join(HOT_FILE),
+            &entry(
+                "rec-old",
+                "2026-08-29T00:00:02Z",
+                &record("cli", "2026-01-01T00:00:00Z", "hash-old"),
+            ),
+        )
+        .unwrap();
 
-        let report =
-            rollup_dry_run(&dir, DEFAULT_ROLLUP_DAYS, DEFAULT_MAX_BYTES, at("2026-08-29T00:00:00Z"))
-                .unwrap();
+        let report = rollup_dry_run(
+            &dir,
+            DEFAULT_ROLLUP_DAYS,
+            DEFAULT_MAX_BYTES,
+            at("2026-08-29T00:00:00Z"),
+        )
+        .unwrap();
         assert_eq!(report.promoted, 1, "one novel tail row");
         assert_eq!(report.skipped, 1, "the duplicate hash row");
         assert_eq!(report.folded, 1);
@@ -1294,9 +1465,17 @@ mod tests {
     #[test]
     fn promote_record_pins_a_case_and_is_idempotent() {
         let dir = temp_dir("promote-record.jsonl");
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:00:00Z", &record("cli", "2026-08-28T00:00:00Z", "hash-a")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:00:00Z",
+                &record("cli", "2026-08-28T00:00:00Z", "hash-a"),
+            ),
+        );
 
-        let outcome = promote_record(&dir, "rec-1", DEFAULT_MAX_BYTES, at("2026-08-29T01:00:00Z")).unwrap();
+        let outcome =
+            promote_record(&dir, "rec-1", DEFAULT_MAX_BYTES, at("2026-08-29T01:00:00Z")).unwrap();
         assert_eq!(outcome, PromoteOutcome::Promoted);
         let rows = hot_rows(&dir);
         assert_eq!(rows.len(), 1);
@@ -1304,7 +1483,8 @@ mod tests {
         assert_eq!(rows[0].created_at, "2026-08-29T00:00:00Z");
         assert!(load_hashes(&dir).contains(&("cli".to_string(), "hash-a".to_string())));
 
-        let again = promote_record(&dir, "rec-1", DEFAULT_MAX_BYTES, at("2026-08-29T02:00:00Z")).unwrap();
+        let again =
+            promote_record(&dir, "rec-1", DEFAULT_MAX_BYTES, at("2026-08-29T02:00:00Z")).unwrap();
         assert_eq!(again, PromoteOutcome::AlreadyPromoted);
         assert_eq!(hot_rows(&dir).len(), 1, "idempotent");
         assert_eq!(promoted_ids(&dir), HashSet::from(["rec-1".to_string()]));
@@ -1314,9 +1494,21 @@ mod tests {
     #[test]
     fn promote_record_refuses_unknown_ids() {
         let dir = temp_dir("promote-unknown.jsonl");
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:00:00Z", &record("cli", "2026-08-28T00:00:00Z", "hash-a")));
-        let err = promote_record(&dir, "rec-404", DEFAULT_MAX_BYTES, at("2026-08-29T00:00:00Z"))
-            .unwrap_err();
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:00:00Z",
+                &record("cli", "2026-08-28T00:00:00Z", "hash-a"),
+            ),
+        );
+        let err = promote_record(
+            &dir,
+            "rec-404",
+            DEFAULT_MAX_BYTES,
+            at("2026-08-29T00:00:00Z"),
+        )
+        .unwrap_err();
         assert!(err.contains("unknown record id rec-404"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1324,7 +1516,14 @@ mod tests {
     #[test]
     fn promote_record_errors_when_the_lock_is_held() {
         let dir = temp_dir("promote-locked.jsonl");
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:00:00Z", &record("cli", "2026-08-28T00:00:00Z", "hash-a")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:00:00Z",
+                &record("cli", "2026-08-28T00:00:00Z", "hash-a"),
+            ),
+        );
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1339,9 +1538,30 @@ mod tests {
     #[test]
     fn list_records_is_newest_first_tenant_filtered_and_flags_promotions() {
         let dir = temp_dir("list.jsonl");
-        append_cold(&dir, &entry("rec-1", "2026-08-29T00:00:00Z", &record("cli", "2026-08-27T00:00:00Z", "hash-1")));
-        append_cold(&dir, &entry("rec-2", "2026-08-29T00:00:01Z", &record("telegram:111", "2026-08-28T00:00:00Z", "hash-2")));
-        append_cold(&dir, &entry("rec-3", "2026-08-29T00:00:02Z", &record("cli", "2026-08-28T00:00:00Z", "hash-3")));
+        append_cold(
+            &dir,
+            &entry(
+                "rec-1",
+                "2026-08-29T00:00:00Z",
+                &record("cli", "2026-08-27T00:00:00Z", "hash-1"),
+            ),
+        );
+        append_cold(
+            &dir,
+            &entry(
+                "rec-2",
+                "2026-08-29T00:00:01Z",
+                &record("telegram:111", "2026-08-28T00:00:00Z", "hash-2"),
+            ),
+        );
+        append_cold(
+            &dir,
+            &entry(
+                "rec-3",
+                "2026-08-29T00:00:02Z",
+                &record("cli", "2026-08-28T00:00:00Z", "hash-3"),
+            ),
+        );
         append_line(
             &dir.join(PROMOTED_FILE),
             &PromotedRecord {

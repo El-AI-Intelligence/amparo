@@ -14,6 +14,7 @@ pub mod git;
 pub mod memory;
 pub mod notification;
 pub mod paths;
+pub mod process_env;
 pub mod registry;
 pub mod shell;
 pub mod skills;

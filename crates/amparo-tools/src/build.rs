@@ -99,11 +99,12 @@ impl ToolExecutor for RunBuildTool {
             detect_build_command(&root).await
         };
 
-        let output = Command::new(&cmd)
-            .args(&args)
-            .current_dir(&root)
-            .kill_on_drop(true)
-            .output();
+        let mut command = Command::new(&cmd);
+        command.args(&args).current_dir(&root).kill_on_drop(true);
+        // Build scripts run arbitrary code — the child must not inherit
+        // any Amparo secret (audit 2026-08-31 MED-3).
+        crate::process_env::secret_free_env(&mut command);
+        let output = command.output();
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(timeout), output).await;
 

@@ -201,12 +201,20 @@ impl JsonCheckpointStore {
     /// half-written file.
     fn write(&self, checkpoint: &Checkpoint) -> io::Result<()> {
         let dir = self.dir_for(&checkpoint.tenant);
+        let created = !dir.exists();
         fs::create_dir_all(&dir)?;
+        // Harden only a directory this call created — a pre-existing
+        // parent is not ours to re-permission; owner-only before any
+        // content lands (audit 2026-08-31 MED-6).
+        if created {
+            amparo_privacy::perms::owner_only(&dir)?;
+        }
         let json = serde_json::to_vec_pretty(checkpoint)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let tmp = dir.join(format!("{}.tmp", checkpoint.task_id));
         let final_path = dir.join(format!("{}.json", checkpoint.task_id));
         fs::write(&tmp, json)?;
+        amparo_privacy::perms::owner_only(&tmp)?;
         fs::rename(&tmp, &final_path)
     }
 }
@@ -452,6 +460,34 @@ mod tests {
         let store = JsonCheckpointStore::new(temp_root("missing"));
         assert!(store.latest_incomplete("nobody").is_none());
         assert!(store.latest_complete("nobody").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoints_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("perms");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        store
+            .save(&checkpoint("cli", "sess-p", 100, SessionStatus::Running))
+            .unwrap();
+        let dir = root.join(".amparo").join("sessions").join("cli");
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "sessions dir must be owner-only"
+        );
+        assert_eq!(
+            fs::metadata(dir.join("sess-p.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "checkpoint file must be owner-only"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     // ── M8 W2: delegation identity ──────────────────────────────────────────

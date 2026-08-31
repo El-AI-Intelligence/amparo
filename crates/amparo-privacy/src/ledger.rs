@@ -209,19 +209,30 @@ impl LedgerStore {
     ) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
+            let created = !parent.exists();
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create ledger directory {}: {e}", parent.display()))?;
+            // Harden only a directory this call created — owner-only
+            // before any row lands (audit 2026-08-31 MED-6).
+            if created {
+                crate::perms::owner_only(parent).map_err(|e| {
+                    format!("cannot lock ledger directory {}: {e}", parent.display())
+                })?;
+            }
         }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(|e| format!("cannot open ledger {}: {e}", path.display()))?;
+        crate::perms::owner_only(&path)
+            .map_err(|e| format!("cannot lock ledger {}: {e}", path.display()))?;
         let bound = quota.map(|q| q.max_bytes);
         let sidecar = path.with_file_name(QUOTA_SIDECAR);
         match bound {
             Some(bytes) => {
                 let _ = std::fs::write(&sidecar, bytes.to_string());
+                let _ = crate::perms::owner_only(&sidecar);
             }
             None => {
                 let _ = std::fs::remove_file(&sidecar);
@@ -316,6 +327,8 @@ impl LedgerStore {
                 .write(true)
                 .open(&tmp)
                 .map_err(|e| format!("cannot open ledger tmp {}: {e}", tmp.display()))?;
+            crate::perms::owner_only(&tmp)
+                .map_err(|e| format!("cannot lock ledger tmp {}: {e}", tmp.display()))?;
             let marker = LedgerRow {
                 ts: chrono::Utc::now().to_rfc3339(),
                 // The marker belongs to the file it describes — tag it
@@ -514,6 +527,29 @@ mod tests {
         let store = LedgerStore::open(dir.join("a").join("b").join("ledger.jsonl")).unwrap();
         store.append(&row(LedgerKind::PiiStrip)).unwrap();
         assert_eq!(store.read_all().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_owner_only_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let path = dir.join("sub").join("ledger.jsonl");
+        LedgerStore::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join("sub"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "ledger dir must be owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "ledger file must be owner-only"
+        );
     }
 
     #[test]

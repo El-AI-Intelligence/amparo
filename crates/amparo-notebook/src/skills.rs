@@ -262,11 +262,20 @@ impl Proposer {
     /// Parse `records_path` (a `RunRecord` JSONL file) and return every
     /// qualifying proposal for `tenant_id`. A missing file yields an empty
     /// list, not an error.
-    pub fn propose(&self, records_path: &Path, tenant_id: &str) -> Result<Vec<ProposalRecord>, String> {
+    pub fn propose(
+        &self,
+        records_path: &Path,
+        tenant_id: &str,
+    ) -> Result<Vec<ProposalRecord>, String> {
         let text = match std::fs::read_to_string(records_path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("cannot read records {}: {e}", records_path.display())),
+            Err(e) => {
+                return Err(format!(
+                    "cannot read records {}: {e}",
+                    records_path.display()
+                ))
+            }
         };
 
         let mut groups: HashMap<String, GroupStats> = HashMap::new();
@@ -310,9 +319,7 @@ impl Proposer {
                 .as_ref()
                 .map(|v| v.decision == "complete")
                 .unwrap_or(false);
-            let group = groups
-                .entry(record.tool_sequence_hash.clone())
-                .or_default();
+            let group = groups.entry(record.tool_sequence_hash.clone()).or_default();
             group.total_runs += 1;
             if verified {
                 group.verified_runs += 1;
@@ -344,7 +351,11 @@ impl Proposer {
                 example_run_ids: group.examples,
             })
             .collect();
-        proposals.sort_by(|a, b| b.verified_rate.partial_cmp(&a.verified_rate).unwrap_or(std::cmp::Ordering::Equal));
+        proposals.sort_by(|a, b| {
+            b.verified_rate
+                .partial_cmp(&a.verified_rate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(proposals)
     }
 }
@@ -362,7 +373,10 @@ pub fn append_proposals(path: &Path, proposals: &[ProposalRecord]) -> Result<usi
     .collect();
     let mut written = 0usize;
     for proposal in proposals {
-        if !seen.insert((proposal.tenant_id.clone(), proposal.tool_sequence_hash.clone())) {
+        if !seen.insert((
+            proposal.tenant_id.clone(),
+            proposal.tool_sequence_hash.clone(),
+        )) {
             continue;
         }
         append_line(path, proposal)?;
@@ -378,14 +392,24 @@ pub fn append_proposals(path: &Path, proposals: &[ProposalRecord]) -> Result<usi
 /// audit rows) and the notebook rollup sidecars.
 pub(crate) fn append_line<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let created = !parent.exists();
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("cannot create directory {}: {e}", parent.display()))?;
+    // Harden only a directory this call created — a pre-existing parent
+    // (e.g. the shared /tmp) is not ours to re-permission (audit
+    // 2026-08-31 MED-6).
+    if created {
+        amparo_privacy::perms::owner_only(parent)
+            .map_err(|e| format!("cannot lock directory {}: {e}", parent.display()))?;
+    }
     let line = serde_json::to_string(value).map_err(|e| e.to_string())?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    amparo_privacy::perms::owner_only(path)
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
     writeln!(file, "{line}").map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     file.flush()
         .map_err(|e| format!("cannot flush {}: {e}", path.display()))
@@ -443,8 +467,7 @@ mod tests {
         // The internally-tagged enum must serialize the M6c `AdoptRecord`
         // shape exactly — rows written before M6d parse with no change.
         let spec = spec("alpha");
-        let event =
-            SkillLogEvent::adopt("cli", "alpha", spec.clone(), "2026-08-29T00:00:00Z");
+        let event = SkillLogEvent::adopt("cli", "alpha", spec.clone(), "2026-08-29T00:00:00Z");
         let line = serde_json::to_string(&event).unwrap();
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["event"], "adopt");
@@ -462,8 +485,12 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         append_event(&path, &adopt_record("cli", "alpha")).unwrap();
         // Garbage line — skipped, not fatal.
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap()
-            .write_all(b"not json\n").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"not json\n")
+            .unwrap();
         // A second adoption of alpha (new spec) — the last one wins.
         let SkillLogEvent::Adopt {
             mut spec,
@@ -477,7 +504,12 @@ mod tests {
         spec.description = "revised".to_string();
         append_event(
             &path,
-            &SkillLogEvent::Adopt { tenant_id, name, spec, adopted_at },
+            &SkillLogEvent::Adopt {
+                tenant_id,
+                name,
+                spec,
+                adopted_at,
+            },
         )
         .unwrap();
         // Another tenant's adoption is invisible to cli.
@@ -601,56 +633,86 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         // hash-1: 3 verified runs of git_status,git_diff → qualifies.
         for i in 0..3 {
-            append_line(&path, &entry(&run_record(
-                "cli",
-                &format!("2026-08-2{i}T10:00:00Z"),
-                "hash-1",
-                &["git_status", "git_diff"],
-                true,
-            )))
+            append_line(
+                &path,
+                &entry(&run_record(
+                    "cli",
+                    &format!("2026-08-2{i}T10:00:00Z"),
+                    "hash-1",
+                    &["git_status", "git_diff"],
+                    true,
+                )),
+            )
             .unwrap();
         }
         // hash-2: 4 runs but only 2 verified (rate 0.5) → rejected.
         for i in 0..4 {
-            append_line(&path, &entry(&run_record(
-                "cli",
-                &format!("2026-08-2{i}T11:00:00Z"),
-                "hash-2",
-                &["read_file"],
-                i < 2,
-            )))
+            append_line(
+                &path,
+                &entry(&run_record(
+                    "cli",
+                    &format!("2026-08-2{i}T11:00:00Z"),
+                    "hash-2",
+                    &["read_file"],
+                    i < 2,
+                )),
+            )
             .unwrap();
         }
         // hash-3: verified enough but another tenant → invisible.
         for i in 0..3 {
-            append_line(&path, &entry(&run_record(
-                "telegram:111",
-                &format!("2026-08-2{i}T12:00:00Z"),
-                "hash-3",
-                &["run_tests"],
-                true,
-            )))
+            append_line(
+                &path,
+                &entry(&run_record(
+                    "telegram:111",
+                    &format!("2026-08-2{i}T12:00:00Z"),
+                    "hash-3",
+                    &["run_tests"],
+                    true,
+                )),
+            )
             .unwrap();
         }
         // hash-4: blocked or failed steps → excluded regardless of verification.
-        let mut deny = run_record("cli", "2026-08-29T13:00:00Z", "hash-4", &["write_file"], true);
+        let mut deny = run_record(
+            "cli",
+            "2026-08-29T13:00:00Z",
+            "hash-4",
+            &["write_file"],
+            true,
+        );
         deny.tool_calls[0].decision = "policy_denied".to_string();
         append_line(&path, &entry(&deny)).unwrap();
-        let mut fail = run_record("cli", "2026-08-29T14:00:00Z", "hash-4", &["write_file"], true);
+        let mut fail = run_record(
+            "cli",
+            "2026-08-29T14:00:00Z",
+            "hash-4",
+            &["write_file"],
+            true,
+        );
         fail.tool_calls[0].success = Some(false);
         append_line(&path, &entry(&fail)).unwrap();
-        let mut unknown = run_record("cli", "2026-08-29T15:00:00Z", "hash-4", &["write_file"], true);
+        let mut unknown = run_record(
+            "cli",
+            "2026-08-29T15:00:00Z",
+            "hash-4",
+            &["write_file"],
+            true,
+        );
         unknown.tool_calls[0].decision = "unknown_tool".to_string();
         append_line(&path, &entry(&unknown)).unwrap();
         // hash-5: uses use_skill → excluded (no nested skills).
         for i in 0..3 {
-            append_line(&path, &entry(&run_record(
-                "cli",
-                &format!("2026-08-2{i}T15:00:00Z"),
-                "hash-5",
-                &[USE_SKILL],
-                true,
-            )))
+            append_line(
+                &path,
+                &entry(&run_record(
+                    "cli",
+                    &format!("2026-08-2{i}T15:00:00Z"),
+                    "hash-5",
+                    &[USE_SKILL],
+                    true,
+                )),
+            )
             .unwrap();
         }
 
@@ -661,7 +723,10 @@ mod tests {
         assert_eq!(p.total_runs, 3);
         assert_eq!(p.verified_runs, 3);
         assert!((p.verified_rate - 1.0).abs() < f64::EPSILON);
-        assert_eq!(p.tool_names, vec!["git_status".to_string(), "git_diff".to_string()]);
+        assert_eq!(
+            p.tool_names,
+            vec!["git_status".to_string(), "git_diff".to_string()]
+        );
         assert_eq!(p.suggested_name, "git-status-git-diff");
         assert_eq!(p.example_run_ids.len(), 3);
         let _ = std::fs::remove_file(&path);

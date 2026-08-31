@@ -167,10 +167,17 @@ impl JsonScheduleStore {
 
 impl ScheduleStore for JsonScheduleStore {
     fn save(&self, task: &ScheduledTask) -> io::Result<()> {
+        let created = !self.dir.exists();
         std::fs::create_dir_all(&self.dir)?;
+        // Harden only a directory this call created (audit
+        // 2026-08-31 MED-6).
+        if created {
+            amparo_privacy::perms::owner_only(&self.dir)?;
+        }
         let json = serde_json::to_vec(task).map_err(io::Error::other)?;
         let tmp = self.dir.join(format!("{}.tmp", task.id));
         std::fs::write(&tmp, json)?;
+        amparo_privacy::perms::owner_only(&tmp)?;
         std::fs::rename(&tmp, self.path(&task.id))
     }
 
@@ -388,6 +395,40 @@ mod tests {
     /// against the wall clock, so hardcoded dates expire.
     fn future_at() -> String {
         (Utc::now() + Duration::hours(1)).to_rfc3339()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saves_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "amparo-schedule-perms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = JsonScheduleStore::new(&dir);
+        store
+            .save(&task("sched-p", &future_at(), ScheduledStatus::Pending))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "schedule dir must be owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("sched-p.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "schedule file must be owner-only"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn task(id: &str, at: &str, status: ScheduledStatus) -> ScheduledTask {

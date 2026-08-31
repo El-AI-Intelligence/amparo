@@ -35,15 +35,25 @@ impl JsonlStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
+            let created = !parent.exists();
             std::fs::create_dir_all(parent).map_err(|e| {
                 format!("cannot create notebook directory {}: {e}", parent.display())
             })?;
+            // Harden only a directory this call created (audit
+            // 2026-08-31 MED-6).
+            if created {
+                amparo_privacy::perms::owner_only(parent).map_err(|e| {
+                    format!("cannot lock notebook directory {}: {e}", parent.display())
+                })?;
+            }
         }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(|e| format!("cannot open notebook store {}: {e}", path.display()))?;
+        amparo_privacy::perms::owner_only(&path)
+            .map_err(|e| format!("cannot lock notebook store {}: {e}", path.display()))?;
         Ok(Self {
             path,
             file: Mutex::new(file),
@@ -137,6 +147,30 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_owner_only_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let path = dir.join("a/b/records.jsonl");
+        JsonlStore::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "notebook dir must be owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "notebook file must be owner-only"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
