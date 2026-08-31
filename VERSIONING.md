@@ -1,7 +1,7 @@
 # Versioning and API stability
 
 Amparo is a workspace of Rust crates that share one version
-(`[workspace.package] version = 0.8.0`). This file is the contract for how
+(`[workspace.package] version = 0.9.0`). This file is the contract for how
 that version moves and what "stable" means at each stage.
 
 ## Semver
