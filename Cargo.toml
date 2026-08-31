@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/amparo-inference", "crates/amparo-memory", "crates/amparo-privacy", "crates/amparo-policy", "crates/amparo-tools", "crates/amparo-agent", "crates/amparo-mcp", "crates/amparo-cli", "crates/amparo-chat", "crates/amparo-notebook", "crates/amparo-sandbox"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
