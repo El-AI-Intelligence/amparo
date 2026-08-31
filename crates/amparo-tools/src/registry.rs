@@ -314,7 +314,7 @@ use crate::filesystem::{EditFileTool, ListDirTool, PatchFileTool, ReadFileTool, 
 use crate::git::{
     GitBlameTool, GitBranchTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool,
 };
-use crate::memory::MemorySearchTool;
+use crate::memory::{Memory, MemorySearchTool};
 use crate::notification::SendNotificationTool;
 use crate::paths::PathPolicy;
 use crate::shell::RunCommandTool;
@@ -367,6 +367,29 @@ pub fn default_registry_with_policy(policy: Arc<PathPolicy>) -> ToolRegistry {
 /// the environment.
 pub fn default_registry() -> ToolRegistry {
     default_registry_with_policy(Arc::new(PathPolicy::from_env()))
+}
+
+/// Create the default registry with the given memory backend behind
+/// `memory_search` (M11 W1): `memory` replaces the built-in in-memory
+/// store the default registers. Equivalent to
+/// [`default_registry_with_policy_and_memory`] with the policy loaded
+/// from the environment.
+pub fn default_registry_with_memory(memory: Arc<dyn Memory>) -> ToolRegistry {
+    default_registry_with_policy_and_memory(Arc::new(PathPolicy::from_env()), memory)
+}
+
+/// Create the default registry rooted at `policy`, with the given memory
+/// backend behind `memory_search` (M11 W1): `memory` replaces the
+/// built-in in-memory store [`default_registry_with_policy`] registers —
+/// re-registering the search tool is how hosts wire e.g. the Engram
+/// adapter without touching the default.
+pub fn default_registry_with_policy_and_memory(
+    policy: Arc<PathPolicy>,
+    memory: Arc<dyn Memory>,
+) -> ToolRegistry {
+    let mut registry = default_registry_with_policy(policy);
+    registry.register(Arc::new(MemorySearchTool::with_store(memory)));
+    registry
 }
 
 #[cfg(test)]

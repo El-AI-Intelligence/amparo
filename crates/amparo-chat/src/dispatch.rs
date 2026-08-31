@@ -29,7 +29,9 @@ use amparo_inference::InferenceConfig;
 use amparo_notebook::{notebook_dir, JsonlStore, HOT_FILE};
 use amparo_policy::{AllowAllPolicyEngine, DenyAllPolicyEngine};
 use amparo_sandbox::EvalWasmTool;
-use amparo_tools::{default_registry, SendNotificationTool, ToolTrustTier};
+use amparo_tools::{
+    default_registry_with_memory, resolve_memory_backend, SendNotificationTool, ToolTrustTier,
+};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -254,7 +256,7 @@ pub fn parse_chat_flags(args: impl Iterator<Item = String>) -> ParseChatResult {
 /// a [`PolicySource::Wire`] engine (`--policy-url` plus `AMPARO_POLICY_KEY`),
 /// an explicit [`AllowAllPolicyEngine`], or a [`DenyAllPolicyEngine`] with
 /// the same reason string as `amparo run`, then the shared
-/// [`default_registry`] (the registry itself reads `AMPARO_WORKSPACE` as
+/// [`default_registry_with_memory`] (the registry itself reads `AMPARO_WORKSPACE` as
 /// its root; there is no `--workspace` flag in chat flags). Tenancy: a
 /// `--chat-config <path>` flag (winning over `AMPARO_CHAT_CONFIG`) loads
 /// the TOML tenant directory — [`Tenants::Directory`]; a load failure is a
@@ -283,7 +285,12 @@ pub async fn build_driver(
         .build()
         .map_err(|e| ChatServeError::new(e.to_string(), 1))?;
 
-    let mut registry = default_registry();
+    // The memory backend (M11 W1): resolved once per chat process — the
+    // Engram adapter when configured and reachable, the built-in store
+    // otherwise. The allowlist arm shares this registry; the directory
+    // arm's per-task registries get the same store from the driver.
+    let memory = resolve_memory_backend().await;
+    let mut registry = default_registry_with_memory(Arc::clone(&memory));
     // M7b: the sandbox tool is host-registered, like use_skill. This
     // registry is also the driver's legacy shared registry, so the
     // allowlist tenant arm gets eval_wasm from here.
@@ -358,7 +365,8 @@ pub async fn build_driver(
         router,
         flags.auto_approve,
     )
-    .with_trust_ceiling(flags.trust_ceiling);
+    .with_trust_ceiling(flags.trust_ceiling)
+    .with_memory(memory);
     if let Some(nb_dir) = nb_dir {
         let path = nb_dir.join("records.jsonl");
         let store = JsonlStore::open(&path)

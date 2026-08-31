@@ -20,7 +20,9 @@ use amparo_policy::{
     PolicyEngine,
 };
 use amparo_sandbox::EvalWasmTool;
-use amparo_tools::{default_registry, PathPolicy, ToolRegistry, ToolTrustTier};
+use amparo_tools::{
+    default_registry_with_memory, resolve_memory_backend, PathPolicy, ToolRegistry, ToolTrustTier,
+};
 use std::sync::{Arc, Mutex};
 
 use crate::McpServer;
@@ -235,7 +237,11 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
         (false, None) => Arc::new(AutoDeny),
     };
 
-    let mut registry: ToolRegistry = default_registry();
+    // The memory backend (M11 W1): the Engram adapter when configured
+    // and reachable, the built-in store otherwise (with one `[memory]`
+    // warning on the degrade path).
+    let memory = resolve_memory_backend().await;
+    let mut registry: ToolRegistry = default_registry_with_memory(memory);
     // M7b: eval_wasm is served over MCP too; approval defaults to
     // AutoDeny here, so it is refused until an operator allows.
     registry.register(Arc::new(EvalWasmTool::new()));
@@ -245,8 +251,12 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
     // a child-flavored tool under the one shared budget. The spawn call
     // itself is a gated tools/call exactly like any other (tier
     // ExternalEffector, so the approval gate sees it).
-    if let Some(tool) = spawn_tool(&flags, &registry, Arc::clone(&policy), Arc::clone(&approval))?
-    {
+    if let Some(tool) = spawn_tool(
+        &flags,
+        &registry,
+        Arc::clone(&policy),
+        Arc::clone(&approval),
+    )? {
         registry.register(tool);
     }
     let mut server = McpServer::new(registry, policy)
@@ -286,7 +296,9 @@ fn spawn_tool(
              Quickstart for the full environment surface"
         ))
     })?;
-    let provider = config.build().map_err(|e| ServeError::config(e.to_string()))?;
+    let provider = config
+        .build()
+        .map_err(|e| ServeError::config(e.to_string()))?;
     // The child chain id root: the caller's session id when given (so
     // children chain as `web-1.1`), else a per-process id.
     let parent_task_id = flags
@@ -299,10 +311,7 @@ fn spawn_tool(
         .with_events(Arc::new(StderrEventSink))
         .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
         .with_path_policy(Arc::new(PathPolicy::from_env()))
-        .with_checkpoints(
-            Arc::new(JsonCheckpointStore::new(&workspace_root)),
-            "mcp",
-        )
+        .with_checkpoints(Arc::new(JsonCheckpointStore::new(&workspace_root)), "mcp")
         .with_task_id(parent_task_id.clone())
         .with_config(AgentConfig {
             trust_ceiling: flags.trust_ceiling,
@@ -459,10 +468,7 @@ mod tests {
     #[test]
     fn parses_the_max_sub_agents_flag_with_zero_default() {
         assert_eq!(flags(parse(&[])).max_sub_agents, 0);
-        assert_eq!(
-            flags(parse(&["--max-sub-agents", "3"])).max_sub_agents,
-            3
-        );
+        assert_eq!(flags(parse(&["--max-sub-agents", "3"])).max_sub_agents, 3);
         // Zero is the explicit off switch.
         assert_eq!(flags(parse(&["--max-sub-agents", "0"])).max_sub_agents, 0);
     }

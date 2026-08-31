@@ -27,10 +27,10 @@ use amparo_policy::wire::WirePolicyEngine;
 use amparo_policy::{AuditNoticeEngine, PolicyEngine};
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore, PrivacyPolicy};
 use amparo_sandbox::EvalWasmTool;
-use amparo_tools::registry::default_registry_with_policy;
+use amparo_tools::registry::default_registry_with_policy_and_memory;
 use amparo_tools::{
-    Memory, PathPolicy, SendNotificationTool, SkillLibrary, ToolRegistry, ToolTrustTier,
-    UseSkillTool,
+    InMemoryStore, Memory, PathPolicy, SendNotificationTool, SkillLibrary, ToolRegistry,
+    ToolTrustTier, UseSkillTool,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
@@ -138,7 +138,7 @@ pub enum PolicySource {
 /// the TOML tenant directory for a `platform:user_id` profile — the
 /// profile's workspace (a subpath of the driver's root, or
 /// `users/<platform>-<user_id>`) gets a fresh [`PathPolicy`] and a
-/// [`default_registry_with_policy`] rooted at it, and the profile's trust
+/// [`default_registry_with_policy_and_memory`] rooted at it, and the profile's trust
 /// ceiling overrides the driver's. [`Tenants::LegacyAllowlist`] keeps the
 /// M4 flat allowlist with the shared registry, root workspace and flag
 /// ceiling. The policy engine is either shared across tasks
@@ -175,6 +175,12 @@ pub struct ChatDriver {
     /// directory mode, where each task gets a fresh registry rooted at its
     /// own workspace (tools are Send+Sync).
     registry: ToolRegistry,
+    /// The memory backend wired behind `memory_search` in the per-task
+    /// registries (M11 W1). Defaults to the built-in in-memory store;
+    /// hosts swap it once per driver with [`ChatDriver::with_memory`]
+    /// (the Engram adapter, say). The allowlist arm's shared registry is
+    /// built by the host, so that mode gets its store from there.
+    memory: Arc<dyn Memory>,
     /// The workspace ROOT tasks operate in: per-user workspaces are
     /// subdirectories of it, and it is the legacy flat workspace.
     workspace_root: PathBuf,
@@ -254,6 +260,7 @@ impl ChatDriver {
             hot: None,
             notebook_dir: None,
             registry,
+            memory: Arc::new(InMemoryStore::new()),
             workspace_root,
             transport,
             router,
@@ -266,6 +273,15 @@ impl ChatDriver {
     /// Attach a privacy policy to every task this driver runs.
     pub fn with_privacy(mut self, policy: Arc<PrivacyPolicy>) -> Self {
         self.privacy = Some(policy);
+        self
+    }
+
+    /// Wire a memory backend behind `memory_search` in every
+    /// directory-mode task registry (M11 W1). The default is the built-in
+    /// in-memory store; the allowlist arm's shared registry is built by
+    /// the host, so the host wires that one directly.
+    pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = memory;
         self
     }
 
@@ -343,7 +359,10 @@ impl ChatDriver {
                 let profile = config.users.get(&key)?;
                 let workspace = self.workspace_for(chat, profile)?;
                 let path_policy = Arc::new(PathPolicy::from_root(workspace.clone()));
-                let mut registry = default_registry_with_policy(Arc::clone(&path_policy));
+                let mut registry = default_registry_with_policy_and_memory(
+                    Arc::clone(&path_policy),
+                    Arc::clone(&self.memory),
+                );
                 // M7b: eval_wasm for the directory-mode arm (the
                 // allowlist arm inherits it from the dispatch-built
                 // shared registry).

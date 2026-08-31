@@ -5,7 +5,8 @@
 //! 1. [`InferenceConfig::from_env`] fails closed — no silent localhost
 //!    defaults. `--timeout` clamps to the same 1–3600s bounds as the env
 //!    surface.
-//! 2. `AMPARO_WORKSPACE` is set **before** [`default_registry`] — tools
+//! 2. `AMPARO_WORKSPACE` is set **before**
+//!    [`default_registry_with_memory`] — tools
 //!    capture the path policy at construction.
 //! 3. The policy match is identical to `amparo_mcp::serve`: wire engine,
 //!    explicit allow-all, or deny-all with the same reason string.
@@ -36,8 +37,8 @@ use amparo_policy::{
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{
-    default_registry, PathPolicy, SendNotificationTool, SkillLibrary, ToolRegistry, ToolTrustTier,
-    UseSkillTool,
+    default_registry_with_memory, resolve_memory_backend, InMemoryStore, Memory, PathPolicy,
+    SendNotificationTool, SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool,
 };
 use std::sync::{Arc, Mutex};
 
@@ -525,9 +526,13 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
     }
     let provider = config.build().map_err(|e| e.to_string())?;
 
+    // The memory backend (M11 W1): resolved once per process — the
+    // Engram adapter when configured and reachable, the built-in store
+    // otherwise (with one `[memory]` warning on the degrade path).
+    let memory = resolve_memory_backend().await;
     // The base registry (M10 W5): shared with the fire path — the growth
     // layer (skills) is the only thing layered on top for the main task.
-    let mut registry = fire_registry(flags);
+    let mut registry = fire_registry(flags, Arc::clone(&memory));
 
     let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {
@@ -764,6 +769,7 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
         Arc::clone(&approval),
         flags,
         &workspace_root,
+        Arc::clone(&memory),
     )
     .await;
 
@@ -782,8 +788,8 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
 /// fire would defeat the queue's purpose. The main task's registry
 /// starts from the same base — the growth layer (skills) is the only
 /// thing layered on top for the main task.
-fn fire_registry(flags: &RunFlags) -> ToolRegistry {
-    let mut registry = default_registry();
+fn fire_registry(flags: &RunFlags, memory: Arc<dyn Memory>) -> ToolRegistry {
+    let mut registry = default_registry_with_memory(memory);
     // M7b: eval_wasm is host-registered (like use_skill), not part of the
     // default registry — amparo-tools stays wasmtime-free.
     registry.register(Arc::new(EvalWasmTool::new()));
@@ -810,6 +816,7 @@ async fn scan_schedules(
     approval: Arc<dyn ApprovalGate>,
     flags: &RunFlags,
     workspace_root: &std::path::Path,
+    memory: Arc<dyn Memory>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let store = Arc::new(JsonScheduleStore::new(schedule_dir(workspace_root)));
     let tasks: Vec<ScheduledTask> = store
@@ -845,8 +852,12 @@ async fn scan_schedules(
         let approval = Arc::clone(&approval);
         let flags = flags.clone();
         let root = workspace_root.to_path_buf();
+        let memory = Arc::clone(&memory);
         handles.push(tokio::spawn(async move {
-            fire_promise(provider, policy, approval, &flags, &root, store, task).await;
+            fire_promise(
+                provider, policy, approval, &flags, &root, store, memory, task,
+            )
+            .await;
         }));
     }
     handles
@@ -867,6 +878,7 @@ async fn fire_promise(
     flags: &RunFlags,
     workspace_root: &std::path::Path,
     store: Arc<JsonScheduleStore>,
+    memory: Arc<dyn Memory>,
     mut task: ScheduledTask,
 ) {
     let fire_id = new_task_id();
@@ -899,7 +911,7 @@ async fn fire_promise(
     };
     // Checkpoints are written like any task, continuity OFF: the
     // promise names one concrete fresh task.
-    let agent = Agent::new(provider, fire_registry(flags), policy)
+    let agent = Agent::new(provider, fire_registry(flags, memory), policy)
         .with_events(sink)
         .with_approval(approval)
         .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
@@ -1243,7 +1255,7 @@ mod tests {
 
     #[test]
     fn fire_registry_lacks_spawn_and_schedule() {
-        let registry = fire_registry(&RunFlags::default());
+        let registry = fire_registry(&RunFlags::default(), Arc::new(InMemoryStore::new()));
         assert!(
             registry.get_executor("spawn_agent").is_none(),
             "a fire never spawns — unattended chains break attribution"
