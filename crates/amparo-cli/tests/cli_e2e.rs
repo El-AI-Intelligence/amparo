@@ -749,6 +749,103 @@ async fn mcp_serve_subcommand_smoke_allow_all() {
     restore_workspace_env(prior);
 }
 
+// ── M10 W5: spawn_agent over the MCP surface ─────────────────────────────────
+
+#[tokio::test]
+async fn mcp_serve_registers_no_spawn_agent_by_default() {
+    let _guard = LOCK.lock().await;
+    let prior = set_workspace_env();
+
+    // Without --max-sub-agents the server never builds the inference
+    // provider (and so needs no inference env) — spawn_agent stays out
+    // of the surface until the operator opts in.
+    let client = amparo_mcp::McpClient::spawn(bin(), ["mcp-serve", "--allow-all"])
+        .await
+        .unwrap();
+    assert!(
+        client.tools().iter().all(|t| t.name != "spawn_agent"),
+        "spawn_agent must not be registered without --max-sub-agents: {:?}",
+        client
+            .tools()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    restore_workspace_env(prior);
+}
+
+#[tokio::test]
+async fn mcp_serve_spawns_agents_within_the_shared_budget() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![vec![content_frame("child done")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let client = amparo_mcp::McpClient::spawn(
+        bin(),
+        [
+            "mcp-serve",
+            "--allow-all",
+            "--auto-approve",
+            "--max-sub-agents",
+            "2",
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(
+        client.tools().iter().any(|t| t.name == "spawn_agent"),
+        "spawn_agent is registered when the budget is on"
+    );
+
+    // Two spawns fit the budget; each child runs the mock loop to its
+    // own final answer and reports it back through the tool result.
+    for n in 1..=2 {
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.call_tool("spawn_agent", json!({"task": "answer the child question"})),
+        )
+        .await
+        .expect("call_tool timed out")
+        .unwrap();
+        let text = result
+            .content
+            .iter()
+            .find(|c| c.block_type == "text")
+            .map(|c| c.text.as_str())
+            .unwrap_or_default();
+        assert!(!result.isError, "spawn {n} should run: {text}");
+        assert!(
+            text.contains("child done"),
+            "spawn {n} reports the child's final answer head: {text}"
+        );
+    }
+
+    // The third spawn exhausts the shared budget and fails closed —
+    // no child is created.
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.call_tool("spawn_agent", json!({"task": "one too many"})),
+    )
+    .await
+    .expect("call_tool timed out")
+    .unwrap();
+    let text = result
+        .content
+        .iter()
+        .find(|c| c.block_type == "text")
+        .map(|c| c.text.as_str())
+        .unwrap_or_default();
+    assert!(result.isError, "the third spawn must be refused: {text}");
+    assert!(
+        text.contains("swarm budget exhausted: 2 sub-agents max"),
+        "{text}"
+    );
+
+    restore_workspace_env(prior);
+    drop(env);
+}
+
 // ── Doctor exit-code matrix ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -3467,6 +3564,25 @@ fn seed_promise(ws: &std::path::Path, id: &str, at: &str) {
     store.save(&task).unwrap();
 }
 
+/// Seed one pending promise in `ws`'s queue written by the CLI itself
+/// (M10 W5) — the shape `ScheduleTool::for_cli` persists: tenant and
+/// platform `cli`, the run's task id as chat id and requester.
+fn seed_cli_promise(ws: &std::path::Path, id: &str, at: &str) {
+    let store = JsonScheduleStore::new(schedule_dir(ws));
+    let task = ScheduledTask {
+        id: id.to_string(),
+        tenant: "cli".to_string(),
+        platform: "cli".to_string(),
+        chat_id: "sess-parent".to_string(),
+        requester: "sess-parent".to_string(),
+        task: "run the standing task".to_string(),
+        at: at.to_string(),
+        status: ScheduledStatus::Pending,
+        result: None,
+    };
+    store.save(&task).unwrap();
+}
+
 #[test]
 fn schedule_help_exits_0() {
     let out = std::process::Command::new(bin())
@@ -3578,6 +3694,154 @@ async fn schedule_list_and_cancel_work_the_queue() {
         !empty.join(".amparo/schedule").exists(),
         "a list never creates the queue dir"
     );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+// ── M10 W5: the CLI scheduler — due_scan at run start ────────────────────────
+
+#[tokio::test]
+async fn run_schedules_a_stripped_cli_promise() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("w5-schedule-tool");
+    let mock = MockLlm::start(vec![
+        tool_script(
+            "schedule",
+            r#"{"at":"2099-01-01T00:00:00Z","task":"email alice@example.com the standing report"}"#,
+        ),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+    let ws_prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--allow-all", "--auto-approve", "schedule something"]).await;
+    restore_workspace_env(ws_prior);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // The promise persisted to the workspace queue as the CLI wrote it:
+    // tenant and platform `cli`, the run's own task id as requester, and
+    // the task PII-stripped before it ever touches the queue (I6).
+    let tasks = JsonScheduleStore::new(schedule_dir(&ws)).load_all();
+    assert_eq!(tasks.len(), 1, "{err}");
+    let task = &tasks[0];
+    assert_eq!(task.status, ScheduledStatus::Pending);
+    assert_eq!(task.tenant, "cli");
+    assert_eq!(task.platform, "cli");
+    assert_eq!(task.chat_id, task.requester);
+    assert!(
+        task.requester.starts_with("sess-"),
+        "the requester is the run's task id: {}",
+        task.requester
+    );
+    assert!(
+        task.task.contains("[EMAIL_1]"),
+        "the persisted task is PII-stripped: {}",
+        task.task
+    );
+    assert!(
+        !task.task.contains("alice@example.com"),
+        "the raw address never reaches the queue: {}",
+        task.task
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn a_due_cli_promise_fires_at_run_start() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("w5-due-fire");
+    // Seeded 30s in the past — inside the 60s grace window, so the
+    // run-start scan fires it (the chat driver's own fire-test precedent
+    // seeds the same way).
+    let at = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    seed_cli_promise(&ws, "sched-fire-1", &at);
+
+    // One repeating script: the main task and the concurrently-fired
+    // promise both answer "Done." off the same mock.
+    let mock = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let ws_prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--allow-all", "say hello"]).await;
+    restore_workspace_env(ws_prior);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(stdout(&out).contains("Done."), "{}", stdout(&out));
+    assert!(
+        err.contains("[schedule] sched-fire-1 fired"),
+        "the fire is reported on stderr: {err}"
+    );
+
+    // The promise record carries the fire's outcome — awaited before the
+    // process exited, so the record is on disk.
+    let task = JsonScheduleStore::new(schedule_dir(&ws))
+        .load("sched-fire-1")
+        .unwrap()
+        .expect("the promise record exists");
+    assert_eq!(task.status, ScheduledStatus::Fired);
+    let result = task.result.clone().unwrap_or_default();
+    assert!(
+        result.contains("Done."),
+        "the fire's answer lands on the promise: {result}"
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn an_overdue_cli_promise_is_marked_missed_and_chat_promises_are_untouched() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("w5-missed");
+    let at = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    seed_cli_promise(&ws, "sched-miss-1", &at);
+    // A chat promise in the same queue dir is none of the CLI's business
+    // (I2): the chat host's ticker owns it, so the scan must skip it.
+    seed_promise(&ws, "sched-chat-1", &at);
+
+    let mock = MockLlm::start(vec![vec![content_frame("Done.")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let ws_prior = set_workspace_env_to(&ws);
+    let out = run_with(&["run", "--allow-all", "say hello"]).await;
+    restore_workspace_env(ws_prior);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains("[schedule] sched-miss-1 missed"),
+        "the overdue promise is reported missed: {err}"
+    );
+    assert!(
+        !err.contains("sched-chat-1"),
+        "the chat promise is never scanned by the CLI: {err}"
+    );
+
+    // Fail closed: the missed promise is marked, never fired late.
+    let store = JsonScheduleStore::new(schedule_dir(&ws));
+    let missed = store.load("sched-miss-1").unwrap().expect("record exists");
+    assert_eq!(missed.status, ScheduledStatus::Missed);
+    assert!(
+        missed
+            .result
+            .clone()
+            .unwrap_or_default()
+            .contains("Re-schedule"),
+        "the missed note names the way back: {:?}",
+        missed.result
+    );
+    // The chat promise is untouched — still pending, still the chat's.
+    let chat = store.load("sched-chat-1").unwrap().expect("record exists");
+    assert_eq!(chat.status, ScheduledStatus::Pending);
+    assert_eq!(chat.platform, "telegram");
 
     let _ = std::fs::remove_dir_all(&ws);
 }

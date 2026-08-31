@@ -20,7 +20,11 @@ use amparo_agent::{
     CaseLibrary, CheckpointStore, EventSink, FanoutSink, JsonCheckpointStore, LedgerSink,
     SpawnAgentTool, TaskStatus, WebApprovalGate,
 };
-use amparo_inference::{InferenceConfig, MAX_TIMEOUT_SECS};
+use amparo_chat::{
+    due_scan, schedule_dir, JsonScheduleStore, ScheduleStore, ScheduleTool, ScheduledStatus,
+    ScheduledTask, SCHEDULE_GRACE,
+};
+use amparo_inference::{InferenceConfig, InferenceProvider, MAX_TIMEOUT_SECS};
 use amparo_notebook::{
     append_event, auto_rollup, check_skill_drift, notebook_dir, skills_dir, CaseRetriever,
     JsonlStore, NotebookSink, SkillLogEvent, SkillSet, HOT_FILE,
@@ -32,7 +36,8 @@ use amparo_policy::{
 use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{
-    default_registry, PathPolicy, SendNotificationTool, SkillLibrary, ToolTrustTier, UseSkillTool,
+    default_registry, PathPolicy, SendNotificationTool, SkillLibrary, ToolRegistry, ToolTrustTier,
+    UseSkillTool,
 };
 use std::sync::{Arc, Mutex};
 
@@ -121,7 +126,18 @@ each escalated/external-effector request is POSTed to the URL as
 \"session_label\", \"rollback\"} JSON, and the gate polls URL/<call_id>
 for {\"status\":\"decided\",\"decision\":true|false} under a 60-second
 deadline — no decision means denial (fail closed). Mutually exclusive
-with --auto-approve and --auto-deny.";
+with --auto-approve and --auto-deny.
+
+The schedule tool is always on in `amparo run` (M8 W5 + M10 W5): a
+promise persists at <workspace>/.amparo/schedule/ and re-enters the same
+gate chain at the next run start. The CLI is process-scoped — no
+background ticker — so due promises fire at run start only
+(best-effort); a promise whose instant passed beyond the 60-second grace
+window is marked missed, never fired late. The scan fires only the
+promises the CLI itself wrote (I2); promises made in chat belong to the
+chat host's ticker. A fire is a fresh task with a reduced tool set — no
+spawn_agent, no schedule: unattended spawn chains would break the
+attribution chain.";
 
 /// Parsed `amparo run` flags.
 #[derive(Debug, Clone)]
@@ -391,9 +407,22 @@ pub async fn execute(flags: RunFlags) -> Result<(), String> {
     // AMPARO_WORKSPACE must be set before the tools capture the path
     // policy at construction — see [`wire`].
     apply_workspace(&flags);
-    let wired = wire(&flags, new_task_id()).await?;
+    let mut wired = wire(&flags, new_task_id()).await?;
     let report = wired.agent.run(flags.task.clone()).await;
+    await_schedule_fires(&mut wired).await;
     finish(wired.notebook, wired.spawn_tool, wired.cost_rate, report).await
+}
+
+/// Wait for the run-start schedule fires (M10 W5): they ran concurrently
+/// with the main task, and the CLI is a short-lived host — awaiting them
+/// here guarantees every promise record is written before the process
+/// exits (the same race the notebook flush guards).
+async fn await_schedule_fires(wired: &mut WiredRun) {
+    for fire in wired.schedule_fires.drain(..) {
+        // A JoinError is absorbed — the promise stays pending and the
+        // next run start re-scans it.
+        let _ = fire.await;
+    }
 }
 
 /// Apply `--workspace` to the process env before anything reads it: the
@@ -441,8 +470,11 @@ async fn execute_resume(flags: &RunFlags) -> Result<(), String> {
     // writes its terminal snapshot through the same store). The resumed
     // task id is the parent id for the spawn tool: children chain off
     // the same id the checkpoint stores.
-    let wired = wire(flags, checkpoint.task_id.clone()).await?;
+    let mut wired = wire(flags, checkpoint.task_id.clone()).await?;
     let report = wired.agent.resume(checkpoint).await;
+    // A resumed run is a run start too: the schedule scan in `wire` has
+    // already spawned its fires — await them before exit.
+    await_schedule_fires(&mut wired).await;
     finish(wired.notebook, wired.spawn_tool, wired.cost_rate, report).await
 }
 
@@ -466,6 +498,10 @@ struct WiredRun {
     notebook: Option<Arc<NotebookSink>>,
     spawn_tool: Option<Arc<SpawnAgentTool>>,
     cost_rate: Option<f64>,
+    /// The run-start schedule fires (M10 W5): due promises run
+    /// concurrently with the main task; the handles are awaited before
+    /// the process exits so every promise record lands.
+    schedule_fires: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Wire the gate chain from flags: provider, policy, approval, sinks
@@ -489,15 +525,9 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
     }
     let provider = config.build().map_err(|e| e.to_string())?;
 
-    let mut registry = default_registry();
-    // M7b: eval_wasm is host-registered (like use_skill below), not part
-    // of the default registry — amparo-tools stays wasmtime-free.
-    registry.register(Arc::new(EvalWasmTool::new()));
-    // M10 W2: with --webhook-url the notification tool POSTs to the
-    // webhook; without it the default registry's stderr transport stands.
-    if let Some(url) = &flags.webhook_url {
-        registry.register(Arc::new(SendNotificationTool::to_webhook(url.clone())));
-    }
+    // The base registry (M10 W5): shared with the fire path — the growth
+    // layer (skills) is the only thing layered on top for the main task.
+    let mut registry = fire_registry(flags);
 
     let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
         (Some(url), false) => {
@@ -671,8 +701,10 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
         Arc::new(FanoutSink::new(sinks))
     };
 
-    let mut agent = Agent::new(provider, registry, policy)
-        .with_approval(approval)
+    // The scheduler needs these parts after the agent is built (the fires
+    // share them with the main task), so the agent holds clones.
+    let mut agent = Agent::new(Arc::clone(&provider), registry, Arc::clone(&policy))
+        .with_approval(Arc::clone(&approval))
         .with_events(sink)
         .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
         // Preflight (M7): the env-derived path policy (AMPARO_WORKSPACE
@@ -701,20 +733,197 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
     // closed at the limit.
     let spawn_tool = if flags.max_sub_agents > 0 {
         let budget = Arc::new(Mutex::new(flags.max_sub_agents));
-        let (swarming, tool) =
-            agent.with_spawn_agent(parent_task_id, Arc::clone(&budget), flags.max_sub_agents);
+        let (swarming, tool) = agent.with_spawn_agent(
+            parent_task_id.clone(),
+            Arc::clone(&budget),
+            flags.max_sub_agents,
+        );
         agent = swarming;
         Some(tool)
     } else {
         None
     };
+    // The schedule queue (M8 W5 + M10 W5): `amparo run` always registers
+    // `schedule` — a promise persists to the workspace queue and fires at
+    // the next run start. Registered AFTER `with_spawn_agent` — the spawn
+    // tool captured the agent's parts before this call — so children
+    // never inherit it: only a top-level task may schedule.
+    agent = agent.with_tool(Arc::new(ScheduleTool::for_cli(
+        Arc::new(JsonScheduleStore::new(schedule_dir(&workspace_root))),
+        parent_task_id.clone(),
+    )));
+
+    // The CLI scheduler (M10 W5): the process is short-lived — no ticker
+    // — so the queue is scanned once, at run start. Missed promises are
+    // marked fail-closed; due ones fire concurrently with the main task
+    // (the handles are awaited before the process exits, so every
+    // promise record lands).
+    let schedule_fires = scan_schedules(
+        Arc::clone(&provider),
+        Arc::clone(&policy),
+        Arc::clone(&approval),
+        flags,
+        &workspace_root,
+    )
+    .await;
 
     Ok(WiredRun {
         agent,
         notebook,
         spawn_tool,
         cost_rate,
+        schedule_fires,
     })
+}
+
+/// The fire registry (M10 W5): the deliberately reduced tool set a fired
+/// promise gets — no `spawn_agent`, no `schedule`: unattended spawn
+/// chains would break the attribution chain, and a fire scheduling a
+/// fire would defeat the queue's purpose. The main task's registry
+/// starts from the same base — the growth layer (skills) is the only
+/// thing layered on top for the main task.
+fn fire_registry(flags: &RunFlags) -> ToolRegistry {
+    let mut registry = default_registry();
+    // M7b: eval_wasm is host-registered (like use_skill), not part of the
+    // default registry — amparo-tools stays wasmtime-free.
+    registry.register(Arc::new(EvalWasmTool::new()));
+    // M10 W2: with --webhook-url the notification tool POSTs to the
+    // webhook; without it the default registry's stderr transport stands.
+    if let Some(url) = &flags.webhook_url {
+        registry.register(Arc::new(SendNotificationTool::to_webhook(url.clone())));
+    }
+    registry
+}
+
+/// One run-start scan of the schedule queue (M10 W5) — the CLI's whole
+/// scheduler. Only `cli` promises are scanned (I2): promises made in
+/// chat belong to the chat host's ticker, which resolves the recorded
+/// tenant's own parts — the CLI cannot, and never touches them. Missed
+/// promises are marked fail-closed with the standard note; due ones
+/// fire as fresh top-level tasks through the same provider, policy and
+/// approval gate the operator configured for this run. The returned
+/// handles are awaited by the caller before the process exits, so every
+/// promise record lands.
+async fn scan_schedules(
+    provider: Arc<dyn InferenceProvider>,
+    policy: Arc<dyn PolicyEngine>,
+    approval: Arc<dyn ApprovalGate>,
+    flags: &RunFlags,
+    workspace_root: &std::path::Path,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let store = Arc::new(JsonScheduleStore::new(schedule_dir(workspace_root)));
+    let tasks: Vec<ScheduledTask> = store
+        .load_all()
+        .into_iter()
+        .filter(|task| task.platform == "cli")
+        .collect();
+    let (due, missed) = due_scan(&tasks, chrono::Utc::now(), SCHEDULE_GRACE);
+    for &index in &missed {
+        let mut task = tasks[index].clone();
+        task.status = ScheduledStatus::Missed;
+        task.result = Some(
+            "the instant passed and the promise was never fired. Re-schedule it if it \
+             still matters."
+                .to_string(),
+        );
+        if let Err(e) = store.save(&task) {
+            eprintln!("[schedule] cannot mark {} missed: {e}", task.id);
+            continue;
+        }
+        eprintln!(
+            "[schedule] {} missed — {}",
+            task.id,
+            task.result.as_deref().unwrap_or_default()
+        );
+    }
+    let mut handles = Vec::with_capacity(due.len());
+    for &index in &due {
+        let task = tasks[index].clone();
+        let store = Arc::clone(&store);
+        let provider = Arc::clone(&provider);
+        let policy = Arc::clone(&policy);
+        let approval = Arc::clone(&approval);
+        let flags = flags.clone();
+        let root = workspace_root.to_path_buf();
+        handles.push(tokio::spawn(async move {
+            fire_promise(provider, policy, approval, &flags, &root, store, task).await;
+        }));
+    }
+    handles
+}
+
+/// Fire one due promise (M10 W5): run the promise's task through the
+/// full gate chain — the same provider, policy and approval the operator
+/// configured for this run — then record the outcome on the promise and
+/// report it on stderr. The fire is a fresh top-level task, deliberately
+/// reduced: no spawn_agent, no schedule, no skills, no case library, no
+/// continuity. A fire whose task needs approval asks the same gate as
+/// the main run (interactive prompt, web endpoint, or an `--auto-*`
+/// flag) — a scheduled promise never executes ahead of the gate.
+async fn fire_promise(
+    provider: Arc<dyn InferenceProvider>,
+    policy: Arc<dyn PolicyEngine>,
+    approval: Arc<dyn ApprovalGate>,
+    flags: &RunFlags,
+    workspace_root: &std::path::Path,
+    store: Arc<JsonScheduleStore>,
+    mut task: ScheduledTask,
+) {
+    let fire_id = new_task_id();
+    // The privacy ledger (always-on, like every task): the fire's rows
+    // are stamped with its own task id — the promise id stays legible on
+    // the promise record itself.
+    let ledger: Option<Arc<LedgerSink>> = match LedgerStore::open_with_quota(
+        privacy_dir(workspace_root).join("ledger.jsonl"),
+        flags.ledger_max_bytes.map(LedgerQuota::new),
+    ) {
+        Ok(store) => Some(Arc::new(LedgerSink::new(
+            store,
+            "cli",
+            Some(fire_id.clone()),
+            None,
+        ))),
+        Err(e) => {
+            eprintln!("[ledger] unavailable — the fire continues without the privacy ledger: {e}");
+            None
+        }
+    };
+    let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(PrintingSink)];
+    if let Some(ledger) = &ledger {
+        sinks.push(Arc::clone(ledger) as Arc<dyn EventSink>);
+    }
+    let sink: Arc<dyn EventSink> = if sinks.len() == 1 {
+        sinks.pop().expect("at least one sink")
+    } else {
+        Arc::new(FanoutSink::new(sinks))
+    };
+    // Checkpoints are written like any task, continuity OFF: the
+    // promise names one concrete fresh task.
+    let agent = Agent::new(provider, fire_registry(flags), policy)
+        .with_events(sink)
+        .with_approval(approval)
+        .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
+        .with_path_policy(Arc::new(PathPolicy::from_env()))
+        .with_checkpoints(Arc::new(JsonCheckpointStore::new(workspace_root)), "cli")
+        .with_task_id(fire_id)
+        .with_config(AgentConfig {
+            trust_ceiling: flags.trust_ceiling,
+            ..AgentConfig::default()
+        });
+    let report = agent.run(task.task.clone()).await;
+    let answer = report
+        .final_answer
+        .unwrap_or_else(|| "The task failed — no final answer was produced.".to_string());
+    task.status = ScheduledStatus::Fired;
+    task.result = Some(answer.clone());
+    if let Err(e) = store.save(&task) {
+        eprintln!(
+            "[schedule] cannot record the fired promise {}: {e}",
+            task.id
+        );
+        return;
+    }
+    eprintln!("[schedule] {} fired — {answer}", task.id);
 }
 
 /// The shared terminal for a fresh run and a resume: flush the growth
@@ -1029,6 +1238,27 @@ mod tests {
         assert_eq!(
             error(parse(&["--approval-endpoint", "nonsense", "task"])),
             "--approval-endpoint must be an http(s) URL, got 'nonsense'"
+        );
+    }
+
+    #[test]
+    fn fire_registry_lacks_spawn_and_schedule() {
+        let registry = fire_registry(&RunFlags::default());
+        assert!(
+            registry.get_executor("spawn_agent").is_none(),
+            "a fire never spawns — unattended chains break attribution"
+        );
+        assert!(
+            registry.get_executor("schedule").is_none(),
+            "a fire never schedules — one fire must not seed the next"
+        );
+        assert!(
+            registry.get_executor("run_command").is_some(),
+            "the base tools remain"
+        );
+        assert!(
+            registry.get_executor("eval_wasm").is_some(),
+            "the sandbox tool remains"
         );
     }
 

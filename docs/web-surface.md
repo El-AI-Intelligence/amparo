@@ -1,6 +1,6 @@
 # Web surface — build contract
 
-Status: **contract v2** (2026-08-30). This document is the binding
+Status: **contract v3** (2026-08-31). This document is the binding
 specification for the web surface — the operator-facing UI built against
 the shipped Amparo binary. It is the "escape hatch" named in
 `docs/swarms-advanced.md`: a face for the agent, not a new trust
@@ -59,7 +59,20 @@ Contract with the spawned process:
 
 For tool-level integrations (not the task runner), the backend may also
 spawn `amparo mcp-serve` (stdio JSON-RPC 2.0, newline-delimited,
-stdout protocol-only). The task runner above is the primary surface.
+stdout protocol-only). With `--max-sub-agents N` (v0.9.0, M10 W5) the
+server registers `spawn_agent` — the web's task reaches swarms through
+the MCP surface under the same shared budget and gate chain as the task
+runner. Without the flag `spawn_agent` stays out of the tool list (and
+the server needs no inference env). The task runner above is the
+primary surface.
+
+`amparo run` always registers the schedule tool (M8 W5): a promise
+persists to the workspace queue, and — the CLI is process-scoped, there
+is no ticker — it fires at the next run start inside the 60s grace
+window, re-entering the same gate chain with a reduced tool set
+(no spawn/schedule recursion). A promise past its instant beyond the
+grace window is marked missed, never fired late. The operator views
+read the same queue (§4).
 
 ## 3. The approval contract (`--approval-endpoint`)
 
@@ -184,6 +197,16 @@ and the example now shows a `write_file` that declares one;
 `--approval-endpoint` also ships on `amparo mcp-serve`. No
 wire-semantics changes — the POST/poll flow and the 60s fail-closed
 deadline are unchanged.
+
+**v2 → v3**: M10 W5. `amparo mcp-serve` gains `--max-sub-agents N` — the
+opt-in `spawn_agent` tool, same budget machinery as `amparo run` (the
+budget is shared across the server; exhaustion fails closed). The CLI
+scheduler lands in `amparo run`: the always-on schedule tool plus a
+run-start scan of the workspace queue — due promises fire through the
+same gate chain with a reduced tool set (spawn/schedule recursion
+excluded), overdue promises are marked missed, and the scan touches
+only promises the CLI itself wrote (chat promises belong to the chat
+host's ticker). No approval-JSON or flag-removal changes.
 
 ## 8. Deliberately excluded
 

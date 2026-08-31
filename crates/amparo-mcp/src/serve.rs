@@ -10,16 +10,31 @@
 //! unless `--auto-approve` is passed — remote MCP clients have no human at
 //! the terminal by default.
 
-use amparo_agent::{ApprovalGate, AutoApprove, AutoDeny, WebApprovalGate};
+use amparo_agent::{
+    format_event, Agent, AgentConfig, AgentEvent, ApprovalGate, AutoApprove, AutoDeny, EventSink,
+    JsonCheckpointStore, SpawnAgentTool, WebApprovalGate,
+};
+use amparo_inference::InferenceConfig;
 use amparo_policy::{
     wire::WirePolicyEngine, AllowAllPolicyEngine, AuditNoticeEngine, DenyAllPolicyEngine,
     PolicyEngine,
 };
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{default_registry, PathPolicy, ToolRegistry, ToolTrustTier};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::McpServer;
+
+/// Renders child-agent events as `[tag]` stderr lines (M10 W5): the MCP
+/// channel keeps stdout protocol-only, so a spawned child's event stream
+/// joins the server's logs — the same stderr contract `amparo run` keeps.
+struct StderrEventSink;
+
+impl EventSink for StderrEventSink {
+    fn emit(&self, event: &AgentEvent) {
+        eprintln!("{}", format_event(event));
+    }
+}
 
 /// Parsed command-line flags for a serve invocation.
 #[derive(Debug, Clone)]
@@ -39,6 +54,11 @@ pub struct ServeFlags {
     /// to this URL and the gate polls it for the human's decision.
     /// Mutually exclusive with `--auto-approve`.
     pub approval_endpoint: Option<String>,
+    /// Swarm budget (M10 W5): register `spawn_agent` with at most N
+    /// sub-agents per spawn chain, all drawing from one shared counter.
+    /// `0` (the default) keeps the tool off — an MCP server spawns no
+    /// agents unless asked.
+    pub max_sub_agents: usize,
 }
 
 impl Default for ServeFlags {
@@ -50,6 +70,7 @@ impl Default for ServeFlags {
             trust_ceiling: ToolTrustTier::SystemControl,
             session_id: None,
             approval_endpoint: None,
+            max_sub_agents: 0,
         }
     }
 }
@@ -84,7 +105,10 @@ pub const HELP: &str =
      \x20                      request to URL, poll URL/<call_id> for the\n\
      \x20                      decision (60s fail-closed)\n\
      \x20 --trust-ceiling T   observational | local_mutating |\n\
-     \x20                      external_effector | system_control (default)\n";
+     \x20                      external_effector | system_control (default)\n\
+     \x20 --max-sub-agents N  register spawn_agent with a shared N spawn\n\
+     \x20                      budget (default 0: no sub-agents; the\n\
+     \x20                      children run on AMPARO_INFERENCE_URL)\n";
 
 /// Parse serve flags from an argument iterator (usually
 /// `env::args().skip(1)`). Never panics and never exits — problems come back
@@ -120,6 +144,19 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> ParseResult {
                     other => return ParseResult::Error(format!("unknown trust tier {other}")),
                 },
                 None => return ParseResult::Error("--trust-ceiling requires a tier".to_string()),
+            },
+            "--max-sub-agents" => match args.next() {
+                Some(n) => match n.parse::<usize>() {
+                    Ok(max) => flags.max_sub_agents = max,
+                    Err(_) => {
+                        return ParseResult::Error(format!(
+                            "--max-sub-agents needs a number, got '{n}'"
+                        ))
+                    }
+                },
+                None => {
+                    return ParseResult::Error("--max-sub-agents requires a number".to_string())
+                }
             },
             "--help" | "-h" => return ParseResult::Help,
             other => return ParseResult::Error(format!("unknown flag {other}; see --help")),
@@ -168,7 +205,7 @@ impl ServeError {
 /// Build the policy, approval gate, registry and server from [`ServeFlags`],
 /// then serve over stdio until the client disconnects.
 pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
-    let policy: Arc<dyn PolicyEngine> = match (flags.policy_url, flags.allow_all) {
+    let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
         (Some(_), true) => {
             return Err(ServeError::config(
                 "--policy-url and --allow-all are mutually exclusive",
@@ -178,7 +215,7 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
             let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
             // M9 W3: every check carries the caller's session id (when
             // given), and the audit-mode notice prints once per process.
-            let engine = WirePolicyEngine::new(url, api_key);
+            let engine = WirePolicyEngine::new(url.clone(), api_key);
             let engine = match &flags.session_id {
                 Some(id) => engine.with_session_id(id.clone()),
                 None => engine,
@@ -202,6 +239,16 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
     // M7b: eval_wasm is served over MCP too; approval defaults to
     // AutoDeny here, so it is refused until an operator allows.
     registry.register(Arc::new(EvalWasmTool::new()));
+    // M10 W5: with --max-sub-agents N the server registers spawn_agent —
+    // the donor agent captures the parts as they now stand (a registry
+    // without itself), so every child starts spawn-free and re-registers
+    // a child-flavored tool under the one shared budget. The spawn call
+    // itself is a gated tools/call exactly like any other (tier
+    // ExternalEffector, so the approval gate sees it).
+    if let Some(tool) = spawn_tool(&flags, &registry, Arc::clone(&policy), Arc::clone(&approval))?
+    {
+        registry.register(tool);
+    }
     let mut server = McpServer::new(registry, policy)
         .with_approval(approval)
         .with_trust_ceiling(flags.trust_ceiling)
@@ -213,6 +260,61 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
         server = server.with_session_id(id.clone());
     }
     server.serve_stdio().await.map_err(ServeError::serve)
+}
+
+/// Build the opt-in `spawn_agent` tool for this server (M10 W5) — `None`
+/// when the flag is off. The tool is built off a donor agent that
+/// mirrors the server's own parts (policy, approval gate, path policy,
+/// trust ceiling) plus an env-derived inference provider for the
+/// children's loops — the same `AMPARO_INFERENCE_*` surface `amparo run`
+/// uses, fail-closed (a missing provider is a usage error, never a
+/// silent default). Every child runs the full gate chain under the one
+/// shared spawn budget, and checkpoints land under the workspace like
+/// any run (tenant `mcp`).
+fn spawn_tool(
+    flags: &ServeFlags,
+    registry: &ToolRegistry,
+    policy: Arc<dyn PolicyEngine>,
+    approval: Arc<dyn ApprovalGate>,
+) -> Result<Option<Arc<SpawnAgentTool>>, ServeError> {
+    if flags.max_sub_agents == 0 {
+        return Ok(None);
+    }
+    let config = InferenceConfig::from_env().map_err(|e| {
+        ServeError::config(format!(
+            "{e}\nset AMPARO_INFERENCE_URL and AMPARO_INFERENCE_MODEL — see the README \
+             Quickstart for the full environment surface"
+        ))
+    })?;
+    let provider = config.build().map_err(|e| ServeError::config(e.to_string()))?;
+    // The child chain id root: the caller's session id when given (so
+    // children chain as `web-1.1`), else a per-process id.
+    let parent_task_id = flags
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("mcp-{}", std::process::id()));
+    let workspace_root = PathPolicy::from_env().workspace_root;
+    let donor = Agent::new(provider, registry.clone(), policy)
+        .with_approval(approval)
+        .with_events(Arc::new(StderrEventSink))
+        .with_privacy(Arc::new(amparo_privacy::PrivacyPolicy::default()))
+        .with_path_policy(Arc::new(PathPolicy::from_env()))
+        .with_checkpoints(
+            Arc::new(JsonCheckpointStore::new(&workspace_root)),
+            "mcp",
+        )
+        .with_task_id(parent_task_id.clone())
+        .with_config(AgentConfig {
+            trust_ceiling: flags.trust_ceiling,
+            ..AgentConfig::default()
+        });
+    let budget = Arc::new(Mutex::new(flags.max_sub_agents));
+    Ok(Some(Arc::new(SpawnAgentTool::new(
+        &donor,
+        parent_task_id,
+        budget,
+        flags.max_sub_agents,
+    ))))
 }
 
 #[cfg(test)]
@@ -352,5 +454,35 @@ mod tests {
     #[test]
     fn help_text_names_the_approval_endpoint_flag() {
         assert!(HELP.contains("--approval-endpoint"));
+    }
+
+    #[test]
+    fn parses_the_max_sub_agents_flag_with_zero_default() {
+        assert_eq!(flags(parse(&[])).max_sub_agents, 0);
+        assert_eq!(
+            flags(parse(&["--max-sub-agents", "3"])).max_sub_agents,
+            3
+        );
+        // Zero is the explicit off switch.
+        assert_eq!(flags(parse(&["--max-sub-agents", "0"])).max_sub_agents, 0);
+    }
+
+    #[test]
+    fn max_sub_agents_rejects_missing_and_non_numeric_values() {
+        match parse(&["--max-sub-agents"]) {
+            ParseResult::Error(m) => assert_eq!(m, "--max-sub-agents requires a number"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match parse(&["--max-sub-agents", "many"]) {
+            ParseResult::Error(m) => {
+                assert_eq!(m, "--max-sub-agents needs a number, got 'many'")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_text_names_the_max_sub_agents_flag() {
+        assert!(HELP.contains("--max-sub-agents"));
     }
 }

@@ -237,11 +237,14 @@ pub struct ScheduleTool {
     chat_id: String,
     /// The requester's platform user id (the approval gate's owner).
     requester: String,
+    /// The schema's firing-semantics copy — the chat and the CLI report
+    /// a fire to different faces, and the model is told which.
+    fire_copy: String,
 }
 
 impl ScheduleTool {
     /// A schedule tool bound to one chat: promises written by it fire as
-    /// that chat's requester.
+    /// that chat's requester and the result reports back to the chat.
     pub fn new(
         store: Arc<dyn ScheduleStore>,
         tenant: impl Into<String>,
@@ -255,6 +258,30 @@ impl ScheduleTool {
             platform: platform.into(),
             chat_id: chat_id.into(),
             requester: requester.into(),
+            fire_copy: "When it fires, it re-enters the same policy and approval gate chain as \
+                        a live task and reports back to this chat."
+                .to_string(),
+        }
+    }
+
+    /// A schedule tool for the CLI (M10 W5): the process is short-lived
+    /// — there is no ticker — so a promise fires at the next
+    /// `amparo run` start (within the grace window), and the result is
+    /// recorded on the promise and printed to stderr. Tenant, platform
+    /// and requester are all the run's task id: there is no chat to
+    /// report back to.
+    pub fn for_cli(store: Arc<dyn ScheduleStore>, task_id: impl Into<String>) -> Self {
+        let task_id = task_id.into();
+        Self {
+            store,
+            tenant: "cli".to_string(),
+            platform: "cli".to_string(),
+            chat_id: task_id.clone(),
+            requester: task_id,
+            fire_copy: "The promise re-enters the same policy and approval gate chain when it \
+                        fires — at the next `amparo run` start, within the grace window — and \
+                        the result is recorded on the promise and printed to stderr."
+                .to_string(),
         }
     }
 
@@ -273,10 +300,10 @@ impl ToolExecutor for ScheduleTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: SCHEDULE.to_string(),
-            description: "Schedule a task to run at a specific future time. When it fires, it \
-                 re-enters the same policy and approval gate chain as a live task and \
-                 reports back to this chat."
-                .to_string(),
+            description: format!(
+                "Schedule a task to run at a specific future time. {}",
+                self.fire_copy
+            ),
             parameters: vec![
                 ToolParam {
                     name: "at".to_string(),
@@ -578,6 +605,50 @@ mod tests {
             result.display_summary.contains("cannot persist"),
             "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn cli_tool_names_the_run_start_fire_and_tags_the_promise_cli() {
+        let dir = std::env::temp_dir().join(format!("amparo-schedule-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = JsonScheduleStore::new(dir.clone());
+        let tool = ScheduleTool::for_cli(Arc::new(store.clone()), "sess-1");
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("next `amparo run` start"),
+            "the CLI copy names the run-start fire: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("stderr"),
+            "the CLI copy names where the result lands: {}",
+            schema.description
+        );
+        // The promise is tagged cli end to end — the run-start scan
+        // fires only promises it wrote (I2).
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: SCHEDULE.to_string(),
+            arguments: serde_json::json!({
+                "at": "2099-01-01T00:00:00Z",
+                "task": "a cli promise"
+            }),
+        };
+        let result = tool.execute(&call).await;
+        assert!(result.success, "the promise persists: {result:?}");
+        let saved = store
+            .load(
+                result.output["id"]
+                    .as_str()
+                    .expect("the result names the id"),
+            )
+            .unwrap()
+            .expect("the cli promise file exists");
+        assert_eq!(saved.tenant, "cli");
+        assert_eq!(saved.platform, "cli");
+        assert_eq!(saved.chat_id, "sess-1");
+        assert_eq!(saved.requester, "sess-1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

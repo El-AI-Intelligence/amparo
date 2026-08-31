@@ -108,7 +108,9 @@ name = "amparo-mcp"
 version = "0.8.0"
 dependencies = [
  "amparo-agent",
+ "amparo-inference",
  "amparo-policy",
+ "amparo-privacy",
  "amparo-sandbox",
  "amparo-tools",
  "async-trait",

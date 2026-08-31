@@ -49,12 +49,13 @@ pub mod telegram;
 pub mod transport;
 
 pub use config::{ChatConfig, ConfigError, UserProfile};
-pub use driver::{ChatDriver, PolicySource, Tenants};
+pub use driver::{ChatDriver, PolicySource, Tenants, SCHEDULE_GRACE};
 pub use gate::{ChatApprovalGate, TimeoutApprovalGate};
 pub use notification::ChatNotificationTransport;
 pub use router::{ApprovalRouter, TakeResult};
 pub use schedule::{
-    schedule_dir, JsonScheduleStore, ScheduleStore, ScheduleTool, ScheduledStatus, ScheduledTask,
+    due_scan, schedule_dir, JsonScheduleStore, ScheduleStore, ScheduleTool, ScheduledStatus,
+    ScheduledTask,
 };
 pub use sink::ChatEventSink;
 pub use transport::{
