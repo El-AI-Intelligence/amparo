@@ -4182,6 +4182,619 @@ async fn tui_piped_runs_a_task_and_renders_the_chain() {
     );
 }
 
+// ── Mock Guardrail Console ───────────────────────────────────────────────────
+
+/// One scripted response: (method, path, status, json body). Requests
+/// match by method+path, so the repeats the client performs per command
+/// (one org resolution each) get the same response.
+type ConsoleRow = (String, String, u16, Value);
+
+/// A hand-rolled responder for the org-rules REST surface: the
+/// `OrgPolicyClient` calls (method, path) pairs the test scripts, and
+/// every request body is recorded so tests can assert what the TUI sent.
+struct MockConsole {
+    addr: std::net::SocketAddr,
+    requests: Arc<tokio::sync::Mutex<Vec<(String, String, Value)>>>,
+}
+
+impl MockConsole {
+    async fn start(script: Vec<ConsoleRow>) -> MockConsole {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock console");
+        let addr = listener.local_addr().unwrap();
+        let requests: Arc<tokio::sync::Mutex<Vec<(String, String, Value)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded);
+                let script = script.clone();
+                tokio::spawn(async move {
+                    // Read head + Content-Length body (the MockPolicy
+                    // pattern).
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if buf.len() > 1_000_000 {
+                            break;
+                        }
+                    }
+                    let split = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                        .unwrap_or(buf.len());
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.trim_start()
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let mut body = buf[split..].to_vec();
+                    while body.len() < content_length {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+                    let mut req = head.lines().next().unwrap_or_default().split_whitespace();
+                    let method = req.next().unwrap_or_default().to_string();
+                    let path = req.next().unwrap_or_default().to_string();
+                    recorded
+                        .lock()
+                        .await
+                        .push((method.clone(), path.clone(), value));
+                    let (status, json) = script
+                        .iter()
+                        .find(|(m, p, _, _)| m == &method && p == &path)
+                        .map(|(_, _, s, b)| (*s, b.to_string()))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "no scripted response for {method} {path} (body: {})",
+                                String::from_utf8_lossy(&body)
+                            )
+                        });
+                    let reason = match status {
+                        200 | 201 => "OK",
+                        400 => "Bad Request",
+                        402 => "Payment Required",
+                        404 => "Not Found",
+                        409 => "Conflict",
+                        _ => "Error",
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        MockConsole { addr, requests }
+    }
+
+    /// Base URL for `AMPARO_CONSOLE_POLICY_URL`.
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Every recorded request: (method, path, body) in arrival order.
+    async fn requests(&self) -> Vec<(String, String, Value)> {
+        self.requests.lock().await.clone()
+    }
+}
+
+// ── Mock engramd ─────────────────────────────────────────────────────────────
+
+/// One scripted response keyed by request line prefix ("GET /health",
+/// "POST /memories", …) — each path is requested once per test run (the
+/// boot probe, then the command's own call).
+struct MockEngramd {
+    addr: std::net::SocketAddr,
+    requests: Arc<tokio::sync::Mutex<Vec<(String, Value)>>>,
+}
+
+impl MockEngramd {
+    async fn start(script: Vec<(String, u16, Value)>) -> MockEngramd {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock engramd");
+        let addr = listener.local_addr().unwrap();
+        let requests: Arc<tokio::sync::Mutex<Vec<(String, Value)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded);
+                let script = script.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if buf.len() > 1_000_000 {
+                            break;
+                        }
+                    }
+                    let split = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                        .unwrap_or(buf.len());
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.trim_start()
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let mut body = buf[split..].to_vec();
+                    while body.len() < content_length {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+                    let key = head
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    recorded.lock().await.push((key.clone(), value));
+                    let (status, json) = script
+                        .iter()
+                        .find(|(k, _, _)| *k == key)
+                        .map(|(_, s, b)| (*s, b.to_string()))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "no scripted response for {key} (body: {})",
+                                String::from_utf8_lossy(&body)
+                            )
+                        });
+                    let reason = if status == 200 { "OK" } else { "Not Found" };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        MockEngramd { addr, requests }
+    }
+
+    /// Base URL for `AMPARO_ENGRAM_URL`.
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Every recorded request: (request line, body) in arrival order.
+    async fn requests(&self) -> Vec<(String, Value)> {
+        self.requests.lock().await.clone()
+    }
+}
+
+// ── tui /memory + /policy + ! ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tui_memory_add_and_search_roundtrip_through_the_engram_daemon() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let engram = MockEngramd::start(vec![
+        ("GET /health".to_string(), 200, json!({"status": "ok"})),
+        (
+            "POST /memories".to_string(),
+            200,
+            json!({"id": "mem-1", "content": "buy more coffee", "created_at": "2026-09-01T00:00:00Z"}),
+        ),
+        (
+            "POST /memories/search".to_string(),
+            200,
+            json!({"results": [{"id": "mem-1", "content": "buy more coffee", "created_at": "2026-09-01T00:00:00Z"}]}),
+        ),
+    ])
+    .await;
+    let _mem_env = set_env(
+        &[
+            ("AMPARO_MEMORY_BACKEND", "engram"),
+            ("AMPARO_ENGRAM_URL", &engram.url()),
+        ],
+        &[
+            "AMPARO_ENGRAM_KEY",
+            "AMPARO_POLICY_KEY",
+            "AMPARO_CONSOLE_POLICY_URL",
+        ],
+    );
+
+    let out = run_with_stdin(
+        &["tui"],
+        b"/memory add buy more coffee\n/memory search coffee\n",
+    )
+    .await;
+
+    drop(_mem_env);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(text.contains("Engram Vault"), "{text}");
+    assert!(
+        text.contains("[memory] stored mem-1"),
+        "no session-only suffix on the vault store: {text}"
+    );
+    assert!(text.contains("[memory] 1 hit(s):"), "{text}");
+    assert!(text.contains("buy more coffee   mem-1"), "{text}");
+    // The human keystroke rides verbatim in the POST body.
+    let posts: Vec<_> = engram
+        .requests()
+        .await
+        .into_iter()
+        .filter(|(k, _)| k == "POST /memories")
+        .collect();
+    assert_eq!(posts.len(), 1, "one capture: {posts:?}");
+    assert_eq!(posts[0].1["content"], "buy more coffee");
+    assert!(!text.contains("\x1b["), "zero escapes: {text}");
+}
+
+#[tokio::test]
+async fn tui_memory_add_reports_a_filtered_capture() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let _engram = MockEngramd::start(vec![
+        ("GET /health".to_string(), 200, json!({"status": "ok"})),
+        (
+            "POST /memories".to_string(),
+            200,
+            json!({
+                "id": "mem-9",
+                "content": "noise",
+                "created_at": "2026-09-01T00:00:00Z",
+                "skipped": true,
+                "skip_reason": "ignored source: interaction",
+                "matched_id": null
+            }),
+        ),
+    ])
+    .await;
+    let _mem_env = set_env(
+        &[
+            ("AMPARO_MEMORY_BACKEND", "engram"),
+            ("AMPARO_ENGRAM_URL", &_engram.url()),
+        ],
+        &[
+            "AMPARO_ENGRAM_KEY",
+            "AMPARO_POLICY_KEY",
+            "AMPARO_CONSOLE_POLICY_URL",
+        ],
+    );
+
+    let out = run_with_stdin(&["tui"], b"/memory add noise\n").await;
+
+    drop(_mem_env);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        text.contains("[memory] filtered — ignored source: interaction"),
+        "{text}"
+    );
+    assert!(!text.contains("\x1b["), "zero escapes: {text}");
+}
+
+#[tokio::test]
+async fn tui_memory_add_builtin_reports_the_session_only_store() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let _mem_env = set_env(
+        &[],
+        &[
+            "AMPARO_MEMORY_BACKEND",
+            "AMPARO_ENGRAM_URL",
+            "AMPARO_ENGRAM_KEY",
+            "AMPARO_POLICY_KEY",
+            "AMPARO_CONSOLE_POLICY_URL",
+        ],
+    );
+
+    let out = run_with_stdin(&["tui"], b"/memory add hello builtin\n/memory search hello\n").await;
+
+    drop(_mem_env);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        text.contains("[memory] stored mem-") && text.contains("built-in store (session-only)"),
+        "{text}"
+    );
+    assert!(text.contains("[memory] 1 hit(s):"), "{text}");
+    assert!(!text.contains("\x1b["), "zero escapes: {text}");
+}
+
+/// The console script the connected /policy tests share: one org, one
+/// existing rule (r1), creates (r2), flips (r1), and the settings PUT.
+fn policy_console_script() -> Vec<ConsoleRow> {
+    vec![
+        (
+            "GET".to_string(),
+            "/api/orgs/current".to_string(),
+            200,
+            json!({"org_id": "org-1", "name": "Test Org", "slug": "test", "enforce_mode": "audit"}),
+        ),
+        (
+            "GET".to_string(),
+            "/api/orgs/org-1/policies".to_string(),
+            200,
+            json!({"rules": [{
+                "id": "r1", "org_id": "org-1", "tool_name": "read_file",
+                "reason": "compliance hold", "enabled": true,
+                "created_by": "u1", "created_at": "2026-09-01T00:00:00Z"
+            }]}),
+        ),
+        (
+            "POST".to_string(),
+            "/api/orgs/org-1/policies".to_string(),
+            201,
+            json!({"rule": {
+                "id": "r2", "org_id": "org-1", "tool_name": "shell",
+                "reason": "paused", "enabled": true,
+                "created_by": "u1", "created_at": "2026-09-01T00:00:00Z"
+            }}),
+        ),
+        (
+            "PUT".to_string(),
+            "/api/orgs/org-1/policies/r1".to_string(),
+            200,
+            json!({"rule": {
+                "id": "r1", "org_id": "org-1", "tool_name": "read_file",
+                "reason": "compliance hold", "enabled": false,
+                "created_by": "u1", "created_at": "2026-09-01T00:00:00Z"
+            }}),
+        ),
+        (
+            "PUT".to_string(),
+            "/api/orgs/org-1/settings".to_string(),
+            200,
+            json!({"status": "ok"}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn tui_policy_writes_rules_through_the_console() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let console = MockConsole::start(policy_console_script()).await;
+    let policy = MockPolicy::start().await;
+    let _pol_env = set_env(
+        &[
+            ("AMPARO_POLICY_KEY", "gk_test_org_key"),
+            ("AMPARO_CONSOLE_POLICY_URL", &console.url()),
+        ],
+        &[],
+    );
+
+    let out = run_with_stdin(
+        &["tui", "--policy-url", &policy.url()],
+        b"/policy list\n/policy deny shell paused\n/policy toggle read_file\n/policy enforce\n",
+    )
+    .await;
+
+    drop(_pol_env);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(text.contains("[policy] 1 org rule(s) · org mode: audit"), "{text}");
+    assert!(text.contains("read_file  enabled — compliance hold"), "{text}");
+    assert!(text.contains("[policy] denied shell — rule r2 active"), "{text}");
+    assert!(text.contains("[policy] read_file disabled"), "{text}");
+    assert!(text.contains("[policy] org mode: enforce"), "{text}");
+    // The writes carried the wire shapes: tool_name+reason on create,
+    // enabled:false on toggle, enforce_mode on settings.
+    let requests = console.requests().await;
+    let post = requests
+        .iter()
+        .find(|(m, p, _)| m == "POST" && p == "/api/orgs/org-1/policies")
+        .expect("deny POST");
+    assert_eq!(post.2["tool_name"], "shell");
+    assert_eq!(post.2["reason"], "paused");
+    let flip = requests
+        .iter()
+        .find(|(m, p, _)| m == "PUT" && p == "/api/orgs/org-1/policies/r1")
+        .expect("toggle PUT");
+    assert_eq!(flip.2["enabled"], false);
+    let mode = requests
+        .iter()
+        .find(|(m, p, _)| m == "PUT" && p == "/api/orgs/org-1/settings")
+        .expect("settings PUT");
+    assert_eq!(mode.2["enforce_mode"], "enforce");
+    assert!(!text.contains("\x1b["), "zero escapes: {text}");
+}
+
+#[tokio::test]
+async fn tui_policy_402_tier_text_rides_verbatim() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let console = MockConsole::start(vec![
+        (
+            "GET".to_string(),
+            "/api/orgs/current".to_string(),
+            200,
+            json!({"org_id": "org-1", "name": "Test Org", "slug": "test", "enforce_mode": "audit"}),
+        ),
+        (
+            "PUT".to_string(),
+            "/api/orgs/org-1/settings".to_string(),
+            402,
+            json!({"error": "Enforce mode requires the Pro plan or above. Your current plan is free."}),
+        ),
+    ])
+    .await;
+    let policy = MockPolicy::start().await;
+    let _pol_env = set_env(
+        &[
+            ("AMPARO_POLICY_KEY", "gk_test_org_key"),
+            ("AMPARO_CONSOLE_POLICY_URL", &console.url()),
+        ],
+        &[],
+    );
+
+    let out = run_with_stdin(&["tui", "--policy-url", &policy.url()], b"/policy enforce\n").await;
+
+    drop(_pol_env);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        text.contains("Enforce mode requires the Pro plan or above. Your current plan is free."),
+        "{text}"
+    );
+    assert!(text.contains("[policy] HTTP 402"), "{text}");
+    assert!(!text.contains("\x1b["), "zero escapes: {text}");
+}
+
+#[tokio::test]
+async fn tui_policy_deny_conflict_points_at_toggle() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let console = MockConsole::start(vec![
+        (
+            "GET".to_string(),
+            "/api/orgs/current".to_string(),
+            200,
+            json!({"org_id": "org-1", "name": "Test Org", "slug": "test", "enforce_mode": "audit"}),
+        ),
+        (
+            "GET".to_string(),
+            "/api/orgs/org-1/policies".to_string(),
+            200,
+            json!({"rules": [{"id": "r9", "org_id": "org-1", "tool_name": "shell", "reason": "paused", "enabled": true}]}),
+        ),
+        (
+            "POST".to_string(),
+            "/api/orgs/org-1/policies".to_string(),
+            409,
+            json!({"error": "duplicate rule for shell"}),
+        ),
+    ])
+    .await;
+    let policy = MockPolicy::start().await;
+    let _pol_env = set_env(
+        &[
+            ("AMPARO_POLICY_KEY", "gk_test_org_key"),
+            ("AMPARO_CONSOLE_POLICY_URL", &console.url()),
+        ],
+        &[],
+    );
+
+    let out = run_with_stdin(&["tui", "--policy-url", &policy.url()], b"/policy deny shell x\n").await;
+
+    drop(_pol_env);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    // The console's error body rides verbatim (the client's contract) —
+    // the guidance names the toggle path.
+    assert!(
+        text.contains("[policy] 'shell' already has a rule ({\"error\":\"duplicate rule for shell\"}) — /policy toggle shell"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn tui_policy_no_key_reports_not_connected_with_the_pairing_hint() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let _pol_env = set_env(
+        &[],
+        &["AMPARO_POLICY_KEY", "AMPARO_CONSOLE_POLICY_URL"],
+    );
+    let policy = MockPolicy::start().await;
+
+    let out = run_with_stdin(&["tui", "--policy-url", &policy.url()], b"/policy list\n").await;
+
+    drop(_pol_env);
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        text.contains(
+            "[policy] not connected — set AMPARO_POLICY_KEY (a gk_ org key) — `guardrail link` pairs this machine"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("\x1b["), "zero escapes: {text}");
+}
+
+#[tokio::test]
+async fn tui_bang_runs_the_child_inline() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![]).await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with_stdin(&["tui"], b"! echo hello-from-bang\n! exit 3\n").await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(text.contains("hello-from-bang"), "{text}");
+    assert!(text.contains("[shell] exited exit status: 3"), "{text}");
+    assert!(!text.contains("\x1b["), "zero escapes: {text}");
+}
+
 // ── wizard ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]

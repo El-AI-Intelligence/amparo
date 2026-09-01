@@ -578,6 +578,22 @@ fn console_policy_url() -> String {
         .unwrap_or_else(|_| amparo_tools::org_policy::DEFAULT_CONSOLE_POLICY_URL.to_string())
 }
 
+/// The host of a URL, hand-parsed (the CLI carries no URL crate): scheme
+/// and path dropped, port kept — a direct engine wire on another port
+/// must not look console-routed.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    Some(rest.split(['/', '?', '#']).next()?.to_string())
+}
+
+/// The wire host out of a banner line like
+/// `wire http://127.0.0.1:47800 (profile)` — `None` when the banner is
+/// not a wire line or the URL does not parse.
+fn banner_policy_host(banner: &str) -> Option<String> {
+    let url = banner.strip_prefix("wire ")?.split_whitespace().next()?;
+    host_of(url)
+}
+
 /// The memory console URL — overridable for self-hosted consoles.
 fn console_memory_url() -> String {
     std::env::var("AMPARO_CONSOLE_MEMORY_URL")
@@ -617,6 +633,20 @@ fn policy_block(
             out.push(format!("  engine:   {} · {}", l.banner.policy, mode));
             let url = console_policy_url();
             out.push(format!("  source:   {}", link(paint, controls, &url, &url)));
+            // Org rules apply only when checks route through the console
+            // proxy — a direct engine wire runs beside them (F4).
+            if let Some(host) = banner_policy_host(&l.banner.policy) {
+                let console = console_policy_url();
+                if host_of(&console).as_deref() != Some(host.as_str()) {
+                    out.push(format!(
+                        "  warn:     checks route to {host} — org rules apply only through the console proxy"
+                    ));
+                }
+            }
+            out.push(
+                "  note:     /policy deny|toggle writes org rules — the Guardrail Console applies them"
+                    .to_string(),
+            );
         }
         _ => {
             out.push("  engine:   built-in · deny-all default".to_string());
@@ -665,6 +695,10 @@ fn memory_block(paint: &Paint, controls: bool, live: Option<&Live>) -> Vec<Strin
             out.push(
                 "  note:     daemon reachable — searchable memory across sessions".to_string(),
             );
+            out.push(
+                "  note:     /memory add stores here verbatim — /memory search queries it"
+                    .to_string(),
+            );
         }
         _ => {
             out.push("  backend:   built-in store".to_string());
@@ -676,6 +710,10 @@ fn memory_block(paint: &Paint, controls: bool, live: Option<&Live>) -> Vec<Strin
                     .to_string(),
             );
             out.push(format!("            {}", link(paint, controls, &url, &url)));
+            out.push(
+                "  note:     /memory add still works — the built-in store keeps this session only"
+                    .to_string(),
+            );
         }
     }
     out.push(rule);
@@ -689,7 +727,10 @@ fn help_lines(paint: &Paint) -> Vec<String> {
         d("  type a task, press enter        run it through the gate chain"),
         d("  ↑↓                              step through the command history"),
         d("  ctrl+c                          cancel a running task (again: exit)"),
-        d("  /policy  /memory                the companion consoles as reports"),
+        d("  /memory add <text> | search <q> write and query memory, verbatim"),
+        d("  /policy list | deny <tool>      the Guardrail Console org rules"),
+        d("  /policy toggle | enforce | audit  one rule, or the org's mode"),
+        d("  ! <command>                     run a shell command (outside the chain)"),
         d("  /chain   /key                   the chain, re-explained"),
         d("  /resume                         pick up a checkpointed task"),
         d("  /quit                           leave"),
@@ -1813,11 +1854,218 @@ enum CommandOut {
     Quit,
 }
 
+/// `/memory add|search` — the human's direct write into the memory store.
+///
+/// The human keystroke is stored verbatim: it sits at the top of the gate
+/// chain, above the agent's own PII-stripped `MemoryWriteTool` (I1/I3).
+/// The store Arc is cloned out of the live lock before any await — the
+/// std mutex never spans one.
+async fn cmd_memory(ui: &Arc<Ui>, live: &Arc<Mutex<Option<Live>>>, rest: &str) {
+    let (sub, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+    let memory = {
+        let guard = live.lock().unwrap();
+        guard.as_ref().map(|l| Arc::clone(&l.memory))
+    };
+    let Some(memory) = memory else {
+        ui.line("[memory] not wired yet — the store resolves at boot");
+        return;
+    };
+    match sub {
+        "add" => {
+            let text = arg.trim();
+            if text.is_empty() {
+                ui.line("[memory] usage: /memory add <text> — stored verbatim");
+                return;
+            }
+            match memory.store(text.to_string()).await {
+                Ok(id) => {
+                    let note = if memory.name() == "engram" {
+                        String::new()
+                    } else {
+                        " — built-in store (session-only)".to_string()
+                    };
+                    ui.line(&format!("[memory] stored {id}{note}"));
+                }
+                Err(reason) => ui.line(&format!("[memory] filtered — {reason}")),
+            }
+        }
+        "search" => {
+            let query = arg.trim();
+            if query.is_empty() {
+                ui.line("[memory] usage: /memory search <query>");
+                return;
+            }
+            let hits = memory.search(query, 5).await;
+            if hits.is_empty() {
+                ui.line("[memory] no hits");
+                return;
+            }
+            ui.line(&format!("[memory] {} hit(s):", hits.len()));
+            for h in &hits {
+                ui.line(&format!("  {}   {}", clip(&h.content, 56), h.id));
+            }
+        }
+        other => ui.line(&format!(
+            "[memory] unknown '{other}' — /memory add <text> | /memory search <query>"
+        )),
+    }
+}
+
+/// The `/policy` errors, in the surface's voice.
+fn policy_err_line(e: &amparo_tools::OrgPolicyError) -> String {
+    match e {
+        amparo_tools::OrgPolicyError::NotConnected(hint) => {
+            format!("[policy] not connected — {hint}")
+        }
+        amparo_tools::OrgPolicyError::Http { status, message } => {
+            format!("[policy] HTTP {status} — {message}")
+        }
+        amparo_tools::OrgPolicyError::BadResponse(m) => format!("[policy] bad response — {m}"),
+    }
+}
+
+/// `/policy list|deny|toggle|enforce|audit` — the human's direct write
+/// into the Guardrail Console org rules.
+///
+/// Harden-only by construction: the console accepts deny rules, never
+/// allows, so nothing typed here can weaken the gate chain. The rules
+/// apply only when the run's checks route through the console proxy — a
+/// run with no wire engine (or wired directly at the engine) has nothing
+/// for them to act on, and the command says so.
+async fn cmd_policy(ui: &Arc<Ui>, live: &Arc<Mutex<Option<Live>>>, rest: &str) {
+    let wired = {
+        let guard = live.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|l| l.banner.policy.clone())
+            .is_some_and(|p| p.starts_with("wire "))
+    };
+    if !wired {
+        ui.line("[policy] not wired yet — connect a Guardrail engine first (/key)");
+        return;
+    }
+    let client = match amparo_tools::OrgPolicyClient::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            ui.line(&policy_err_line(&e));
+            return;
+        }
+    };
+    let (sub, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+    match sub {
+        "list" => {
+            let org = match client.current_org().await {
+                Ok(o) => o,
+                Err(e) => {
+                    ui.line(&policy_err_line(&e));
+                    return;
+                }
+            };
+            match client.list_rules().await {
+                Ok(rules) => {
+                    ui.line(&format!(
+                        "[policy] {} org rule(s) · org mode: {}",
+                        rules.len(),
+                        org.enforce_mode
+                    ));
+                    for r in &rules {
+                        let state = if r.enabled { "enabled" } else { "disabled" };
+                        let reason = if r.reason.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", r.reason)
+                        };
+                        ui.line(&format!("  {}  {}{}", clip(&r.tool_name, 28), state, reason));
+                    }
+                }
+                Err(e) => ui.line(&policy_err_line(&e)),
+            }
+        }
+        "deny" => {
+            let (tool, reason) = arg
+                .split_once(' ')
+                .map(|(t, r)| (t.trim(), r.trim()))
+                .unwrap_or((arg.trim(), ""));
+            match client.deny(tool, reason).await {
+                Ok(rule) => ui.line(&format!(
+                    "[policy] denied {} — rule {} active",
+                    rule.tool_name, rule.id
+                )),
+                Err(amparo_tools::OrgPolicyError::Http { status: 409, message }) => {
+                    ui.line(&format!(
+                        "[policy] '{tool}' already has a rule ({message}) — /policy toggle {tool}"
+                    ));
+                }
+                Err(e) => ui.line(&policy_err_line(&e)),
+            }
+        }
+        "toggle" => {
+            let tool = arg.trim();
+            match client.toggle(tool).await {
+                Ok(rule) => {
+                    let state = if rule.enabled { "enabled" } else { "disabled" };
+                    ui.line(&format!("[policy] {} {state}", rule.tool_name));
+                }
+                Err(e) => ui.line(&policy_err_line(&e)),
+            }
+        }
+        "enforce" | "audit" => match client.set_mode(sub).await {
+            Ok(()) => ui.line(&format!("[policy] org mode: {sub}")),
+            Err(e) => ui.line(&policy_err_line(&e)),
+        },
+        other => ui.line(&format!(
+            "[policy] unknown '{other}' — /policy list | deny <tool> | toggle <tool> | enforce | audit"
+        )),
+    }
+}
+
+/// The platform shell behind `!`: `sh -c` on unix, `cmd /C` elsewhere.
+#[cfg(unix)]
+fn shell_command(cmd: &str) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new("sh");
+    c.arg("-c").arg(cmd);
+    c
+}
+
+/// The platform shell behind `!`: `cmd /C` (non-unix).
+#[cfg(not(unix))]
+fn shell_command(cmd: &str) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new("cmd");
+    c.arg("/C").arg(cmd);
+    c
+}
+
+/// `! <cmd>` — a shell escape at the prompt.
+///
+/// Interactive: the raw-mode guard drops so the child owns a normal
+/// terminal (its output — or its own TUI — renders), then raw mode
+/// re-enters. Piped: spawn and wait; the child inherits stdio, so its
+/// output lands inline in the stream. The child runs OUTSIDE the gate
+/// chain — it is the human's own keystroke, like any shell.
+async fn shell_escape(ui: &Arc<Ui>, raw: &RawSlot, cmd: &str) {
+    if cmd.is_empty() {
+        ui.line("[shell] usage: ! <command> — runs in your shell, outside the gate chain");
+        return;
+    }
+    #[cfg(unix)]
+    raw.drop_for_child();
+    let status = shell_command(cmd).status().await;
+    #[cfg(unix)]
+    raw.reenter();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => ui.line(&format!("[shell] exited {s}")),
+        Err(e) => ui.line(&format!("[shell] failed to run — {e}")),
+    }
+}
+
 /// The `/` commands. `/resume` opens the picker (which borrows the reader
-/// channel for its keys).
+/// channel for its keys); the `/memory` and `/policy` subcommands write
+/// into the sibling products; `!` runs a shell command outside the chain.
 async fn handle_command(
     ui: &Arc<Ui>,
     live: &Arc<Mutex<Option<Live>>>,
+    raw: &RawSlot,
     line: &str,
     main_rx: &mut mpsc::UnboundedReceiver<ReaderMsg>,
 ) -> CommandOut {
@@ -1865,6 +2113,18 @@ async fn handle_command(
             Some(cp) => CommandOut::Resume(cp),
             None => CommandOut::Handled,
         },
+        other if other.starts_with("/memory ") => {
+            cmd_memory(ui, live, &other["/memory ".len()..]).await;
+            CommandOut::Handled
+        }
+        other if other.starts_with("/policy ") => {
+            cmd_policy(ui, live, &other["/policy ".len()..]).await;
+            CommandOut::Handled
+        }
+        other if other.starts_with('!') => {
+            shell_escape(ui, raw, other[1..].trim()).await;
+            CommandOut::Handled
+        }
         other if other.starts_with('/') => {
             ui.line(&format!(
                 "[note] unknown command '{other}' — /help lists them"
@@ -1967,6 +2227,7 @@ async fn run_interactive(
     live: &Arc<Mutex<Option<Live>>>,
     keys: &Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<char>>>>,
     mut main_rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    raw: &RawSlot,
 ) -> Result<(), String> {
     let mut failed = false;
     loop {
@@ -1992,7 +2253,7 @@ async fn run_interactive(
                 if line.is_empty() {
                     continue;
                 }
-                match handle_command(ui, live, &line, &mut main_rx).await {
+                match handle_command(ui, live, raw, &line, &mut main_rx).await {
                     CommandOut::Quit => break,
                     CommandOut::Handled => {}
                     CommandOut::Task(task) => {
@@ -2054,6 +2315,7 @@ async fn run_piped(
     live: &Arc<Mutex<Option<Live>>>,
     keys: &Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<char>>>>,
     main_rx: &mut mpsc::UnboundedReceiver<ReaderMsg>,
+    raw: &RawSlot,
 ) -> Result<(), String> {
     let mut failed = false;
     // The cancel watch stays armed for the whole session; piped runs are
@@ -2065,7 +2327,7 @@ async fn run_piped(
         if line.is_empty() {
             continue;
         }
-        match handle_command(ui, live, &line, main_rx).await {
+        match handle_command(ui, live, raw, &line, main_rx).await {
             CommandOut::Quit => break,
             CommandOut::Handled => {}
             CommandOut::Task(task) => {
@@ -2141,15 +2403,15 @@ async fn run_tui(flags: RunFlags) -> Result<(), String> {
     let _main_tx = main_tx; // no reader thread here — stdin stays cooked
 
     // Raw mode for the life of the run: the guard restores the terminal
-    // on drop.
+    // on drop. The `!` escape borrows the slot — a child gets a cooked
+    // terminal, then raw mode re-enters.
+    let raw = RawSlot::new();
     #[cfg(unix)]
-    let _raw: Option<RawGuard> = if controls {
+    if controls {
         ui.enable_modes();
         ui.set_title("amparo · idle");
-        enter_raw_mode()
-    } else {
-        None
-    };
+        raw.set(enter_raw_mode());
+    }
 
     let live: Arc<Mutex<Option<Live>>> = Arc::new(Mutex::new(None));
     boot_wire(&ui, &flags, &live, &keys).await?;
@@ -2165,11 +2427,11 @@ async fn run_tui(flags: RunFlags) -> Result<(), String> {
     });
 
     let result = if controls {
-        run_interactive(&ui, &flags, &live, &keys, main_rx).await
+        run_interactive(&ui, &flags, &live, &keys, main_rx, &raw).await
     } else {
         drop(main_rx);
         let (_, mut noop_rx) = mpsc::unbounded_channel::<ReaderMsg>();
-        run_piped(&ui, &flags, &live, &keys, &mut noop_rx).await
+        run_piped(&ui, &flags, &live, &keys, &mut noop_rx, &raw).await
     };
     ticker.abort();
     ui.shutdown();
@@ -2340,6 +2602,43 @@ impl Drop for RawGuard {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig);
         }
+    }
+}
+
+/// The raw-mode slot the `!` escape borrows: the child runs on a cooked
+/// terminal, and raw mode re-enters afterwards. Empty in piped mode and
+/// on non-unix platforms (no raw mode there at all).
+struct RawSlot {
+    #[cfg(unix)]
+    guard: Mutex<Option<RawGuard>>,
+}
+
+impl RawSlot {
+    fn new() -> Self {
+        Self {
+            #[cfg(unix)]
+            guard: Mutex::new(None),
+        }
+    }
+
+    /// Hands the fresh guard from [`enter_raw_mode`] to the slot (run
+    /// start).
+    #[cfg(unix)]
+    fn set(&self, guard: Option<RawGuard>) {
+        *self.guard.lock().unwrap() = guard;
+    }
+
+    /// Drops the guard for the child — the terminal returns to cooked
+    /// mode (the drop restores the original settings).
+    #[cfg(unix)]
+    fn drop_for_child(&self) {
+        self.guard.lock().unwrap().take();
+    }
+
+    /// Re-enters raw mode after the child.
+    #[cfg(unix)]
+    fn reenter(&self) {
+        *self.guard.lock().unwrap() = enter_raw_mode();
     }
 }
 
@@ -3006,6 +3305,48 @@ mod tests {
             s.contains("connect Engram Vault for searchable memory"),
             "{s}"
         );
+        assert!(
+            s.contains("/memory add still works — the built-in store keeps this session only"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn host_of_keeps_the_port_and_drops_the_path() {
+        assert_eq!(
+            host_of("https://guardrail.elai-intelligence.com"),
+            Some("guardrail.elai-intelligence.com".to_string())
+        );
+        assert_eq!(
+            host_of("https://guardrail.elai-intelligence.com/api/upstream"),
+            Some("guardrail.elai-intelligence.com".to_string())
+        );
+        assert_eq!(
+            host_of("http://127.0.0.1:47800"),
+            Some("127.0.0.1:47800".to_string())
+        );
+        assert_eq!(
+            host_of("http://127.0.0.1:47800?q=1"),
+            Some("127.0.0.1:47800".to_string())
+        );
+        assert_eq!(host_of("not a url"), None);
+    }
+
+    #[test]
+    fn banner_policy_host_parses_wire_lines_only() {
+        assert_eq!(
+            banner_policy_host("wire http://127.0.0.1:47800"),
+            Some("127.0.0.1:47800".to_string())
+        );
+        assert_eq!(
+            banner_policy_host("wire http://127.0.0.1:47800 (profile)"),
+            Some("127.0.0.1:47800".to_string())
+        );
+        assert_eq!(
+            banner_policy_host("deny-all (no --policy-url or --allow-all)"),
+            None
+        );
+        assert_eq!(banner_policy_host("wire not a url"), None);
     }
 
     #[test]

@@ -441,19 +441,6 @@ mod tests {
         .to_string()
     }
 
-    fn rule_body(enabled: bool) -> String {
-        json!({
-            "id": "rule-1",
-            "org_id": "org-a",
-            "tool_name": "shell",
-            "reason": "untrusted inputs",
-            "enabled": enabled,
-            "created_by": "u1",
-            "created_at": "2026-09-01T00:00:00Z",
-        })
-        .to_string()
-    }
-
     fn rules_body() -> String {
         json!({ "rules": [json!({
             "id": "rule-1",
