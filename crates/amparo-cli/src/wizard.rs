@@ -676,7 +676,17 @@ mod tests {
         // policy key, console url, memory url, memory key.
         let mut stdin: &[u8] = b"/tmp/unused-workspace\nhttp://127.0.0.1:11434/v1\nqwen\n\n\nhttp://127.0.0.1:8080\n\nhttp://127.0.0.1:9101\n\n\n";
         let (chosen, profile) = run(&mut stdin, &root).unwrap();
-        assert_eq!(chosen, PathBuf::from("/tmp/unused-workspace"));
+        // The wizard absolutizes the workspace answer. `/tmp/…` is
+        // already absolute on Unix and stays verbatim; on Windows it is
+        // root-relative, so the runner's drive prefix is joined on
+        // (`D:/tmp/…`) — the contract is an absolute path carrying the
+        // name, not the literal string.
+        assert!(chosen.is_absolute(), "workspace must be absolute: {chosen:?}");
+        assert_eq!(
+            chosen.file_name().and_then(|n| n.to_str()),
+            Some("unused-workspace"),
+            "the workspace name is captured: {chosen:?}"
+        );
         assert_eq!(
             profile.inference_url.as_deref(),
             Some("http://127.0.0.1:11434/v1")

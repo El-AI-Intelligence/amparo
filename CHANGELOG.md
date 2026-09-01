@@ -58,7 +58,11 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 - **Windows config test fixture**: the absolute-workspace rejection test
   used `/etc/passwd`, which is drive-relative (not absolute) on Windows
   and so sailed through validation. The fixture is now platform-aware —
-  a Windows absolute path trips the rule on Windows.
+  a Windows absolute path trips the rule on Windows. The wizard test had
+  the mirror-image shape: its `/tmp/…` workspace answer is root-relative
+  on Windows and the wizard (correctly) joins the runner's drive prefix
+  on, so the assertion now checks the contract — an absolute path
+  carrying the workspace name — instead of the Unix literal.
 - **CI wait budgets**: the chat test harnesses polled with 5 s ceilings
   and the `chat_e2e` round trips with 30 s; loaded 2-core CI runners
   (especially Windows) blew both on scheduler contention alone, and the
