@@ -20,11 +20,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
-      # A tag that fails the gates must not ship.
-      - run: cargo test --workspace
+      # A tag that fails the gates must not ship. --locked: the committed
+      # lockfile is the release's dependency set — drift fails the gate,
+      # it never silently re-resolves.
+      - run: cargo test --workspace --locked
         env:
           RUSTFLAGS: "-D warnings"
-      - run: cargo doc --workspace --no-deps
+      - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: "-D warnings"
 

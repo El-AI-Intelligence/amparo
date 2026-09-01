@@ -16,9 +16,25 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 fn bin() -> String {
-    // Set at test runtime by cargo (this cargo version does not expose it
-    // at compile time via env!).
-    std::env::var("CARGO_BIN_EXE_amparo").expect("cargo sets CARGO_BIN_EXE_amparo for tests")
+    // cargo ≥ 1.89 sets CARGO_BIN_EXE_<name> for integration tests; the
+    // pinned MSRV (cargo 1.85) builds the package binaries but never sets
+    // the env var, so fall back to the test executable's own location —
+    // test binaries live in <profile>/deps/, package bins in <profile>/.
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_amparo") {
+        return path;
+    }
+    let exe = std::env::current_exe().expect("test executable path");
+    let profile = exe
+        .parent()
+        .and_then(|dir| dir.parent())
+        .expect("test executable lives in <profile>/deps/");
+    let fallback = profile.join(format!("amparo{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        fallback.exists(),
+        "{} not built — run `cargo build` (or the workspace test gate) first",
+        fallback.display()
+    );
+    fallback.to_string_lossy().into_owned()
 }
 
 /// Serializes the tests that mutate environment variables around child

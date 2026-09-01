@@ -1,0 +1,11 @@
+# Workspace-wide cargo configuration.
+#
+# The workspace declares an MSRV (rust-version 1.85 on every crate) and CI
+# gates at that pinned toolchain. `incompatible-rust-versions = "fallback"`
+# makes every cargo invocation in this repo resolve dependency versions
+# compatible with the declared rust-version — including plain `cargo update`
+# on a newer toolchain — so the lockfile cannot silently drift past the MSRV
+# the way it did in 2026-09 (idna_adapter 1.2.2 / icu 2.3.x locked at
+# rustc 1.98, breaking the pinned-1.85 CI).
+[resolver]
+incompatible-rust-versions = "fallback"

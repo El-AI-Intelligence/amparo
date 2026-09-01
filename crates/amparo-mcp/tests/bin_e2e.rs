@@ -15,10 +15,25 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 fn bin() -> String {
-    // Set at test runtime by cargo (this cargo version does not expose it
-    // at compile time via env!, and keeps the dash in the name).
-    std::env::var("CARGO_BIN_EXE_amparo-mcp-serve")
-        .expect("cargo sets CARGO_BIN_EXE_<bin-name> for tests")
+    // cargo ≥ 1.89 sets CARGO_BIN_EXE_<name> for integration tests; the
+    // pinned MSRV (cargo 1.85) builds the package binaries but never sets
+    // the env var, so fall back to the test executable's own location —
+    // test binaries live in <profile>/deps/, package bins in <profile>/.
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_amparo-mcp-serve") {
+        return path;
+    }
+    let exe = std::env::current_exe().expect("test executable path");
+    let profile = exe
+        .parent()
+        .and_then(|dir| dir.parent())
+        .expect("test executable lives in <profile>/deps/");
+    let fallback = profile.join(format!("amparo-mcp-serve{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        fallback.exists(),
+        "{} not built — run `cargo build` (or the workspace test gate) first",
+        fallback.display()
+    );
+    fallback.to_string_lossy().into_owned()
 }
 
 /// Serializes the tests that mutate `AMPARO_WORKSPACE` around child spawns.

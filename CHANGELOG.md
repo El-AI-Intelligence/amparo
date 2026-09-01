@@ -22,6 +22,21 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   `/tmp` and `/dev/shm` on Unix, the system temp directory on Windows
   (which has no `/dev/shm` twin). The default-workspace fallback when
   `HOME` is unset is now the system temp dir instead of `/tmp`.
+- **MSRV-safe lockfile**: the first pinned-1.85 CI run caught a lockfile
+  that had drifted past the declared MSRV (resolved at rustc 1.98 —
+  `idna_adapter` 1.2.2 and `icu` 2.3.x require 1.86/1.88). The lock now
+  resolves MSRV-compatible versions via
+  `resolver.incompatible-rust-versions = "fallback"` in
+  `.cargo/config.toml`, and the CI gates run `--locked` so dependency
+  drift fails loudly instead of re-resolving.
+
+### Fixed
+
+- **Integration tests at the pinned MSRV**: cargo 1.85 builds the package
+  binaries for `cargo test` but does not set `CARGO_BIN_EXE_<name>`
+  (that arrived in a later cargo), so the real-process e2e suites
+  (`cli_e2e`, `chat_e2e`, `bin_e2e`) now fall back to locating the
+  binaries next to the test executables in the profile directory.
 
 ## [0.11.0] — 2026-09-01
 

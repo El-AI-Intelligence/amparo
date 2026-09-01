@@ -28,13 +28,13 @@ jobs:
         with:
           toolchain: "1.85"
       - name: Test gate (zero warnings)
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
         env:
           RUSTFLAGS: "-D warnings"
       # The API-stability gate (missing_docs on every crate). Runs once,
       # on Linux; the test matrix above is the cross-platform gate.
       - name: Doc gate (zero warnings)
         if: runner.os == 'Linux'
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: "-D warnings"
