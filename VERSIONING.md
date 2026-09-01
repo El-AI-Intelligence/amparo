@@ -1,7 +1,7 @@
 # Versioning and API stability
 
 Amparo is a workspace of Rust crates that share one version
-(`[workspace.package] version = 0.10.0`). This file is the contract for how
+(`[workspace.package] version = 0.11.0`). This file is the contract for how
 that version moves and what "stable" means at each stage.
 
 ## Semver
@@ -58,6 +58,12 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
   both companions and reporting audit mode, and the web surface live
   at `amparo.ellmstack.dev` (deployment against the v0.9.0 approval
   seam).
+- **0.11.0 (2026-09-01)** — the ecosystem terminal: the TUI writes into
+  both siblings (`/memory` into the Engram vault, `/policy` into the
+  Guardrail Console's org rules, `!` shell escape for delegation), the
+  wizard's 10-answer contract captures the console URL and delegates
+  credentials to the sibling CLIs, and console-routed checks carry the
+  org's deny-only rules.
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 

@@ -8,6 +8,47 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-09-01
+
+M12, landed: the ecosystem terminal — Amparo writes directly into both
+siblings. The TUI stores memories in an Engram vault and manages the
+Guardrail Console's org policy rules, with credential setup delegated to
+the sibling CLIs.
+
+### Added
+
+- **Org policy rules in the Guardrail Console** (sibling change): a
+  deny-only, harden-only rules API under `/api/orgs/{id}/policies`
+  (list, create, toggle, remove) plus a key-scoped `GET /api/orgs/current`.
+  The console proxy rewrites `/check` verdicts for rules matching the
+  check's `tool_name` — the engine's verdict is preserved in
+  `engine_verdict`, the deny is attributed (`org_rule_id`, reason
+  `"org policy: …"`), and the rewrite applies in audit and enforce modes
+  alike.
+- **`OrgPolicyClient`** (`amparo-tools/src/org_policy.rs`): a thin
+  reqwest client for the console's org-rules API, configured from
+  `AMPARO_POLICY_KEY` + `AMPARO_CONSOLE_POLICY_URL` (default
+  `https://guardrail.elai-intelligence.com`). Every failure degrades to
+  a `[policy] not connected` line with a hint — never a panic, nothing
+  written locally.
+- **The TUI writes into both siblings** (`amparo tui`): `/memory add`
+  stores into the resolved memory backend (Engram when wired — verbatim,
+  skips surfaced honestly) and `/memory search` retrieves; `/policy
+  list|deny|toggle|enforce|audit` drives the console's org rules and
+  surfaces the console's error text verbatim (including the Pro-plan
+  tier gate). A new `! <command>` escape runs a shell command from the
+  prompt — the delegation path for `! guardrail link`.
+- **The wizard's 10-answer contract** (`amparo wizard`): step 3 gains
+  the console URL (`AMPARO_CONSOLE_POLICY_URL`), and steps 3/4 print
+  delegation guidance — the sibling CLI found on PATH
+  ("`guardrail link` pairs this machine") or its install one-liner.
+- **Real-shape verification**: the Engram adapter's mocks are pinned to
+  the live engramd v0.1.4 capture/search response shapes, and the full
+  cross-repo path was drilled against a fresh console: gk_ key → check
+  through the console proxy → deny rule → `verdict: deny` with the
+  engine's verdict preserved → enforce flip reflected in
+  `/api/orgs/current` → rule removal restores the engine verdict.
+
 ## [0.10.0] — 2026-08-31
 
 M11, landed: adoption — Engram and Guardrail go native, and the web

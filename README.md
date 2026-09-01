@@ -157,8 +157,8 @@ on a GUI.
   polling), Discord (gateway websocket) and Slack (Socket Mode) drivers;
   the schedule ticker.
 - **`amparo-cli`** — the one binary: `run`, `resume`, `privacy`,
-  `schedule`, `skill`, `notebook`, `doctor`, `chat`, `mcp-serve`,
-  `version`.
+  `schedule`, `skill`, `notebook`, `doctor`, `chat`, `mcp-serve`, `tui`,
+  `wizard`, `version`.
 
 ```sh
 cargo test --workspace            # the behavior gate
@@ -182,7 +182,10 @@ call is checked there before it runs. Audit-mode verdicts
 (`enforced:false`) are visible, never silent — one stderr line names the
 mode ("policy engine is in audit mode; verdicts are advisory") — and an
 unreachable engine escalates through the fail-safe path: it never fails
-open.
+open. Route the URL through the Guardrail Console
+(`https://guardrail.elai-intelligence.com/api/upstream`) and the
+operator's org deny rules apply to every check — the wizard steers there
+by default.
 
 **Graceful degradation.** Remove both companions and Amparo still runs:
 the built-in memory store and the local default engine. `amparo doctor
@@ -193,6 +196,33 @@ operator.
 the public reveal with one month of Engram's personal tier and Guardrail's
 policy enforcement, degrading to the existing free tiers at expiry —
 nothing breaks, nothing is silently waived.
+
+## Interactive surface
+
+`amparo tui` is the one-prompt terminal surface: the banner, gutter rows
+and approval cards render live, every decision through the same gate
+chain. Piped, it degrades to one task per stdin line with zero escapes —
+the scripting shape the e2e suite drives. Slash commands at the prompt:
+
+- `/memory add <text>` — store a memory in the resolved backend
+  (the Engram vault when wired; skips are surfaced honestly)
+- `/memory search <query>` — retrieve up to 5 hits
+- `/policy list` — the org's rules plus the org mode (audit/enforce)
+- `/policy deny <tool> [reason]` — add a deny-only org rule
+  (harden-only: it can never allow what the engine denied)
+- `/policy toggle <tool>` — enable/disable an existing rule
+- `/policy enforce` / `/policy audit` — flip the org mode (the
+  console's error text — including the Pro-plan gate — is shown
+  verbatim)
+- `! <command>` — run a shell command from the prompt (the delegation
+  path: `! guardrail link` pairs this machine with an org key)
+
+`amparo wizard` writes the first-run profile in four steps — workspace,
+LLM endpoint, optional Guardrail policy (engine URL, key, console URL),
+optional Engram memory URL — saved locally (mode 0600) and read back at
+boot to fill environment gaps (env always wins). Steps 3 and 4 print
+delegation guidance: the sibling CLI found on PATH
+("`guardrail link` pairs this machine") or its install one-liner.
 
 ## Environment surface
 
@@ -207,6 +237,7 @@ nothing breaks, nothing is silently waived.
 | `AMPARO_INFERENCE_MODEL_ALLOWLIST` | Optional comma-separated model allowlist |
 | `AMPARO_WORKSPACE` | Directory the tools are confined to |
 | `AMPARO_POLICY_KEY` | API key for a remote policy engine (with `--policy-url`) |
+| `AMPARO_CONSOLE_POLICY_URL` | Guardrail Console URL the TUI's `/policy` commands write through (the wizard saves it; default `https://guardrail.elai-intelligence.com`) |
 | `AMPARO_MEMORY_BACKEND` | `engram` selects the Engram backend (with `AMPARO_ENGRAM_URL` / `AMPARO_ENGRAM_KEY`) |
 | `AMPARO_CHAT_TELEGRAM_TOKEN` | Bot token for `amparo chat telegram` |
 | `AMPARO_CHAT_DISCORD_TOKEN` | Bot token for `amparo chat discord` |
@@ -249,6 +280,7 @@ the user who started a task can decide it.
 | 10 | Verification & QA | ✅ landed — the QC council, `amparo doctor`, the audit-mode stderr notice + session tagging |
 | 11 | Coordination & surfaces | ✅ landed — the blackboard, `send_notification`, rollback groups, the web-approval seam, MCP spawn, the CLI scheduler |
 | 12 | Engram + Guardrail native, web surface | ✅ landed — the Engram memory backend, Guardrail-native policy, and the web surface live at amparo.ellmstack.dev |
+| 13 | Ecosystem terminal | ✅ landed — the TUI writes into both siblings (`/memory`, `/policy`, `!` escape), the wizard's 10-answer contract delegates credentials, org deny rules apply to console-routed checks |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant
