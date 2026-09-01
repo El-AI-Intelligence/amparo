@@ -44,6 +44,15 @@ safety/privacy posture, and no heavyweight new dependencies.
 
 ## Deferred (revisit conditions)
 
+- **Screen/desktop perception — build note (2026-09-01).** The exclusion of
+  Axiom's GUI-bound stack (compositor, window backends, CDP) stands, but the
+  *capability* stays on the table as a fresh, surface-neutral adapter, per
+  the standing directive. Build shape when revisited: local capture,
+  PII-stripped before inference (`amparo-privacy`), every capture session
+  through the same gate chain (preflight blast radius + human approval,
+  never an always-on ingestor), delivered as gated registry tools. Revisit
+  when computer-use becomes a user requirement — Amparo's trust topology is
+  the differentiator that could make screen perception credible.
 - **Code intelligence** (`crates/axiom-code`, tree-sitter + LSP) — defer
   until Amparo positions as a coding agent; heavy dependency surface.
 - **Event bus + blackboard** (`crates/axiom-eventbus`,
