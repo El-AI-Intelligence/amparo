@@ -77,6 +77,12 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   also moved from refused-connection ports to accept-and-drop loopback
   listeners, a deterministic offline failure that closes in milliseconds
   on every OS.
+- **Chat approval press race**: the gate registered its approval in the
+  router only after the button message was sent; a press delivered in
+  that window found no entry and was consumed as already-decided, so the
+  gate auto-denied after its 60 s timeout (observed on Windows CI). The
+  gate now registers first — a press cannot outrun the buttons it
+  presses — and unregisters if the message send fails.
 
 ## [0.11.0] — 2026-09-01
 

@@ -1133,14 +1133,19 @@ async fn chat_config_directory_roundtrip_per_user_workspace() {
         per_user.is_dir(),
         "the per-user workspace exists on disk: {per_user:?}"
     );
+    // On failure the bodies alone are not enough to see where the flow
+    // broke (e.g. the approval gate auto-denying) — the child's stderr
+    // and the mock's request log pin the exact step.
+    let child_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let telegram_requests = format!("{:?}", telegram.log());
     let bodies = llm.bodies.lock().unwrap();
     assert!(
         bodies.iter().any(|b| b.contains(&per_user.to_string_lossy().to_string())),
-        "the run_command result echoed the per-user cwd: {bodies:?}"
+        "the run_command result echoed the per-user cwd: {bodies:?}\nchild stderr: {child_stderr}\ntelegram requests: {telegram_requests}"
     );
     assert!(
         bodies.iter().any(|b| b.contains("\\\"exit_code\\\":0")),
-        "the tool truly ran (success result present): {bodies:?}"
+        "the tool truly ran (success result present): {bodies:?}\nchild stderr: {child_stderr}\ntelegram requests: {telegram_requests}"
     );
     drop(bodies);
     assert!(

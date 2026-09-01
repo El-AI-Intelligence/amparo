@@ -80,21 +80,36 @@ impl ApprovalGate for ChatApprovalGate {
         // The tool call id is the approval id: unique per task, one task
         // per chat, and short enough for every platform's button payload.
         let approval_id = request.call_id.clone();
+
+        // Register before the message is sent: the entry must exist from
+        // the first moment a press can possibly be delivered, or a press
+        // landing in the send's wake finds no entry and is consumed as
+        // already-decided — the decision is lost and the gate auto-denies
+        // on its 60 s timeout (observed on slow CI runners, where the
+        // receive loop's next poll can land between the send's completion
+        // and the registration). A press cannot outrun its buttons: the
+        // transport only delivers callbacks for messages that exist, and
+        // the test mock holds the press until the keyboard message is
+        // logged. The chat's user is the requester: only their press may
+        // decide this approval.
+        let rx = self
+            .router
+            .register(&self.chat.chat_id, &approval_id, &self.chat.user_id)
+            .await;
+
         let Ok(msg) = self
             .transport
             .send_approval(&self.chat, request, &approval_id)
             .await
         else {
-            return false; // no message was sent — nothing to edit, fail closed
+            // No message was sent — nothing to edit, fail closed. Remove
+            // the entry registered above so no stale entry outlives this
+            // ask (a later press finds nothing: already decided).
+            self.router
+                .unregister(&self.chat.chat_id, &approval_id)
+                .await;
+            return false;
         };
-
-        // Register only after the message exists, so a press can never find
-        // an entry before the buttons are on screen. The chat's user is the
-        // requester: only their press may decide this approval.
-        let rx = self
-            .router
-            .register(&self.chat.chat_id, &approval_id, &self.chat.user_id)
-            .await;
 
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(true)) => {
@@ -118,6 +133,10 @@ impl ApprovalGate for ChatApprovalGate {
                 // Timeout: unregister so a late press is "already decided"
                 // rather than waking a dead channel, then record the
                 // auto-deny on the message (this gate is its single editor).
+                eprintln!(
+                    "amparo chat gate: approval {approval_id} timed out in chat {}",
+                    self.chat.chat_id
+                );
                 self.router
                     .unregister(&self.chat.chat_id, &approval_id)
                     .await;

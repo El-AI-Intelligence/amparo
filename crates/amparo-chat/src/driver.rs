@@ -805,7 +805,14 @@ impl ChatDriver {
                 let _ = tx.send(press.approved);
                 PressOutcome::Routed
             }
-            TakeResult::AlreadyDecided => PressOutcome::AlreadyDecided,
+            TakeResult::AlreadyDecided => {
+                eprintln!(
+                    "amparo chat: press {} for chat {} found no pending approval \
+                     (already decided)",
+                    press.approval_id, press.chat_id
+                );
+                PressOutcome::AlreadyDecided
+            }
             TakeResult::WrongUser => PressOutcome::WrongUser,
         }
     }
