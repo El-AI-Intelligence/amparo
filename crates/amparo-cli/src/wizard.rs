@@ -1,7 +1,7 @@
 //! `amparo wizard` — the first-run profile wizard (#167).
 //!
 //! Local-first: four ruled steps — workspace → LLM endpoint → optional
-//! Guardrail policy URL → optional Engram memory URL — captured line by
+//! Guardrail Console policy URL → optional Engram Vault memory URL — captured line by
 //! line (Enter skips; piped stdin answers one line per prompt, in order)
 //! and written to `{workspace}/.amparo/profile.json`, mode 0600 — the
 //! profile can carry keys, so it is never world-readable.
@@ -35,14 +35,14 @@ pub(crate) struct Profile {
     /// `openai` (default) or `anthropic` (`AMPARO_INFERENCE_PROVIDER`).
     #[serde(default)]
     pub inference_provider: Option<String>,
-    /// The Guardrail wire-protocol engine URL — the `--policy-url`
+    /// The Guardrail Console wire-protocol engine URL — the `--policy-url`
     /// fallback, never under `--allow-all`.
     #[serde(default)]
     pub policy_url: Option<String>,
     /// The policy key (`AMPARO_POLICY_KEY`); never echoed back.
     #[serde(default)]
     pub policy_key: Option<String>,
-    /// The engramd base URL (`AMPARO_ENGRAM_URL`, with
+    /// The Engram Vault daemon (engramd) base URL (`AMPARO_ENGRAM_URL`, with
     /// `AMPARO_MEMORY_BACKEND=engram`).
     #[serde(default)]
     pub memory_url: Option<String>,
@@ -162,7 +162,7 @@ pub(crate) fn policy_desc(profile: &Profile) -> String {
 /// The memory segment in the banner's grammar, from the answers.
 pub(crate) fn memory_desc(profile: &Profile) -> String {
     match &profile.memory_url {
-        Some(url) => format!("engram @ {}", site_desc(url)),
+        Some(url) => format!("Engram Vault @ {}", site_desc(url)),
         None => "built-in store".to_string(),
     }
 }
@@ -317,8 +317,8 @@ pub(crate) fn run(
     let policy_default = existing.as_ref().and_then(|p| p.policy_url.clone());
     let policy_key_default = existing.as_ref().and_then(|p| p.policy_key.clone());
     println!();
-    println!("▐ step 3/4 — policy (recommended, never required)");
-    println!("  a Guardrail wire-protocol engine URL — verdicts in, keys stay local");
+    println!("▐ step 3/4 — Guardrail Console policy (recommended, never required)");
+    println!("  a Guardrail wire-protocol engine URL — the engine Guardrail Console manages; keys stay local");
     let policy_url = ask(
         reader,
         &format!(
@@ -347,8 +347,8 @@ pub(crate) fn run(
         .or_else(|| existing.as_ref().and_then(|p| p.memory_url.clone()));
     let memory_key_default = existing.as_ref().and_then(|p| p.memory_key.clone());
     println!();
-    println!("▐ step 4/4 — memory (recommended, never required)");
-    println!("  an engramd URL — memories that outlive the session");
+    println!("▐ step 4/4 — Engram Vault memory (recommended, never required)");
+    println!("  an Engram Vault daemon (engramd) URL — memories that outlive the session");
     let memory_url = ask(
         reader,
         &format!(
@@ -427,8 +427,8 @@ amparo wizard — the first-run profile wizard
 USAGE:
   amparo wizard
 
-Four steps — workspace → LLM endpoint → optional Guardrail policy URL →
-optional Engram memory URL — written to {workspace}/.amparo/profile.json
+Four steps — workspace → LLM endpoint → optional Guardrail Console policy URL →
+optional Engram Vault memory URL — written to {workspace}/.amparo/profile.json
 (mode 0600). Policy and memory are recommended, never required; Enter
 skips any line; keys are never echoed. Piped stdin answers one line per
 prompt, in order: workspace, url, model, provider, key, policy url,

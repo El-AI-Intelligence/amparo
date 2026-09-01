@@ -559,7 +559,7 @@ pub struct BannerInfo {
     /// The resolved provider · model · host — the host in the ledger's
     /// `scheme://host[:port]` shape, never a key-carrying URL.
     pub infer: String,
-    /// The resolved memory backend (`built-in store`, `engram @ …`).
+    /// The resolved memory backend (`built-in store`, `Engram Vault @ …`).
     pub memory: String,
 }
 
@@ -678,7 +678,7 @@ pub(crate) async fn wire_with(
         "engram" => {
             let url = std::env::var("AMPARO_ENGRAM_URL")
                 .unwrap_or_else(|_| DEFAULT_ENGRAM_URL.to_string());
-            format!("engram @ {}", site_desc(&url))
+            format!("Engram Vault @ {}", site_desc(&url))
         }
         _ => "built-in store".to_string(),
     };

@@ -622,7 +622,8 @@ fn policy_block(
             out.push("  source:   built-in — no engine configured".to_string());
             let url = console_policy_url();
             note = Some(vec![
-                "  note:     connect a guardrail engine for managed policies".to_string(),
+                "  note:     connect a Guardrail engine — Guardrail Console-managed policies"
+                    .to_string(),
                 format!("            {}", link(paint, controls, &url, &url)),
             ]);
         }
@@ -658,7 +659,7 @@ fn memory_block(paint: &Paint, controls: bool, live: Option<&Live>) -> Vec<Strin
     let url = console_memory_url();
     match live {
         Some(l) if l.memory.name() == "engram" => {
-            out.push("  backend:   engram".to_string());
+            out.push("  backend:   Engram Vault".to_string());
             out.push(format!("  source:   {}", link(paint, controls, &url, &url)));
             out.push(
                 "  note:     daemon reachable — searchable memory across sessions".to_string(),
@@ -670,7 +671,8 @@ fn memory_block(paint: &Paint, controls: bool, live: Option<&Live>) -> Vec<Strin
                 .unwrap_or_else(|_| "127.0.0.1:8787 (default)".to_string());
             out.push(format!("  source:   {local} — not answering"));
             out.push(
-                "  note:     connect Engram for searchable memory across sessions".to_string(),
+                "  note:     connect Engram Vault for searchable memory across sessions"
+                    .to_string(),
             );
             out.push(format!("            {}", link(paint, controls, &url, &url)));
         }
@@ -2987,7 +2989,7 @@ mod tests {
         assert!(s.contains("§ deny"), "{s}");
         assert!(s.contains("41s ago"), "{s}");
         assert!(
-            s.contains("connect a guardrail engine for managed policies"),
+            s.contains("connect a Guardrail engine — Guardrail Console-managed policies"),
             "{s}"
         );
     }
@@ -2999,7 +3001,10 @@ mod tests {
         assert!(s.contains("── memory "), "{s}");
         assert!(s.contains("built-in store"), "{s}");
         assert!(s.contains("not answering"), "{s}");
-        assert!(s.contains("connect Engram for searchable memory"), "{s}");
+        assert!(
+            s.contains("connect Engram Vault for searchable memory"),
+            "{s}"
+        );
     }
 
     #[test]
