@@ -116,6 +116,10 @@ struct SearchBody {
 
 #[async_trait]
 impl Memory for EngramStore {
+    fn name(&self) -> &'static str {
+        "engram"
+    }
+
     async fn search(&self, query: &str, limit: usize) -> Vec<MemoryEntry> {
         // Any failure — the daemon down, a bad response — degrades to no
         // hits. The startup probe already warned when the daemon was down

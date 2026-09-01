@@ -962,6 +962,38 @@ async fn run_completes_against_mock_llm() {
 }
 
 #[tokio::test]
+async fn run_prints_the_power_on_banner_to_stderr() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![vec![content_frame("Hello from the mock.")]]).await;
+    let (env, prior) = mock_env(&mock).await;
+    let out = run_with(&["run", "--allow-all", "say hello"]).await;
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains("Greetings! My name is Amparo, built by EL AI Intelligence."),
+        "the greeting leads the run: {err}"
+    );
+    assert!(err.contains("[wake] Amparo is awake."), "{err}");
+    assert!(
+        err.contains(
+            "[gate] chain: registry → trust ceiling (system_control) → policy (allow-all) \
+             → human approval (terminal y/N, 60s fail-closed)"
+        ),
+        "the banner names the wired chain: {err}"
+    );
+    assert!(
+        err.contains("[infer] openai · mock-model · http://127.0.0.1:"),
+        "the infer line names the mock provider: {err}"
+    );
+    assert!(err.contains("[memory] built-in store"), "{err}");
+    // stdout purity: the banner is stderr-only.
+    assert_eq!(stdout(&out).trim(), "Hello from the mock.");
+}
+
+#[tokio::test]
 async fn run_executes_approved_tool_end_to_end() {
     let _guard = LOCK.lock().await;
     let marker = format!("amparo-cli-e2e-{}", std::process::id());
@@ -3435,6 +3467,8 @@ async fn resume_replays_a_checkpoint_to_completion() {
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {err}");
     assert!(err.contains("[session] resumed sess-1 (step 2)"), "{err}");
+    // A resume is a run start too: the power-on banner greets it.
+    assert!(err.contains("[wake] Amparo is awake."), "{err}");
     assert_eq!(stdout(&out).trim(), "Resumed and done.");
     // The resumed agent replaced the Running checkpoint with a terminal
     // one in place — same file, now complete.

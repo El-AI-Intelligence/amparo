@@ -38,7 +38,7 @@ use amparo_privacy::{privacy_dir, LedgerQuota, LedgerStore};
 use amparo_sandbox::EvalWasmTool;
 use amparo_tools::{
     default_registry_with_memory, resolve_memory_backend, Memory, PathPolicy, SendNotificationTool,
-    SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool,
+    SkillLibrary, ToolRegistry, ToolTrustTier, UseSkillTool, DEFAULT_ENGRAM_URL,
 };
 use std::sync::{Arc, Mutex};
 
@@ -505,6 +505,41 @@ struct WiredRun {
     schedule_fires: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Reduce a URL to the ledger's `scheme://host[:port]` shape for a
+/// status line. Userinfo (`user:pass@`) never survives
+/// [`amparo_privacy::ledger::site_host_only`], and it must never survive
+/// into stderr either — a key can ride exactly there by mistake.
+fn site_desc(url: &str) -> String {
+    amparo_privacy::ledger::site_host_only(url)
+        .unwrap_or_else(|| "(unparseable url)".to_string())
+}
+
+/// The flag spelling for a trust ceiling — the same literals
+/// `parse_run_flags` accepts, so the banner reads in the CLI's own
+/// vocabulary.
+fn tier_name(tier: ToolTrustTier) -> &'static str {
+    match tier {
+        ToolTrustTier::Observational => "observational",
+        ToolTrustTier::Network => "network",
+        ToolTrustTier::LocalMutating => "local_mutating",
+        ToolTrustTier::ExternalEffector => "external_effector",
+        ToolTrustTier::SystemControl => "system_control",
+    }
+}
+
+/// The awakened power-on banner (#165): one stderr block naming who this
+/// is and the gate chain the run will enforce. Printed at the end of
+/// [`wire`] so a fresh run and a resume share it, and after every degrade
+/// decision so each line reports what is actually wired. stderr-only —
+/// stdout carries the final answer, and the banner must never touch it.
+pub fn boot_banner(chain: &str, infer: &str, memory: &str) {
+    eprintln!("Greetings! My name is Amparo, built by EL AI Intelligence.");
+    eprintln!("[wake] Amparo is awake.");
+    eprintln!("[gate] chain: {chain}");
+    eprintln!("[infer] {infer}");
+    eprintln!("[memory] {memory}");
+}
+
 /// Wire the gate chain from flags: provider, policy, approval, sinks
 /// (printing + optional growth notebook + always-on privacy ledger) and
 /// the agent. Shared by a fresh run and a resume — a resumed task is the
@@ -524,47 +559,80 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
     if let Some(model) = &flags.model {
         config.model = model.clone();
     }
+    // The boot banner's infer line names the resolved provider, model and
+    // host — captured after the flags override, before the config moves
+    // on. The host is the ledger's `scheme://host[:port]` shape: a
+    // key-carrying URL must never reach stderr.
+    let infer_desc = format!(
+        "{} · {} · {}",
+        format!("{:?}", config.provider).to_lowercase(),
+        config.model,
+        site_desc(&config.base_url)
+    );
     let provider = config.build().map_err(|e| e.to_string())?;
 
     // The memory backend (M11 W1): resolved once per process — the
     // Engram adapter when configured and reachable, the built-in store
-    // otherwise (with one `[memory]` warning on the degrade path).
+    // otherwise (with one `[memory]` warning on the degrade path). The
+    // banner names the store that actually resolved, never the one that
+    // was merely requested.
     let memory = resolve_memory_backend().await;
+    let memory_desc = match memory.name() {
+        "engram" => {
+            let url = std::env::var("AMPARO_ENGRAM_URL")
+                .unwrap_or_else(|_| DEFAULT_ENGRAM_URL.to_string());
+            format!("engram @ {}", site_desc(&url))
+        }
+        _ => "built-in store".to_string(),
+    };
     // The base registry (M10 W5): shared with the fire path — the growth
     // layer (skills) is the only thing layered on top for the main task.
     let mut registry = fire_registry(flags, Arc::clone(&memory));
 
-    let policy: Arc<dyn PolicyEngine> = match (&flags.policy_url, flags.allow_all) {
-        (Some(url), false) => {
-            let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
-            // M9 W3: every check carries the run's session id (the task id
-            // by default) so engine-side audit rows correlate with this
-            // run; the audit-mode notice prints once, on the first
-            // audit-only verdict.
-            let session_id = flags
-                .session_id
-                .clone()
-                .unwrap_or_else(|| parent_task_id.clone());
-            Arc::new(AuditNoticeEngine::new(
-                WirePolicyEngine::new(url.clone(), api_key).with_session_id(session_id),
-            ))
-        }
-        (None, true) => Arc::new(AllowAllPolicyEngine),
-        (None, false) => Arc::new(DenyAllPolicyEngine::new(
-            "no policy configured (--policy-url or --allow-all)",
-        )),
-        (Some(_), true) => unreachable!("rejected by parse_run_flags"),
-    };
+    let (policy, policy_desc): (Arc<dyn PolicyEngine>, String) =
+        match (&flags.policy_url, flags.allow_all) {
+            (Some(url), false) => {
+                let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
+                // M9 W3: every check carries the run's session id (the task id
+                // by default) so engine-side audit rows correlate with this
+                // run; the audit-mode notice prints once, on the first
+                // audit-only verdict.
+                let session_id = flags
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| parent_task_id.clone());
+                (
+                    Arc::new(AuditNoticeEngine::new(
+                        WirePolicyEngine::new(url.clone(), api_key).with_session_id(session_id),
+                    )),
+                    format!("wire {}", site_desc(url)),
+                )
+            }
+            (None, true) => (Arc::new(AllowAllPolicyEngine), "allow-all".to_string()),
+            (None, false) => (
+                Arc::new(DenyAllPolicyEngine::new(
+                    "no policy configured (--policy-url or --allow-all)",
+                )),
+                "deny-all (no --policy-url or --allow-all)".to_string(),
+            ),
+            (Some(_), true) => unreachable!("rejected by parse_run_flags"),
+        };
 
-    let approval: Arc<dyn ApprovalGate> = match (
+    let (approval, approval_desc): (Arc<dyn ApprovalGate>, String) = match (
         &flags.approval_endpoint,
         flags.auto_approve,
         flags.auto_deny,
     ) {
-        (Some(url), false, false) => Arc::new(WebApprovalGate::new(url.clone())),
-        (None, true, false) => Arc::new(AutoApprove),
-        (None, false, true) => Arc::new(AutoDeny),
-        (None, false, false) => Arc::new(InteractiveApprovalGate::default()),
+        (Some(url), false, false) => (
+            Arc::new(WebApprovalGate::new(url.clone())),
+            format!("web {}", site_desc(url)),
+        ),
+        (None, true, false) => (Arc::new(AutoApprove), "auto-approve".to_string()),
+        (None, false, true) => (Arc::new(AutoDeny), "auto-deny".to_string()),
+        (None, false, false) => (
+            Arc::new(InteractiveApprovalGate::default()),
+            "terminal y/N, 60s fail-closed".to_string(),
+        ),
         _ => unreachable!("rejected by parse_run_flags"),
     };
 
@@ -772,6 +840,20 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
         Arc::clone(&memory),
     )
     .await;
+
+    // The awakened power-on experience (#165): every run start — fresh
+    // or resumed — greets once with the chain it will enforce, so the
+    // one rule is on screen before any tool call exists.
+    boot_banner(
+        &format!(
+            "registry → trust ceiling ({}) → policy ({}) → human approval ({})",
+            tier_name(flags.trust_ceiling),
+            policy_desc,
+            approval_desc,
+        ),
+        &infer_desc,
+        &memory_desc,
+    );
 
     Ok(WiredRun {
         agent,

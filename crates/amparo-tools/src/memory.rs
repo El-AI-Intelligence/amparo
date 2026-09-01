@@ -46,6 +46,13 @@ pub trait Memory: Send + Sync {
     async fn search(&self, query: &str, limit: usize) -> Vec<MemoryEntry>;
     /// Store content, returning its id.
     async fn store(&self, content: String) -> Result<String, String>;
+    /// Human-readable backend name for status surfaces (the boot banner,
+    /// the TUI memory pane). The default names the built-in store; the
+    /// Engram adapter overrides it — status lines must report what is
+    /// actually wired, never what was requested.
+    fn name(&self) -> &'static str {
+        "built-in"
+    }
 }
 
 /// Built-in default: a process-local, naive keyword store. Deliberately simple
