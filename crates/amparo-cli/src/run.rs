@@ -429,7 +429,7 @@ async fn await_schedule_fires(wired: &mut WiredRun) {
 /// Apply `--workspace` to the process env before anything reads it: the
 /// tools capture `AMPARO_WORKSPACE` when the registry is built, and the
 /// checkpoint store roots at the same workspace — both must see the flag.
-fn apply_workspace(flags: &RunFlags) {
+pub(crate) fn apply_workspace(flags: &RunFlags) {
     if let Some(dir) = &flags.workspace {
         std::env::set_var("AMPARO_WORKSPACE", dir);
     }
@@ -482,7 +482,7 @@ async fn execute_resume(flags: &RunFlags) -> Result<(), String> {
 /// The task id for a fresh run — the same `sess-<nanos>-<pid>` shape the
 /// agent generates when the host names none, so a parent's children
 /// chain as `{parent}.{n}` off the same id the checkpoint stores.
-fn new_task_id() -> String {
+pub(crate) fn new_task_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -494,15 +494,25 @@ fn new_task_id() -> String {
 /// plus the growth notebook sink that must be flushed after the task,
 /// the swarm tool (when the budget is above zero) for the terminal
 /// report, and the cost rate the report lines use.
-struct WiredRun {
-    agent: Agent,
-    notebook: Option<Arc<NotebookSink>>,
-    spawn_tool: Option<Arc<SpawnAgentTool>>,
-    cost_rate: Option<f64>,
+pub(crate) struct WiredRun {
+    pub(crate) agent: Agent,
+    pub(crate) notebook: Option<Arc<NotebookSink>>,
+    pub(crate) spawn_tool: Option<Arc<SpawnAgentTool>>,
+    pub(crate) cost_rate: Option<f64>,
     /// The run-start schedule fires (M10 W5): due promises run
     /// concurrently with the main task; the handles are awaited before
     /// the process exits so every promise record lands.
-    schedule_fires: Vec<tokio::task::JoinHandle<()>>,
+    pub(crate) schedule_fires: Vec<tokio::task::JoinHandle<()>>,
+    /// The gate-chain facts the banner rendered (TUI #166): the TUI
+    /// re-renders `[chain]` from these when the live state changes
+    /// (policy audit flip, memory degrade).
+    pub(crate) banner: BannerInfo,
+    /// The resolved policy engine — the TUI reads [`PolicyEngine::audit_mode`]
+    /// for the status line's `§` symbol.
+    pub(crate) policy: Arc<dyn PolicyEngine>,
+    /// The resolved memory backend — the TUI reads [`Memory::name`] for
+    /// the status line's memory segment.
+    pub(crate) memory: Arc<dyn Memory>,
 }
 
 /// Reduce a URL to the ledger's `scheme://host[:port]` shape for a
@@ -510,8 +520,7 @@ struct WiredRun {
 /// [`amparo_privacy::ledger::site_host_only`], and it must never survive
 /// into stderr either — a key can ride exactly there by mistake.
 fn site_desc(url: &str) -> String {
-    amparo_privacy::ledger::site_host_only(url)
-        .unwrap_or_else(|| "(unparseable url)".to_string())
+    amparo_privacy::ledger::site_host_only(url).unwrap_or_else(|| "(unparseable url)".to_string())
 }
 
 /// The flag spelling for a trust ceiling — the same literals
@@ -527,17 +536,80 @@ fn tier_name(tier: ToolTrustTier) -> &'static str {
     }
 }
 
+/// The gate-chain facts the boot banner names (#165, extended for the
+/// TUI #166): everything a surface needs to draw the chain in its own
+/// grammar. `amparo run` prints the one-line [`BannerInfo::chain`]; the
+/// TUI draws the full `◆──▲──§──◉` diagram and its `[key]`/`[chain]`
+/// lines from the same facts.
+#[derive(Clone)]
+pub struct BannerInfo {
+    /// The chain in one line — `registry → trust ceiling (…) → policy
+    /// (…) → human approval (…)`.
+    pub chain: String,
+    /// How many tools are registered — the `◆ registry: N tools` count.
+    pub tool_count: usize,
+    /// The ceiling's flag spelling (`observational` … `system_control`).
+    pub ceiling: String,
+    /// The policy's one-line status (`wire https://…`, `deny-all (…)`,
+    /// `allow-all`).
+    pub policy: String,
+    /// The approval's one-line status (`terminal y/N, 60s fail-closed`,
+    /// `web …`, `auto-…`).
+    pub approval: String,
+    /// The resolved provider · model · host — the host in the ledger's
+    /// `scheme://host[:port]` shape, never a key-carrying URL.
+    pub infer: String,
+    /// The resolved memory backend (`built-in store`, `engram @ …`).
+    pub memory: String,
+}
+
+/// The rendering seam for a wired run (TUI #166). [`wire`] builds a run
+/// on the default terminal surface — stderr `[tag]` lines and the
+/// interactive terminal approval gate; the TUI calls [`wire_with`] with
+/// its own surface: same registry, same policy, same fail-closed chain,
+/// rendered in its own grammar.
+#[derive(Clone)]
+pub struct Surface {
+    /// Every loop event renders through this sink (default: the stderr
+    /// printing sink).
+    pub events: Arc<dyn EventSink>,
+    /// The human-approval gate and its one-line status; `None` wires the
+    /// gate from the flags exactly like [`wire`] (default).
+    pub approval: Option<(Arc<dyn ApprovalGate>, String)>,
+    /// Renders the boot banner — called once per wired run (fresh or
+    /// resumed).
+    pub banner: fn(&BannerInfo),
+    /// Renders one `[tag]` status line (`[growth]`, `[schedule]`,
+    /// `[ledger]` notices).
+    pub line: fn(&str),
+    /// Renders the one-time policy audit notice (M9 W3): "policy engine
+    /// is in audit mode; verdicts are advisory".
+    pub notice: fn(&str),
+}
+
+impl Default for Surface {
+    fn default() -> Self {
+        Self {
+            events: Arc::new(PrintingSink),
+            approval: None,
+            banner: boot_banner,
+            line: |line| eprintln!("{line}"),
+            notice: |line| eprintln!("{line}"),
+        }
+    }
+}
+
 /// The awakened power-on banner (#165): one stderr block naming who this
 /// is and the gate chain the run will enforce. Printed at the end of
 /// [`wire`] so a fresh run and a resume share it, and after every degrade
 /// decision so each line reports what is actually wired. stderr-only —
 /// stdout carries the final answer, and the banner must never touch it.
-pub fn boot_banner(chain: &str, infer: &str, memory: &str) {
+pub fn boot_banner(info: &BannerInfo) {
     eprintln!("Greetings! My name is Amparo, built by EL AI Intelligence.");
     eprintln!("[wake] Amparo is awake.");
-    eprintln!("[gate] chain: {chain}");
-    eprintln!("[infer] {infer}");
-    eprintln!("[memory] {memory}");
+    eprintln!("[gate] chain: {}", info.chain);
+    eprintln!("[infer] {}", info.infer);
+    eprintln!("[memory] {}", info.memory);
 }
 
 /// Wire the gate chain from flags: provider, policy, approval, sinks
@@ -546,7 +618,22 @@ pub fn boot_banner(chain: &str, infer: &str, memory: &str) {
 /// same loop and the same gates; only the starting state differs.
 /// `parent_task_id` names the task (fresh: [`new_task_id`]; resume: the
 /// checkpoint's id), so children chain as `{parent}.{n}`.
+///
+/// The default surface — stderr lines and the interactive terminal gate.
+/// The TUI calls [`wire_with`] for the same chain on its own surface.
 async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, String> {
+    wire_with(flags, parent_task_id, Surface::default()).await
+}
+
+/// [`wire`] on an explicit [`Surface`] (TUI #166): the TUI's renderer and
+/// approval gate replace the stderr printing sink and the interactive
+/// prompt; everything else — the gate chain, the fail-closed semantics,
+/// the checkpoint store — is identical.
+pub(crate) async fn wire_with(
+    flags: &RunFlags,
+    parent_task_id: String,
+    surface: Surface,
+) -> Result<WiredRun, String> {
     let mut config = InferenceConfig::from_env().map_err(|e| {
         format!(
             "{e}\nset AMPARO_INFERENCE_URL and AMPARO_INFERENCE_MODEL — see the README \
@@ -602,8 +689,10 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
                     .clone()
                     .unwrap_or_else(|| parent_task_id.clone());
                 (
-                    Arc::new(AuditNoticeEngine::new(
+                    Arc::new(AuditNoticeEngine::with_printer(
                         WirePolicyEngine::new(url.clone(), api_key).with_session_id(session_id),
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        surface.notice,
                     )),
                     format!("wire {}", site_desc(url)),
                 )
@@ -618,22 +707,27 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
             (Some(_), true) => unreachable!("rejected by parse_run_flags"),
         };
 
-    let (approval, approval_desc): (Arc<dyn ApprovalGate>, String) = match (
-        &flags.approval_endpoint,
-        flags.auto_approve,
-        flags.auto_deny,
-    ) {
-        (Some(url), false, false) => (
-            Arc::new(WebApprovalGate::new(url.clone())),
-            format!("web {}", site_desc(url)),
-        ),
-        (None, true, false) => (Arc::new(AutoApprove), "auto-approve".to_string()),
-        (None, false, true) => (Arc::new(AutoDeny), "auto-deny".to_string()),
-        (None, false, false) => (
-            Arc::new(InteractiveApprovalGate::default()),
-            "terminal y/N, 60s fail-closed".to_string(),
-        ),
-        _ => unreachable!("rejected by parse_run_flags"),
+    let (approval, approval_desc): (Arc<dyn ApprovalGate>, String) = match &surface.approval {
+        // The TUI brings its own gate (single-keypress approval cards) —
+        // the same fail-closed contract, its own renderer.
+        Some((gate, desc)) => (Arc::clone(gate), desc.clone()),
+        None => match (
+            &flags.approval_endpoint,
+            flags.auto_approve,
+            flags.auto_deny,
+        ) {
+            (Some(url), false, false) => (
+                Arc::new(WebApprovalGate::new(url.clone())),
+                format!("web {}", site_desc(url)),
+            ),
+            (None, true, false) => (Arc::new(AutoApprove), "auto-approve".to_string()),
+            (None, false, true) => (Arc::new(AutoDeny), "auto-deny".to_string()),
+            (None, false, false) => (
+                Arc::new(InteractiveApprovalGate::default()),
+                "terminal y/N, 60s fail-closed".to_string(),
+            ),
+            _ => unreachable!("rejected by parse_run_flags"),
+        },
     };
 
     let mut agent_config = AgentConfig::default();
@@ -651,7 +745,6 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
     // before. Kept outside the fanout so `flush` can await the final write.
     // The same store feeds the case library (M6b): prior `cli` records are
     // retrieved into the self-verification prompt — growth is write + read.
-    let printing = Arc::new(PrintingSink);
     // The workspace root anchors the privacy ledger (always-on) and the
     // growth notebook (--growth only). The tools' path policy already
     // read AMPARO_WORKSPACE above.
@@ -665,23 +758,23 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
             JsonlStore::open(&cold_path)
                 .map_err(|e| format!("cannot open the growth notebook: {e}"))?,
         );
-        eprintln!(
+        (surface.line)(&format!(
             "[growth] recording PII-stripped run records to {}",
             cold_path.display()
-        );
+        ));
         // Rollup and archival (M6e): promote the cold tail into the hot
         // layer — folding it daily — before retrieval, so the case
         // library reads this workspace's hot copy too. Observational: a
         // failure warns and never fails the task.
         match auto_rollup(&nb_dir, chrono::Utc::now()) {
             Ok(Some(report)) if report.promoted > 0 => {
-                eprintln!(
+                (surface.line)(&format!(
                     "[growth] notebook: promoted {} tail record(s) to the hot layer",
                     report.promoted
-                );
+                ));
             }
             Ok(_) => {}
-            Err(e) => eprintln!("[growth] notebook rollup failed: {e}"),
+            Err(e) => (surface.line)(&format!("[growth] notebook rollup failed: {e}")),
         }
         // The hot layer is what the case library reads (M6b + M6e): the
         // informative subset — dedupe survivors plus gate events of
@@ -692,7 +785,7 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
             JsonlStore::open(&hot_path)
                 .map_err(|e| format!("cannot open the notebook hot layer: {e}"))?,
         );
-        eprintln!("[growth] retrieval: prior cli cases (hot layer) inform self-verification");
+        (surface.line)("[growth] retrieval: prior cli cases (hot layer) inform self-verification");
         case_library = Some(Arc::new(CaseRetriever::new(Arc::clone(&hot_store), "cli")));
         // Gated skills (M6c + M6d): adopted skills register `use_skill`
         // and the loop expands it step by step through the gate chain.
@@ -717,9 +810,9 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
                         &skills_path,
                         &SkillLogEvent::retire("cli", name, &now, reason.clone()),
                     ) {
-                        eprintln!("[growth] retire write failed: {e}");
+                        (surface.line)(&format!("[growth] retire write failed: {e}"));
                     }
-                    eprintln!("[growth] skill {name} retired: {reason}");
+                    (surface.line)(&format!("[growth] skill {name} retired: {reason}"));
                 }
             }
             let survivors = SkillSet::load(&skills_path, "cli");
@@ -727,10 +820,10 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
             if !survivor_names.is_empty() {
                 let library: Arc<dyn SkillLibrary> = Arc::new(survivors);
                 registry.register(Arc::new(UseSkillTool::new(Arc::clone(&library))));
-                eprintln!(
+                (surface.line)(&format!(
                     "[growth] skills: {} adopted for tenant cli",
                     survivor_names.len()
-                );
+                ));
                 skills = Some(library);
             }
         }
@@ -757,11 +850,13 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
             None,
         ))),
         Err(e) => {
-            eprintln!("[ledger] unavailable — the run continues without the privacy ledger: {e}");
+            (surface.line)(&format!(
+                "[ledger] unavailable — the run continues without the privacy ledger: {e}"
+            ));
             None
         }
     };
-    let mut sinks: Vec<Arc<dyn EventSink>> = vec![printing];
+    let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::clone(&surface.events)];
     if let Some(nb) = &notebook {
         sinks.push(Arc::clone(nb) as Arc<dyn EventSink>);
     }
@@ -773,6 +868,10 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
     } else {
         Arc::new(FanoutSink::new(sinks))
     };
+
+    // The registry count the banner reports (TUI #166) — captured before
+    // the registry moves into the agent.
+    let tool_count = registry.tool_count();
 
     // The scheduler needs these parts after the agent is built (the fires
     // share them with the main task), so the agent holds clones.
@@ -838,22 +937,30 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
         flags,
         &workspace_root,
         Arc::clone(&memory),
+        surface.clone(),
     )
     .await;
 
     // The awakened power-on experience (#165): every run start — fresh
     // or resumed — greets once with the chain it will enforce, so the
-    // one rule is on screen before any tool call exists.
-    boot_banner(
-        &format!(
+    // one rule is on screen before any tool call exists. The surface's
+    // renderer owns the layout: `run` prints the five stderr lines, the
+    // TUI draws the full chain diagram from the same facts.
+    let banner_info = BannerInfo {
+        chain: format!(
             "registry → trust ceiling ({}) → policy ({}) → human approval ({})",
             tier_name(flags.trust_ceiling),
             policy_desc,
             approval_desc,
         ),
-        &infer_desc,
-        &memory_desc,
-    );
+        tool_count,
+        ceiling: tier_name(flags.trust_ceiling).to_string(),
+        policy: policy_desc,
+        approval: approval_desc,
+        infer: infer_desc,
+        memory: memory_desc,
+    };
+    (surface.banner)(&banner_info);
 
     Ok(WiredRun {
         agent,
@@ -861,6 +968,9 @@ async fn wire(flags: &RunFlags, parent_task_id: String) -> Result<WiredRun, Stri
         spawn_tool,
         cost_rate,
         schedule_fires,
+        banner: banner_info,
+        policy: Arc::clone(&policy),
+        memory: Arc::clone(&memory),
     })
 }
 
@@ -899,6 +1009,7 @@ async fn scan_schedules(
     flags: &RunFlags,
     workspace_root: &std::path::Path,
     memory: Arc<dyn Memory>,
+    surface: Surface,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let store = Arc::new(JsonScheduleStore::new(schedule_dir(workspace_root)));
     let tasks: Vec<ScheduledTask> = store
@@ -916,14 +1027,14 @@ async fn scan_schedules(
                 .to_string(),
         );
         if let Err(e) = store.save(&task) {
-            eprintln!("[schedule] cannot mark {} missed: {e}", task.id);
+            (surface.line)(&format!("[schedule] cannot mark {} missed: {e}", task.id));
             continue;
         }
-        eprintln!(
+        (surface.line)(&format!(
             "[schedule] {} missed — {}",
             task.id,
             task.result.as_deref().unwrap_or_default()
-        );
+        ));
     }
     let mut handles = Vec::with_capacity(due.len());
     for &index in &due {
@@ -935,9 +1046,10 @@ async fn scan_schedules(
         let flags = flags.clone();
         let root = workspace_root.to_path_buf();
         let memory = Arc::clone(&memory);
+        let surface = surface.clone();
         handles.push(tokio::spawn(async move {
             fire_promise(
-                provider, policy, approval, &flags, &root, store, memory, task,
+                provider, policy, approval, &flags, &root, store, memory, surface, task,
             )
             .await;
         }));
@@ -961,6 +1073,7 @@ async fn fire_promise(
     workspace_root: &std::path::Path,
     store: Arc<JsonScheduleStore>,
     memory: Arc<dyn Memory>,
+    surface: Surface,
     mut task: ScheduledTask,
 ) {
     let fire_id = new_task_id();
@@ -978,11 +1091,13 @@ async fn fire_promise(
             None,
         ))),
         Err(e) => {
-            eprintln!("[ledger] unavailable — the fire continues without the privacy ledger: {e}");
+            (surface.line)(&format!(
+                "[ledger] unavailable — the fire continues without the privacy ledger: {e}"
+            ));
             None
         }
     };
-    let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(PrintingSink)];
+    let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::clone(&surface.events)];
     if let Some(ledger) = &ledger {
         sinks.push(Arc::clone(ledger) as Arc<dyn EventSink>);
     }
@@ -1011,13 +1126,13 @@ async fn fire_promise(
     task.status = ScheduledStatus::Fired;
     task.result = Some(answer.clone());
     if let Err(e) = store.save(&task) {
-        eprintln!(
+        (surface.line)(&format!(
             "[schedule] cannot record the fired promise {}: {e}",
             task.id
-        );
+        ));
         return;
     }
-    eprintln!("[schedule] {} fired — {answer}", task.id);
+    (surface.line)(&format!("[schedule] {} fired — {answer}", task.id));
 }
 
 /// The shared terminal for a fresh run and a resume: flush the growth

@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Amparo — terminal surface · design preview</title>
+<meta name="description" content="Static design preview of the Amparo TUI, implementing docs/tui-design-spec.md.">
+<style>
+  /* Family slate tokens (web/public/style.css) — dark-only for this preview. */
+  :root {
+    --bg: #0b0f14;
+    --bg-raised: #11161d;
+    --panel: #151b24;
+    --border: #232c3a;
+    --fg: #e2e8f0;
+    --dim: #94a3b8;
+    --faint: #64748b;
+    --accent: #3b82f6;
+    --ok: #10b981;
+    --bad: #ef4444;
+    --warn: #f59e0b;
+    --warn-bright: #fbbf24;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.6 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 1.5rem; }
+
+  /* ---------- page header ---------- */
+  header { border-bottom: 1px solid var(--border); }
+  .hdr { max-width: 960px; margin: 0 auto; padding: 0.85rem 1.5rem; }
+  .brand-line { display: flex; align-items: baseline; gap: 0.7rem; flex-wrap: wrap; }
+  .brand { font: 600 18px var(--mono); color: var(--accent); letter-spacing: 0.01em; }
+  .cursor {
+    display: inline-block;
+    margin-left: 2px;
+    color: var(--ok);
+    animation: blink 1.1s steps(1, end) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
+  .hdr-sub { color: var(--dim); font: 13px var(--mono); }
+  .hdr-note { margin: 0.3rem 0 0; color: var(--faint); font: 12px var(--mono); }
+
+  main { padding: 2rem 0 1rem; }
+  h2.sec { font: 600 13px var(--mono); color: var(--dim); text-transform: lowercase; margin: 0 0 0.9rem; }
+  section { margin-bottom: 2.6rem; }
+  .caption { color: var(--faint); font: 12px var(--mono); margin: 0.6rem 0 0; }
+
+  /* ---------- terminal window ---------- */
+  .term {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  .term-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    font: 12px var(--mono);
+    color: var(--faint);
+    min-width: 720px;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--border); flex: none; }
+  .term-title { margin-left: 0.4rem; }
+  .term-body {
+    padding: 0.9rem 1.1rem 1.1rem;
+    font: 12.5px/1.75 var(--mono);
+    min-width: 720px;
+  }
+  .tline { white-space: pre; display: block; }
+  .spacer { height: 0.9em; }
+
+  /* verdict colors — color carries verdict, symbols carry the link */
+  .ok   { color: var(--ok); }
+  .warn { color: var(--warn); }
+  .bad  { color: var(--bad); }
+  .dim  { color: var(--dim); }
+  .faint { color: var(--faint); }
+  .acc  { color: var(--accent); }
+  .est  { color: var(--dim); font-style: italic; }
+  .sym.pending { color: var(--faint); }
+  .bright { color: var(--fg); font-weight: 600; }
+
+  /* approval card — a warn left rule, not a box */
+  .card-rule { color: var(--warn); }
+  .card-title { font-weight: 600; color: var(--fg); }
+  #pending-human { color: var(--warn-bright); }
+  #pending-human.pulse { color: var(--warn); }
+  #cd-secs, #cd-meter { color: var(--warn); }
+
+  /* input line */
+  .input-line { display: flex; white-space: pre; }
+  .input-line .grow { flex: 1; }
+  .rstatus { color: var(--dim); }
+
+  /* ---------- states reference ---------- */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+  }
+  .panel h3 { font: 600 12px var(--mono); color: var(--dim); text-transform: lowercase; margin: 0 0 0.6rem; }
+  .panel .tline { font: 12.5px/1.8 var(--mono); }
+  .panel p.note { color: var(--faint); font: 11.5px var(--mono); margin: 0.5rem 0 0; }
+
+  footer { border-top: 1px solid var(--border); }
+  .ftr { max-width: 960px; margin: 0 auto; padding: 1.4rem 1.5rem 2rem; color: var(--faint); font: 12px var(--mono); }
+  .ftr a { color: var(--dim); text-decoration: none; }
+  .ftr a:hover { color: var(--fg); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hdr">
+    <div class="brand-line">
+      <span class="brand">Amparo<span class="cursor" aria-hidden="true">█</span></span>
+      <span class="hdr-sub">— terminal surface · design preview</span>
+    </div>
+    <p class="hdr-note">static mockup implementing docs/tui-design-spec.md · no live gates, no dependencies</p>
+  </div>
+</header>
+
+<main>
+<div class="wrap">
+
+  <!-- ============ main terminal mock ============ -->
+  <section>
+    <h2 class="sec">[the stream] — boot, one task, one approval</h2>
+    <div class="term" aria-label="amparo tui mockup">
+      <div class="term-bar">
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        <span class="term-title">amparo · sess-481 · awaiting approval</span>
+      </div>
+      <div class="term-body" id="stream"><div class="tline">Greetings! My name is Amparo, built by EL AI Intelligence.</div>
+<div class="tline"><span class="dim">[wake]</span> Amparo is awake.</div>
+<div class="spacer"></div>
+<div class="tline">Every action I take passes one chain. No action exits it.</div>
+<div class="spacer"></div>
+<div class="tline">   <span class="acc">◆</span> registry  <span class="dim">──▶</span>  <span class="acc">▲</span> trust ceiling  <span class="dim">──▶</span>  <span class="acc">§</span> policy  <span class="dim">──▶</span>  <span class="acc">◉</span> you</div>
+<div class="spacer"></div>
+<div class="tline">   <span class="dim">◆  the tool must be registered, or it does not exist</span></div>
+<div class="tline">   <span class="dim">▲  its tier must sit under your trust ceiling</span></div>
+<div class="tline">   <span class="dim">§  the policy engine must allow this exact call</span></div>
+<div class="tline">   <span class="bright">◉  you approve whatever the first three cannot settle</span></div>
+<div class="spacer"></div>
+<div class="tline">Deny by default. Fail closed at every link. A model is never the approver.</div>
+<div class="spacer"></div>
+<div class="tline"><span class="dim">[key]</span>   <span class="ok">pass</span> <span class="dim">·</span> <span class="warn">escalate</span> <span class="dim">·</span> <span class="bad">denied</span> <span class="dim">· not reached</span></div>
+<div class="tline"><span class="dim">[chain]</span> <span class="acc">◆</span> <span class="dim">registry: 14 tools  ·</span>  <span class="acc">▲</span> <span class="dim">ceiling: tier-3  ·</span>  <span class="acc">§</span> <span class="dim">policy: guardrail (enforce)  ·</span>  <span class="acc">◉</span> <span class="dim">human: tier ≥ 2</span></div>
+<div class="spacer"></div>
+<div class="tline"><span class="faint">──────── sess-481 ──────────────────────────── enforce · engram ──</span></div>
+<div class="tline"><span class="dim">[memory] sess-472 touched this — the spec markers bit us last time</span></div>
+<div class="spacer"></div>
+<div class="tline"><span class="sym pending" data-final="ok">◆</span><span class="sym pending" data-final="ok">▲</span><span class="sym pending" data-final="ok">§</span><span class="sym pending" data-final="ok">◉</span>  read_file src/rollback.rs                        <span class="dim">42ms</span></div>
+<div class="tline"><span class="sym pending" data-final="ok">◆</span><span class="sym pending" data-final="ok">▲</span><span class="sym pending" data-final="ok">§</span><span class="sym pending" data-final="ok">◉</span>  search_code "rollback spec"                      <span class="dim">18ms</span></div>
+<div class="tline"><span class="sym pending" data-final="ok">◆</span><span class="sym pending" data-final="ok">▲</span><span class="sym pending" data-final="dim">§</span><span class="sym pending" data-final="dim">◉</span>  read_file src/hints.rs                           <span class="dim">7s</span></div>
+<div class="tline"><span class="sym pending" data-final="ok">◆</span><span class="sym pending" data-final="ok">▲</span><span class="sym pending" data-final="warn">§</span><span class="sym pending" data-final="warn-bright">◉</span>  edit_file src/hints.rs                  <span class="warn">escalated</span></div>
+<div class="spacer"></div>
+<div class="tline"><span class="card-rule">▐</span> <span class="card-title">approval required — edit_file src/hints.rs</span></div>
+<div class="tline"><span class="card-rule">▐</span>   <span class="ok">◆</span><span class="faint">──</span><span class="ok">▲</span><span class="faint">──</span><span class="ok">§</span><span class="faint">──</span><span id="pending-human">◉</span>  <span class="dim">policy escalates → human decides</span></div>
+<div class="tline"><span class="card-rule">▐</span>   <span class="dim">why:</span>      tier-2 write; policy escalate: src/ path</div>
+<div class="tline"><span class="card-rule">▐</span>   <span class="dim">blast:</span>    writes 1 file (src/hints.rs, +14 −3 lines)</div>
+<div class="tline"><span class="card-rule">▐</span>   <span class="dim">rollback:</span> restore hints.rs.amparo-bak</div>
+<div class="tline"><span class="card-rule">▐</span></div>
+<div class="tline"><span class="card-rule">▐</span>   approve? [y/N]  <span id="cd-secs">47s</span> <span id="cd-meter">▓▓▓▓▓▓▓▓░░</span> <span class="dim">── deny on timeout</span></div>
+<div class="spacer"></div>
+<div class="tline"><span class="dim">[approval]</span> you granted this — proceeding</div>
+<div class="tline"><span class="sym pending" data-final="ok">◆</span><span class="sym pending" data-final="ok">▲</span><span class="sym pending" data-final="ok">§</span><span class="sym pending" data-final="ok">◉</span>  edit_file src/hints.rs                           <span class="dim">96ms</span></div>
+<div class="tline"><span class="sym pending" data-final="ok">◆</span><span class="sym pending" data-final="ok">▲</span><span class="sym pending" data-final="bad">§</span><span class="sym pending" data-final="dim">◉</span>  run_command rm -rf build/    <span class="bad">policy: destructive flags</span></div>
+<div class="spacer"></div>
+<div class="tline"><span class="dim">[complete]</span> done. 3 files read, 1 written</div>
+<div class="tline"><span class="est">~$0.04 in inference (estimate, chars/4, $3/1M tokens)</span></div>
+<div class="spacer"></div>
+<div class="tline input-line"><span class="acc">›</span> <span class="cursor" aria-hidden="true">█</span><span class="grow"></span><span class="rstatus"><span class="ok">◆▲§◉</span> · enforce · engram · ~$0.04</span></div></div>
+    </div>
+    <p class="caption">symbols light up left-to-right as verdicts arrive (one pass, on load) · the countdown drains and resets for the preview — the real default on timeout is deny · width &lt; ~72 cols drops the right-aligned status, never wraps the chain</p>
+  </section>
+
+  <!-- ============ states reference ============ -->
+  <section>
+    <h2 class="sec">[key] — the four chain states</h2>
+    <div class="grid">
+      <div class="panel">
+        <h3>pass — green</h3>
+        <div class="tline"><span class="ok">◆▲§◉</span>  read_file src/rollback.rs      <span class="dim">42ms</span></div>
+        <p class="note">the auto-passed majority; the uniform green baseline is what makes amber and red pop</p>
+      </div>
+      <div class="panel">
+        <h3>escalate — amber</h3>
+        <div class="tline"><span class="ok">◆▲</span><span class="warn">§</span><span style="color:var(--warn-bright)">◉</span>  edit_file src/hints.rs     <span class="warn">escalated</span></div>
+        <p class="note">policy hands off; the pending human link is bright amber until you decide</p>
+      </div>
+      <div class="panel">
+        <h3>denied — red</h3>
+        <div class="tline"><span class="ok">◆▲</span><span class="bad">§</span><span class="faint">◉</span>  run_command rm -rf build/  <span class="bad">policy: destructive flags</span></div>
+        <p class="note">this link said no; a human denial is red too — a decision, not an absence</p>
+      </div>
+      <div class="panel">
+        <h3>not reached — dim</h3>
+        <div class="tline"><span class="ok">◆▲</span><span class="bad">§</span><span class="faint">◉</span>  <span class="dim">◉ never evaluated — upstream denied</span></div>
+        <p class="note">dim never means "skipped" — "not reached" when an upstream link denied, "not configured" when a link has no config</p>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:1rem">
+      <h3>the key — printed once at boot, re-printable via /key</h3>
+      <div class="tline"><span class="dim">[key]</span>   <span class="ok">pass</span> <span class="dim">·</span> <span class="warn">escalate</span> <span class="dim">·</span> <span class="bad">denied</span> <span class="dim">· not reached</span> <span class="faint">── the symbols light up as each verdict arrives</span></div>
+    </div>
+  </section>
+
+  <!-- ============ companion configurations ============ -->
+  <section>
+    <h2 class="sec">[chain] — companion honesty is a value in a field, never error styling</h2>
+    <div class="grid">
+      <div class="panel">
+        <h3>with guardrail</h3>
+        <div class="tline"><span class="acc">§</span> <span class="dim">policy: guardrail v0.9.2 (enforce)</span></div>
+        <div class="tline"><span class="acc">§</span> <span class="dim">policy: guardrail v0.9.2 (</span><span class="warn">audit — verdicts advisory</span><span class="dim">)</span></div>
+        <p class="note">"audit" is amber — advisory verdicts are a trust-relevant condition</p>
+      </div>
+      <div class="panel">
+        <h3>without a companion</h3>
+        <div class="tline"><span class="acc">§</span> <span class="dim">policy: built-in (deny-all default)</span></div>
+        <p class="note">same register, no red, no warning iconography — a missing companion is a configuration, not an error</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ presence: away briefing + resume picker ============ -->
+  <section>
+    <h2 class="sec">[presence] — behavior, not animation</h2>
+    <div class="grid">
+      <div class="panel">
+        <h3>[away] — focus reporting, one dim line on return</h3>
+        <div class="tline"><span class="dim">[away] you were gone 26m — nothing happened</span></div>
+        <div class="tline"><span class="dim">[away] you were gone 2h — while unfocused:</span></div>
+        <div class="tline"><span class="dim">  [schedule] weekly audit ran — 0 findings</span></div>
+        <div class="tline"><span class="dim">  [bus] sess-477 finished — completed</span></div>
+        <p class="note">perception is bounded to the terminal channel on purpose</p>
+      </div>
+      <div class="panel">
+        <h3>[session] — resume picker, cost at the decision point</h3>
+        <div class="tline"><span class="dim">[session] resume which session?</span></div>
+        <div class="tline"><span class="dim">  1  sess-481   tighten the rollback hints        2h ago   </span><span class="est">~$0.04</span></div>
+        <div class="tline"><span class="dim">  2  sess-477   audit the policy fixtures         1d ago   </span><span class="est">~$0.31</span></div>
+        <div class="tline"><span class="acc">›</span> 3  sess-472   migrate vault schema              3d ago   <span class="est">~$1.12</span></div>
+        <p class="note">↑↓ + enter, esc cancels, digit keys select directly · resuming is choosing to spend</p>
+      </div>
+    </div>
+  </section>
+
+</div>
+</main>
+
+<footer>
+  <div class="ftr">Design: docs/tui-design-spec.md · <a href="https://elai-intelligence.com">EL AI Intelligence</a></div>
+</footer>
+
+<script>
+(function () {
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* Chain symbols light up left-to-right as verdicts arrive — one pass. */
+  var syms = Array.prototype.slice.call(document.querySelectorAll("#stream .sym"));
+  function settle(s) { s.classList.remove("pending"); s.classList.add(s.dataset.final); }
+  if (reduce) {
+    syms.forEach(settle);
+  } else {
+    syms.forEach(function (s, i) { setTimeout(function () { settle(s); }, 250 + i * 150); });
+  }
+
+  /* Approval countdown — draining meter, one redraw per second.
+     Loops for the preview; the real default on timeout is deny. */
+  var secsEl = document.getElementById("cd-secs");
+  var meterEl = document.getElementById("cd-meter");
+  var humanEl = document.getElementById("pending-human");
+  var TOTAL = 60, BLOCKS = 10, t = 47;
+  function render() {
+    secsEl.textContent = t + "s";
+    var filled = Math.max(0, Math.ceil(t / TOTAL * BLOCKS));
+    meterEl.textContent = "▓".repeat(filled) + "░".repeat(BLOCKS - filled);
+  }
+  render();
+  if (!reduce) {
+    setInterval(function () {
+      t -= 1;
+      if (t < 0) t = TOTAL;
+      render();
+      humanEl.classList.toggle("pulse"); /* pending ◉ pulses bright↔normal on the tick */
+    }, 1000);
+  }
+})();
+</script>
+
+</body>
+</html>

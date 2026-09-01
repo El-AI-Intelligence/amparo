@@ -4143,3 +4143,41 @@ async fn resume_lands_a_swarm_with_the_chain_stamped() {
     assert_eq!(parent["status"], "complete");
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+// ── tui ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tui_piped_runs_a_task_and_renders_the_chain() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![
+        tool_script("read_file", r#"{"path":"README.md"}"#),
+        vec![content_frame(" done.")],
+    ])
+    .await;
+    let (env, prior) = mock_env(&mock).await;
+
+    let out = run_with_stdin(&["tui", "--allow-all"], b"read the readme\n").await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    // The whole surface renders on stdout in piped mode: the banner, the
+    // gate-chain gutter row for the executed tool, and the closing report
+    // — all plain, zero escapes.
+    assert!(text.contains("Greetings! My name is Amparo"), "{text}");
+    assert!(text.contains("[wake] Amparo is awake."), "{text}");
+    assert!(
+        text.contains("Every action I take passes one chain"),
+        "{text}"
+    );
+    assert!(text.contains("[key]"), "{text}");
+    assert!(text.contains("[chain]"), "{text}");
+    assert!(text.contains("◆▲§◉  read_file"), "{text}");
+    assert!(text.contains("[report] complete —"), "{text}");
+    assert!(
+        !text.contains("\x1b["),
+        "piped mode emits zero escapes: {text}"
+    );
+}

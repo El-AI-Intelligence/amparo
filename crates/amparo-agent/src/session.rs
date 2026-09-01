@@ -121,6 +121,14 @@ pub trait CheckpointStore: Send + Sync {
     /// The newest `Complete` checkpoint for `tenant`, if any — the
     /// continuity source. `Running`/`Failed` files are ignored.
     fn latest_complete(&self, tenant: &str) -> Option<Checkpoint>;
+
+    /// Every `Running` checkpoint for `tenant`, newest first — the
+    /// resume picker's list. The default returns at most one entry
+    /// ([`CheckpointStore::latest_incomplete`]); stores that can
+    /// enumerate their own files (the on-disk store) override it.
+    fn list_incomplete(&self, tenant: &str) -> Vec<Checkpoint> {
+        self.latest_incomplete(tenant).into_iter().collect()
+    }
 }
 
 /// The on-disk store: one JSON file per task under
@@ -230,6 +238,43 @@ impl CheckpointStore for JsonCheckpointStore {
 
     fn latest_complete(&self, tenant: &str) -> Option<Checkpoint> {
         self.latest(tenant, SessionStatus::Complete)
+    }
+
+    fn list_incomplete(&self, tenant: &str) -> Vec<Checkpoint> {
+        let dir = self.dir_for(tenant);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(), // no directory — no checkpoints
+        };
+        let mut running: Vec<Checkpoint> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            let checkpoint: Checkpoint = match serde_json::from_str(&text) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    tracing::warn!(
+                        "[amparo-agent] skipping corrupt checkpoint {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if checkpoint.status == SessionStatus::Running {
+                running.push(checkpoint);
+            }
+        }
+        // Newest first — the resume picker lists the most recent on top.
+        running.sort_by(|a: &Checkpoint, b: &Checkpoint| {
+            (b.started_at, &b.task_id).cmp(&(a.started_at, &a.task_id))
+        });
+        running
     }
 }
 

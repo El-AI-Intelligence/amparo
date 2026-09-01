@@ -29,6 +29,11 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+# Raw terminal mode for `amparo tui` (single-keypress approval, width
+# detection) — already in the workspace lockfile as a transitive dep.
+libc = "0.2"
+
 [dev-dependencies]
 # Test-only: build the eval_wasm fixture module at test runtime (both are
 # already workspace deps through amparo-sandbox).

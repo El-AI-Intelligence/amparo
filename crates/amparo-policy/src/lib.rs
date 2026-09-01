@@ -110,6 +110,18 @@ pub trait PolicyEngine: Send + Sync {
         target: &str,
         params: &[(&str, &str)],
     ) -> PolicyDecision;
+
+    /// Whether this engine has answered in audit mode — verdicts
+    /// advisory, not enforced.
+    ///
+    /// `false` by default: most engines never audit. [`AuditNoticeEngine`]
+    /// overrides it to `true` once an underlying decision carried the
+    /// audit-only marker — exactly when the one-time advisory notice
+    /// fires. Hosts read this to recolor their policy status (the TUI's
+    /// `§` symbol) without parsing verdicts themselves.
+    fn audit_mode(&self) -> bool {
+        false
+    }
 }
 
 /// Fail-safe default engine: refuses everything, with the reason surfaced in
@@ -220,6 +232,10 @@ impl<E: PolicyEngine> PolicyEngine for AuditNoticeEngine<E> {
             (self.print)(AUDIT_NOTICE);
         }
         decision
+    }
+
+    fn audit_mode(&self) -> bool {
+        self.noticed.load(Ordering::SeqCst)
     }
 }
 

@@ -295,6 +295,12 @@ impl ToolRegistry {
         self.tools.get(name).map(|t| t.schema().trust_tier)
     }
 
+    /// The number of registered tools — the `[chain]` line's registry
+    /// count (`◆ registry: 14 tools`).
+    pub fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
+
     /// Returns a cloned Arc to the executor so callers can invoke it after
     /// releasing the registry lock (avoids holding a Mutex across an .await).
     pub fn get_executor(&self, name: &str) -> Option<Arc<dyn ToolExecutor>> {

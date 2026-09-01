@@ -28,10 +28,15 @@
 //! - `amparo schedule list|cancel [FLAGS]` inspects the schedule queue
 //!   (M8): list every persisted promise or cancel a pending one — a status
 //!   change, never a deletion; the chat driver's ticker does the firing.
+//! - `amparo tui [FLAGS]` is the interactive terminal surface: one prompt,
+//!   the whole gate chain rendered live — banner, gutter rows, approval
+//!   cards, status line. Piped, it degrades to one task per stdin line with
+//!   zero escapes.
 //! - `amparo version` prints the version.
 //!
 //! stdout carries the final answer only (a scripting contract); progress,
-//! gate decisions, the report and errors go to stderr.
+//! gate decisions, the report and errors go to stderr. `amparo tui` is the
+//! exception: it renders its whole surface on stdout.
 
 mod approve;
 mod doctor;
@@ -42,6 +47,7 @@ mod run;
 mod schedule;
 mod skill;
 mod stderr_subscriber;
+mod tui;
 
 use amparo_mcp::serve::{self, ParseResult};
 
@@ -57,6 +63,7 @@ USAGE:
   amparo privacy [FLAGS]
   amparo doctor [FLAGS]
   amparo schedule list|cancel [FLAGS]
+  amparo tui [FLAGS]
   amparo version
 
 SUBCOMMANDS:
@@ -73,11 +80,15 @@ SUBCOMMANDS:
              skills, schedule, policy, engram, chat-config
   schedule   inspect the schedule queue: list every persisted promise or
              cancel a pending one (a status change, never a deletion)
+  tui        the interactive terminal surface: one prompt, the whole gate
+             chain rendered live (banner, gutter rows, approval cards,
+             status line); piped: one task per stdin line
   version    print the version
 
 Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help`,
 `amparo skill --help`, `amparo notebook --help`, `amparo privacy --help`,
-`amparo doctor --help` or `amparo schedule --help` for flags.";
+`amparo doctor --help`, `amparo schedule --help` or `amparo tui --help`
+for flags.";
 
 #[tokio::main]
 async fn main() {
@@ -100,6 +111,7 @@ async fn main() {
         "privacy" => privacy::dispatch(args),
         "doctor" => doctor::dispatch(args).await,
         "schedule" => schedule::dispatch(args),
+        "tui" => tui::dispatch(args).await,
         "version" | "-V" | "--version" => println!("amparo {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{USAGE}"),
         other => {
