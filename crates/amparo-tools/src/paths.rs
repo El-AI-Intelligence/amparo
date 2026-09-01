@@ -120,15 +120,16 @@ impl PathPolicy {
 
     /// Check whether a path is within the sandbox boundary.
     pub fn is_path_allowed(&self, path: &std::path::Path, write: bool) -> bool {
-        // Canonicalize if possible; fall back to normalized path
-        let resolved = path.canonicalize().unwrap_or_else(|_| normalize_path(path));
+        // Resolve the candidate to its on-disk view and compare against
+        // boundary roots resolved the same way — both sides must share one
+        // view, or the comparison silently denies. See `resolve_deep` for
+        // the platform asymmetries this guards against (macOS symlinked
+        // temp dirs, Windows `\\?\` canonical prefixes, not-yet-existing
+        // write targets).
+        let resolved = resolve_deep(path);
 
-        // Always allow paths inside workspace_root. The boundary root is
-        // resolved the same way as the candidate — on macOS the temp dir
-        // (`/var/folders/…`) and `/tmp` are symlinks into `/private/…`, so
-        // a canonical candidate compared against a lexical root would be
-        // wrongly denied.
-        let workspace_root = resolve_boundary(&self.workspace_root);
+        // Always allow paths inside workspace_root.
+        let workspace_root = resolve_deep(&self.workspace_root);
         if resolved.starts_with(&workspace_root) {
             return true;
         }
@@ -139,7 +140,7 @@ impl PathPolicy {
         // that would otherwise make run_command→read_file workflows fail.
         if scratch_roots()
             .iter()
-            .any(|root| resolved.starts_with(&resolve_boundary(root)))
+            .any(|root| resolved.starts_with(&resolve_deep(root)))
         {
             return true;
         }
@@ -147,7 +148,7 @@ impl PathPolicy {
         // Read-only paths are allowed for reads only
         if !write {
             for ro_path in &self.read_only_paths {
-                if resolved.starts_with(&resolve_boundary(ro_path)) {
+                if resolved.starts_with(&resolve_deep(ro_path)) {
                     return true;
                 }
             }
@@ -211,21 +212,13 @@ impl PathPolicy {
         let candidate = self.workspace_root.join(stripped);
         let resolved = normalize_path(&candidate);
 
-        // Verify against root with trailing separator to prevent
-        // sibling-directory escapes (e.g., /home/user/work must not match
-        // /home/user/workaround).
-        let root_with_sep = {
-            let mut s = self.workspace_root.to_string_lossy().to_string();
-            if !s.ends_with('/') {
-                s.push('/');
-            }
-            s
-        };
-
-        let resolved_str = resolved.to_string_lossy();
-        if resolved_str == self.workspace_root.to_string_lossy()
-            || resolved_str.starts_with(&root_with_sep)
-        {
+        // Verify against the root component-wise. `starts_with` compares
+        // whole path components, so a sibling-directory name
+        // (`/home/user/workaround`) never matches `/home/user/work` — and
+        // it needs no separator surgery, which was outright wrong on
+        // Windows (pushing '/' onto a `\`-separated path can never match,
+        // so every relative file write was denied).
+        if resolved == self.workspace_root || resolved.starts_with(&self.workspace_root) {
             Ok(resolved)
         } else {
             Err(format!(
@@ -242,13 +235,35 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir())
 }
 
-/// Resolve a boundary root the same way candidates are resolved:
-/// canonicalized when the path exists on disk, lexical otherwise. Both
-/// sides of a boundary comparison must use the same view — see
-/// [`PathPolicy::is_path_allowed`].
-fn resolve_boundary(root: &std::path::Path) -> PathBuf {
-    root.canonicalize()
-        .unwrap_or_else(|_| normalize_path(&root.to_path_buf()))
+/// Resolve a path to its on-disk view for boundary comparison: the
+/// deepest existing ancestor is canonicalized and the remaining tail
+/// re-appended lexically. Both sides of a boundary comparison go through
+/// this, so they always share one view — including for not-yet-existing
+/// targets (`write_file` creates files, so the candidate itself often
+/// does not exist yet) and across the platform asymmetries that string
+/// comparison cannot see: macOS's `/var/folders/…` → `/private/var/…`
+/// symlinks and Windows' `\\?\`-prefixed canonical paths.
+fn resolve_deep(path: &std::path::Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match cursor.canonicalize() {
+            Ok(canonical) => {
+                let mut out = canonical;
+                for component in tail.iter().rev() {
+                    out.push(component);
+                }
+                return out;
+            }
+            Err(_) => match (cursor.file_name(), cursor.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name.to_os_string());
+                    cursor = parent.to_path_buf();
+                }
+                _ => return normalize_path(&path.to_path_buf()),
+            },
+        }
+    }
 }
 
 /// Normalize a path lexically: resolve `.` and `..` without touching the
@@ -400,6 +415,36 @@ mod tests {
         assert!(p.check_command_blocked("base64 -d").is_some());
         assert!(p.check_command_blocked("echo hello").is_none());
         assert!(p.check_command_blocked("git status").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn not_yet_existing_file_under_a_symlinked_root_is_allowed() {
+        // macOS ships its temp dir as a symlink (`/var/folders/…` →
+        // `/private/var/folders/…`). write_file resolves a not-yet-existing
+        // target, so the candidate itself cannot canonicalize and must still
+        // land in the same view as the boundary — rebuild that shape here
+        // with an explicit symlink.
+        let real = scratch().join(format!("amparo-symlink-real-{}", std::process::id()));
+        let link = scratch().join(format!("amparo-symlink-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let p = PathPolicy::from_root(link.clone());
+        let fresh_write = link.join("notes.txt");
+        assert!(
+            p.is_path_allowed(&fresh_write, true),
+            "a fresh write under a symlinked root must be allowed"
+        );
+        assert!(
+            p.is_path_allowed(&link.join("notes.txt.amparo-bak"), true),
+            "the backup marker beside a fresh write must be allowed too"
+        );
+
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
     }
 
     #[test]

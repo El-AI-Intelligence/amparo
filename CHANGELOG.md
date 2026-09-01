@@ -37,11 +37,15 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   (that arrived in a later cargo), so the real-process e2e suites
   (`cli_e2e`, `chat_e2e`, `bin_e2e`) now fall back to locating the
   binaries next to the test executables in the profile directory.
-- **Symlinked temp dirs on macOS**: the sandbox boundary now resolves
-  comparison roots the same way candidates are resolved (canonical when
-  they exist on disk). On macOS the temp dir and `/tmp` are symlinks
-  into `/private/…`, and the canonical-vs-lexical mismatch silently
-  denied every workspace write under them.
+- **Sandbox boundary on macOS and Windows**: both sides of a boundary
+  comparison now resolve through the same view — the deepest existing
+  ancestor is canonicalized and the tail re-appended — instead of
+  canonicalize-or-lexical. On macOS the temp dir and `/tmp` are symlinks
+  into `/private/…`, and a not-yet-existing write target can never
+  canonicalize, so every fresh workspace write was silently denied. The
+  workspace check is also component-wise now: it appended `/` to the
+  root string, which can never match a Windows `\`-separated path, so
+  every relative file write on Windows was denied at resolution.
 - **Windows TUI dead code**: the interactive reader (raw mode, keypress
   approvals, picker) is Unix-only by design — on Windows the surface
   runs piped. The Unix-only machinery is now allow-listed for dead code
