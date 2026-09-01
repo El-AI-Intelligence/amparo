@@ -264,8 +264,20 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    /// The real engramd v0.1.4 capture-row shape (verified 2026-09-01):
+    /// a live row carries `"skipped": false` explicitly — the adapter's
+    /// `#[serde(default)]` tolerates absence, but the mocks pin the real
+    /// shape.
     fn mem(id: &str, content: &str, created: &str) -> String {
-        json!({"id": id, "content": content, "created_at": created}).to_string()
+        json!({
+            "id": id,
+            "content": content,
+            "created_at": created,
+            "skipped": false,
+            "skip_reason": null,
+            "matched_id": null
+        })
+        .to_string()
     }
 
     #[tokio::test]
@@ -298,11 +310,18 @@ mod tests {
             assert!(raw.contains("\"query\":\"hetzner\""), "query not forwarded: {raw}");
             assert!(raw.contains("\"limit\":3"), "limit not forwarded: {raw}");
             let body = json!({
-                "results": [json!({"id":"m1","content":"deploys to hetzner","created_at":"2026-08-31T00:00:00Z"})],
+                "results": [json!({
+                    "id":"m1",
+                    "content":"deploys to hetzner",
+                    "created_at":"2026-08-31T00:00:00Z",
+                    "skipped": false,
+                    "skip_reason": null,
+                    "matched_id": null
+                })],
                 "total": 1,
                 "vault_total": 5,
-                "search_type": "fts5",
-                "took_ms": 1
+                "search_type": "hybrid",
+                "took_ms": 210
             });
             (200, body.to_string())
         })
