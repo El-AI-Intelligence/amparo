@@ -44,6 +44,24 @@ pub struct PathPolicy {
     pub blocked_patterns: Vec<String>,
 }
 
+/// The shared scratch roots for the current platform.
+///
+/// Unix tools pass `/tmp` and `/dev/shm` through unchanged so that file
+/// tools and shell tools see the same filesystem. Windows has no
+/// `/dev/shm` twin — the system temp directory is the single scratch
+/// root, and the Unix root-style pass-through does not extend to drive
+/// roots.
+pub fn scratch_roots() -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        vec![PathBuf::from("/tmp"), PathBuf::from("/dev/shm")]
+    }
+    #[cfg(not(unix))]
+    {
+        vec![std::env::temp_dir()]
+    }
+}
+
 impl Default for PathPolicy {
     fn default() -> Self {
         Self {
@@ -110,11 +128,11 @@ impl PathPolicy {
             return true;
         }
 
-        // /tmp and /dev/shm are shared scratch spaces — readable and writable.
-        // They must appear in the same filesystem view for both file tools and
-        // shell tools, avoiding the path-resolution asymmetry that would
-        // otherwise make run_command→read_file workflows fail.
-        if resolved.starts_with("/tmp") || resolved.starts_with("/dev/shm") {
+        // The platform scratch dirs are shared scratch space — readable and
+        // writable. They must appear in the same filesystem view for both
+        // file tools and shell tools, avoiding the path-resolution asymmetry
+        // that would otherwise make run_command→read_file workflows fail.
+        if scratch_roots().iter().any(|root| resolved.starts_with(root)) {
             return true;
         }
 
@@ -146,13 +164,14 @@ impl PathPolicy {
     /// within the workspace boundary — `..` traversal that would escape is
     /// always rejected.
     ///
-    /// **Absolute paths** under `/tmp` or `/dev/shm` are passed through
+    /// **Absolute paths** under the platform scratch dirs are passed through
     /// unchanged so that file tools (`read_file`, `write_file`) and shell
     /// tools (`run_command`) see the same filesystem — a file written by bash
-    /// in `/tmp` can be read back by `read_file` without silent remapping.
-    /// All other absolute paths are stripped of their leading `/` and remapped
-    /// to the workspace (defense-in-depth: an agent that accidentally passes
-    /// `/etc/passwd` gets a safe "not found" rather than the real file).
+    /// in the scratch dir can be read back by `read_file` without silent
+    /// remapping. All other absolute paths are stripped of their leading `/`
+    /// and remapped to the workspace (defense-in-depth: an agent that
+    /// accidentally passes `/etc/passwd` gets a safe "not found" rather than
+    /// the real file).
     ///
     /// Returns Err if the path would escape all allowed boundaries.
     pub fn resolve_workspace_path(&self, user_path: &str) -> Result<PathBuf, String> {
@@ -162,19 +181,19 @@ impl PathPolicy {
         std::fs::create_dir_all(&self.workspace_root).ok();
 
         // ── Shared scratch paths: pass through unchanged ────────────────
-        // /tmp and /dev/shm are the only absolute paths that bypass
+        // The platform scratch dirs are the only absolute paths that bypass
         // workspace remapping. This keeps cross-tool filesystem access
         // consistent without opening a broad bypass for arbitrary system
         // paths.
-        if path.is_absolute() && (path.starts_with("/tmp") || path.starts_with("/dev/shm")) {
+        if path.is_absolute() && scratch_roots().iter().any(|root| path.starts_with(root)) {
             let resolved = normalize_path(&path.to_path_buf());
-            // Safety: ensure the path is still within /tmp or /dev/shm
-            // after normalization (prevents /tmp/../home/… escapes).
-            if resolved.starts_with("/tmp") || resolved.starts_with("/dev/shm") {
+            // Safety: ensure the path is still within a scratch root after
+            // normalization (prevents /tmp/../home/… escapes).
+            if scratch_roots().iter().any(|root| resolved.starts_with(root)) {
                 return Ok(resolved);
             }
             return Err(format!(
-                "Path '{}' escapes /tmp boundary. Access denied.",
+                "Path '{}' escapes the scratch dir boundary. Access denied.",
                 user_path
             ));
         }
@@ -212,7 +231,7 @@ impl PathPolicy {
 fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .unwrap_or_else(|_| std::env::temp_dir())
 }
 
 /// Normalize a path lexically: resolve `.` and `..` without touching the
@@ -298,9 +317,18 @@ fn default_blocked_patterns() -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The platform scratch dir the tests exercise (first of
+    /// [`scratch_roots`]: `/tmp` on Unix, the system temp dir on Windows).
+    fn scratch() -> PathBuf {
+        scratch_roots()
+            .into_iter()
+            .next()
+            .expect("at least one scratch root")
+    }
+
     fn policy() -> PathPolicy {
         PathPolicy {
-            workspace_root: PathBuf::from("/tmp/amparo-test-workspace"),
+            workspace_root: scratch().join("amparo-test-workspace"),
             ..Default::default()
         }
     }
@@ -309,7 +337,7 @@ mod tests {
     fn relative_path_stays_in_workspace() {
         let p = policy();
         let resolved = p.resolve_workspace_path("notes/ideas.md").unwrap();
-        assert!(resolved.starts_with("/tmp/amparo-test-workspace"));
+        assert!(resolved.starts_with(&p.workspace_root));
     }
 
     #[test]
@@ -322,20 +350,22 @@ mod tests {
     fn absolute_system_path_is_remapped_not_served() {
         let p = policy();
         let resolved = p.resolve_workspace_path("/etc/passwd").unwrap();
-        assert!(resolved.starts_with("/tmp/amparo-test-workspace"));
+        assert!(resolved.starts_with(&p.workspace_root));
     }
 
     #[test]
     fn tmp_scratch_passes_through() {
         let p = policy();
-        let resolved = p.resolve_workspace_path("/tmp/some-file").unwrap();
-        assert_eq!(resolved, PathBuf::from("/tmp/some-file"));
+        let sample = scratch().join("some-file");
+        let resolved = p.resolve_workspace_path(sample.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(resolved, sample);
     }
 
     #[test]
     fn tmp_boundary_escape_is_rejected() {
         let p = policy();
-        assert!(p.resolve_workspace_path("/tmp/../etc/passwd").is_err());
+        let escape = format!("{}/../etc/passwd", scratch().to_string_lossy());
+        assert!(p.resolve_workspace_path(&escape).is_err());
     }
 
     #[test]

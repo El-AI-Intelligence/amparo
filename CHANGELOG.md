@@ -8,6 +8,21 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+### Added
+
+- **CI on three platforms**: a GitHub Actions matrix (Linux, macOS,
+  Windows) runs both gates at the pinned MSRV (1.85) with warnings denied,
+  and a tag-triggered release workflow builds all five installer targets
+  natively and publishes a GitHub release with SHA256SUMS.
+
+### Changed
+
+- **Platform scratch dirs**: the file/shell sandbox and the preflight
+  blast-radius classifier now use platform-aware shared scratch roots —
+  `/tmp` and `/dev/shm` on Unix, the system temp directory on Windows
+  (which has no `/dev/shm` twin). The default-workspace fallback when
+  `HOME` is unset is now the system temp dir instead of `/tmp`.
+
 ## [0.11.0] — 2026-09-01
 
 M12, landed: the ecosystem terminal — Amparo writes directly into both

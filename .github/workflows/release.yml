@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Gate before release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      # A tag that fails the gates must not ship.
+      - run: cargo test --workspace
+        env:
+          RUSTFLAGS: "-D warnings"
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          # macos-13 (the last Intel runner) was retired 2025-11; the
+          # x86_64 macOS build cross-compiles from the arm64 runner,
+          # which replaces the workstation osxcross step.
+          - runner: macos-14
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # `--target` on every entry keeps the artifact path uniform; for
+      # the four native entries the target triple equals the host triple.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          targets: ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release -p amparo-cli -p amparo-mcp --bins --target ${{ matrix.target }}
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin="target/${{ matrix.target }}/release"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "$bin/amparo.exe" "dist/amparo-${{ matrix.target }}.exe"
+            cp "$bin/amparo-mcp-serve.exe" "dist/amparo-mcp-serve-${{ matrix.target }}.exe"
+          else
+            cp "$bin/amparo" "dist/amparo-${{ matrix.target }}"
+            cp "$bin/amparo-mcp-serve" "dist/amparo-mcp-serve-${{ matrix.target }}"
+          fi
+          (cd dist && sha256sum * > SHA256SUMS.${{ matrix.target }})
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amparo-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-release
+          merge-multiple: true
+      - name: Combine checksums
+        run: (cd dist-release && sha256sum amparo-* amparo-mcp-serve-* > SHA256SUMS)
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Amparo ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist-release/*

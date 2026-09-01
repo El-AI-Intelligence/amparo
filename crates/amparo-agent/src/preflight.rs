@@ -82,8 +82,8 @@ impl std::fmt::Display for BlastRadius {
 }
 
 /// The file tools whose `path` argument gets the workspace-boundary
-/// inspection: an absolute path outside the workspace, `/tmp` and
-/// `/dev/shm` labels the call [`BlastRadius::SystemWide`].
+/// inspection: an absolute path outside the workspace and the platform
+/// scratch dirs labels the call [`BlastRadius::SystemWide`].
 const FILE_TOOLS: &[&str] = &[
     "read_file",
     "write_file",
@@ -151,8 +151,8 @@ pub fn classify_tier(registry: &ToolRegistry, call: &ToolCall) -> BlastRadius {
 ///    [`PathPolicy::check_command_blocked`] → [`BlastRadius::Destructive`]
 /// 2. `run_command` naming a network-transfer utility → at least
 ///    [`BlastRadius::Network`]
-/// 3. a file tool given an absolute path outside the workspace, `/tmp`
-///    and `/dev/shm` → at least [`BlastRadius::SystemWide`]
+/// 3. a file tool given an absolute path outside the workspace and the
+///    platform scratch dirs → at least [`BlastRadius::SystemWide`]
 ///
 /// An unknown tool (never seen in the loop — the gate blocks those
 /// first) is labeled [`BlastRadius::SystemWide`], the honest
@@ -205,7 +205,10 @@ fn outside_workspace(path: &str, workspace_root: &std::path::Path) -> bool {
     if path.starts_with(workspace_root) {
         return false;
     }
-    if path.starts_with("/tmp") || path.starts_with("/dev/shm") {
+    if amparo_tools::paths::scratch_roots()
+        .iter()
+        .any(|root| path.starts_with(root))
+    {
         return false;
     }
     true
@@ -218,7 +221,6 @@ mod tests {
     use super::*;
     use amparo_tools::registry::{ToolExecutor, ToolParam, ToolSchema};
     use async_trait::async_trait;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     /// A minimal executor so the tests can register tools at any tier.
@@ -262,7 +264,7 @@ mod tests {
     }
 
     fn policy() -> PathPolicy {
-        PathPolicy::from_root(PathBuf::from("/tmp/amparo-ws"))
+        PathPolicy::from_root(std::env::temp_dir().join("amparo-ws"))
     }
 
     fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -414,24 +416,45 @@ mod tests {
         assert_eq!(classify(&registry, &policy, &call), BlastRadius::ReadOnly);
     }
 
+    /// An absolute path that is outside both the workspace and the
+    /// platform scratch dirs — string-only, never touched.
+    #[cfg(unix)]
+    fn outside_sample() -> String {
+        "/etc/passwd".to_string()
+    }
+
+    /// Windows treats rooted-but-unprefixed paths (`/etc/…`) as relative,
+    /// so the outside sample carries a drive prefix there.
+    #[cfg(not(unix))]
+    fn outside_sample() -> String {
+        "C:\\etc\\passwd".to_string()
+    }
+
     #[test]
     fn file_paths_outside_the_workspace_raise_to_system_wide() {
         let registry = registry(&[("write_file", ToolTrustTier::LocalMutating)]);
         let policy = policy();
-        let outside = call("write_file", serde_json::json!({"path": "/etc/passwd"}));
+        let outside = call("write_file", serde_json::json!({"path": outside_sample()}));
         assert_eq!(
             classify(&registry, &policy, &outside),
             BlastRadius::SystemWide
         );
         // The shared scratch dirs and the workspace itself stay local…
-        let scratch = call("write_file", serde_json::json!({"path": "/tmp/out.txt"}));
+        let scratch = call(
+            "write_file",
+            serde_json::json!({
+                "path": amparo_tools::paths::scratch_roots()[0].join("out.txt").to_string_lossy().to_string()
+            }),
+        );
         assert_eq!(
             classify(&registry, &policy, &scratch),
             BlastRadius::WorkspaceLocal
         );
         let inside = call(
             "write_file",
-            serde_json::json!({"path": "/tmp/amparo-ws/out.txt"}),
+            serde_json::json!({
+                "path": policy.workspace_root.join("out.txt").to_string_lossy().to_string()
+            }),
         );
         assert_eq!(
             classify(&registry, &policy, &inside),
