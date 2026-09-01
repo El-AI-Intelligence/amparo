@@ -50,6 +50,24 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   approvals, picker) is Unix-only by design — on Windows the surface
   runs piped. The Unix-only machinery is now allow-listed for dead code
   on non-unix instead of faking a Windows reader.
+- **`read_file` not-found message is OS-independent**: a missing file now
+  reports `File not found: <path>` on every platform instead of the raw
+  io error text, which differs per OS ("No such file" vs "The system
+  cannot find the file specified") — the agent reasons over this string,
+  and it must not shift underneath it. Other io errors keep the OS text.
+- **Windows config test fixture**: the absolute-workspace rejection test
+  used `/etc/passwd`, which is drive-relative (not absolute) on Windows
+  and so sailed through validation. The fixture is now platform-aware —
+  a Windows absolute path trips the rule on Windows.
+- **CI wait budgets**: the chat test harnesses polled with 5 s ceilings
+  and the `chat_e2e` round trips with 30 s; loaded 2-core CI runners
+  (especially Windows) blew both on scheduler contention alone, and the
+  e2e children were killed mid-round-trip. Budgets are now 30 s and
+  120 s — a polling ceiling, not a correctness window: a stalled driver
+  still fails, just not prematurely. The ledger tests' fetch targets
+  also moved from refused-connection ports to accept-and-drop loopback
+  listeners, a deterministic offline failure that closes in milliseconds
+  on every OS.
 
 ## [0.11.0] — 2026-09-01
 

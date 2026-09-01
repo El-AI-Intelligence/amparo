@@ -1108,6 +1108,27 @@ mod tests {
         }
     }
 
+    /// Bind a loopback listener that accepts every connection and closes
+    /// it immediately, and return its port. `fetch_url` against it fails
+    /// in milliseconds on every OS — a deterministic offline failure,
+    /// unlike refused-connection ports, whose connect latency under
+    /// loaded Windows CI runners proved able to bust the wait budget.
+    async fn refused_target() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refused target");
+        let port = listener.local_addr().expect("target port").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
+        port
+    }
+
     fn driver_with(
         allowlist: HashSet<String>,
         transport: Arc<MockTransport>,
@@ -1822,8 +1843,10 @@ mod tests {
             "user_a read its own file back: {requests:?}"
         );
         // user_b's read under its own root fails — the file is not there.
+        // The tool's not-found message is OS-independent ("File not
+        // found:"), never the raw io::Error text.
         assert!(
-            requests.iter().any(|r| r.contains("No such file")),
+            requests.iter().any(|r| r.contains("File not found: notes.txt")),
             "user_b's read under its own root fails: {requests:?}"
         );
         assert!(
@@ -1844,14 +1867,17 @@ mod tests {
         let transport = MockTransport::new();
         // The messages are driven sequentially (each task to its final
         // answer first), so the shared script queue cannot interleave:
-        // user_a pops scripts 1-2, user_b pops 3-4. The fetch targets are
-        // refused-connection ports — deterministic, fully offline.
+        // user_a pops scripts 1-2, user_b pops 3-4. The fetch targets
+        // are accept-and-drop listeners — a deterministic offline
+        // failure that closes in milliseconds on every OS.
+        let port_a = refused_target().await;
+        let port_b = refused_target().await;
         let provider = StubProvider::new(vec![
             vec![
                 tool_call_frame(
                     "call_1",
                     "fetch_url",
-                    r#"{"url":"http://127.0.0.1:1/from-a"}"#,
+                    &format!(r#"{{"url":"http://127.0.0.1:{port_a}/from-a"}}"#),
                 ),
                 done_frame(),
             ],
@@ -1860,7 +1886,7 @@ mod tests {
                 tool_call_frame(
                     "call_2",
                     "fetch_url",
-                    r#"{"url":"http://127.0.0.1:2/from-b"}"#,
+                    &format!(r#"{{"url":"http://127.0.0.1:{port_b}/from-b"}}"#),
                 ),
                 done_frame(),
             ],
@@ -1893,7 +1919,7 @@ mod tests {
             "user_a's row is tenant-tagged: {ledger_a}"
         );
         assert!(
-            ledger_a.contains(r#""site":"http://127.0.0.1:1""#),
+            ledger_a.contains(&format!(r#""site":"http://127.0.0.1:{port_a}""#)),
             "the host is kept, never the path: {ledger_a}"
         );
         assert!(
@@ -1905,7 +1931,7 @@ mod tests {
             "user_b's row is tenant-tagged: {ledger_b}"
         );
         assert!(
-            ledger_b.contains(r#""site":"http://127.0.0.1:2""#),
+            ledger_b.contains(&format!(r#""site":"http://127.0.0.1:{port_b}""#)),
             "the host is kept, never the path: {ledger_b}"
         );
         assert!(
@@ -1925,18 +1951,52 @@ mod tests {
         // further append rotates, dropping the previous row + previous
         // marker (steady state: dropped == 2). user_b is unbounded. The
         // messages are driven sequentially, so the shared script queue
-        // cannot interleave; the fetch targets are refused-connection
-        // ports — deterministic, fully offline.
+        // cannot interleave; the fetch targets are accept-and-drop
+        // listeners — deterministic offline failures on every OS.
+        let port_a = refused_target().await;
+        let port_b = refused_target().await;
         let provider = StubProvider::new(vec![
-            turn_tool_call("a1", "fetch_url", r#"{"url":"http://127.0.0.1:1/a1"}"#),
-            turn_tool_call("a2", "fetch_url", r#"{"url":"http://127.0.0.1:1/a2"}"#),
-            turn_tool_call("a3", "fetch_url", r#"{"url":"http://127.0.0.1:1/a3"}"#),
-            turn_tool_call("a4", "fetch_url", r#"{"url":"http://127.0.0.1:1/a4"}"#),
+            turn_tool_call(
+                "a1",
+                "fetch_url",
+                &format!(r#"{{"url":"http://127.0.0.1:{port_a}/a1"}}"#),
+            ),
+            turn_tool_call(
+                "a2",
+                "fetch_url",
+                &format!(r#"{{"url":"http://127.0.0.1:{port_a}/a2"}}"#),
+            ),
+            turn_tool_call(
+                "a3",
+                "fetch_url",
+                &format!(r#"{{"url":"http://127.0.0.1:{port_a}/a3"}}"#),
+            ),
+            turn_tool_call(
+                "a4",
+                "fetch_url",
+                &format!(r#"{{"url":"http://127.0.0.1:{port_a}/a4"}}"#),
+            ),
             turn_text("A done."),
-            turn_tool_call("b1", "fetch_url", r#"{"url":"http://127.0.0.1:2/b1"}"#),
-            turn_tool_call("b2", "fetch_url", r#"{"url":"http://127.0.0.1:2/b2"}"#),
-            turn_tool_call("b3", "fetch_url", r#"{"url":"http://127.0.0.1:2/b3"}"#),
-            turn_tool_call("b4", "fetch_url", r#"{"url":"http://127.0.0.1:2/b4"}"#),
+            turn_tool_call(
+                "b1",
+                "fetch_url",
+                &format!(r#"{{"url":"http://127.0.0.1:{port_b}/b1"}}"#),
+            ),
+            turn_tool_call(
+                "b2",
+                "fetch_url",
+                &format!(r#"{{"url":"http://127.0.0.1:{port_b}/b2"}}"#),
+            ),
+            turn_tool_call(
+                "b3",
+                "fetch_url",
+                &format!(r#"{{"url":"http://127.0.0.1:{port_b}/b3"}}"#),
+            ),
+            turn_tool_call(
+                "b4",
+                "fetch_url",
+                &format!(r#"{{"url":"http://127.0.0.1:{port_b}/b4"}}"#),
+            ),
             turn_text("B done."),
         ]);
         let mut users = BTreeMap::new();

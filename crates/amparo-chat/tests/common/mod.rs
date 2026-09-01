@@ -31,7 +31,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How long [`wait_until`] polls before failing the test.
-const WAIT_BUDGET: Duration = Duration::from_secs(5);
+///
+/// 5s proved too tight for loaded CI runners — a turn that runs four
+/// fetch_url calls plus ledger writes can exceed it purely on scheduler
+/// contention, especially on 2-core Windows hosts. The budget is a
+/// polling ceiling, not a correctness window: a stalled driver still
+/// fails, just at 30s instead of a premature 5s.
+const WAIT_BUDGET: Duration = Duration::from_secs(30);
 
 /// Poll `cond` every 10ms until it holds, or fail the test after
 /// [`WAIT_BUDGET`].

@@ -272,17 +272,32 @@ mod tests {
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
+    /// An absolute path that must trip the workspace rule on every
+    /// platform. `"/etc/passwd"` is only absolute on Unix — on Windows it
+    /// is drive-relative and slips through as a plain relative name.
+    /// Forward slashes keep the TOML fixture free of `\` escapes while
+    /// still parsing as an absolute Windows path (`C:/…`).
+    fn absolute_escape_path() -> String {
+        #[cfg(unix)]
+        {
+            "/etc/passwd".to_string()
+        }
+        #[cfg(not(unix))]
+        {
+            "C:/Windows/System32/notepad.exe".to_string()
+        }
+    }
+
     #[test]
     fn absolute_workspace_is_rejected() {
-        let path = write_cfg(
-            "absolute_ws",
-            "[users.\"telegram:111\"]\nworkspace = \"/etc/passwd\"\n",
-        );
+        let escape = absolute_escape_path();
+        let body = format!("[users.\"telegram:111\"]\nworkspace = \"{escape}\"\n");
+        let path = write_cfg("absolute_ws", &body);
         let err = ChatConfig::load(&path).unwrap_err();
         std::fs::remove_file(&path).unwrap();
         match &err {
             ConfigError::WorkspacePath { value, .. } => {
-                assert_eq!(value, &PathBuf::from("/etc/passwd"))
+                assert_eq!(value, &PathBuf::from(&escape))
             }
             other => panic!("expected WorkspacePath, got {other:?}"),
         }

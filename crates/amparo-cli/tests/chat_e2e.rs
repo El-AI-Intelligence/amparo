@@ -100,9 +100,12 @@ fn stderr(out: &Output) -> String {
 }
 
 /// Spawn `amparo chat` with a closed stdin and a hard timeout so a
-/// regression can never hang the suite.
+/// regression can never hang the suite. The budget is deliberately
+/// generous: round trips finish in under a second locally, but on a
+/// loaded 2-core CI runner several concurrent `amparo chat` children
+/// (each running a mock-LLM agent loop) pushed past 30s.
 async fn run_with(args: &[&str]) -> Output {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         tokio::process::Command::new(bin())
             .args(args)
             .stdin(Stdio::null())
@@ -116,9 +119,12 @@ async fn run_with(args: &[&str]) -> Output {
     .expect("amparo chat timed out")
 }
 
-/// Poll `cond` until it is true, or 30 seconds elapse.
+/// Poll `cond` until it is true, or 120 seconds elapse. See the
+/// [`run_with`] note: the budget absorbs loaded-runner contention, not
+/// correctness — the conditions resolve in milliseconds when the runner
+/// is idle.
 async fn wait_until(cond: impl Fn() -> bool) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while tokio::time::Instant::now() < deadline {
         if cond() {
             return true;
@@ -727,7 +733,7 @@ async fn chat_telegram_roundtrip_message_approval_tool_answer() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
         done,
-        "the round trip never completed within 30s; child stderr: {err}"
+        "the round trip never completed within 120s; child stderr: {err}"
     );
 
     let log = telegram.log();
@@ -813,7 +819,7 @@ async fn chat_telegram_growth_writes_run_record() {
     drop(env);
 
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(written, "no tenant-tagged record within 30s; child stderr: {err}");
+    assert!(written, "no tenant-tagged record within 120s; child stderr: {err}");
     assert!(err.contains("[growth]"), "startup reports the notebook: {err}");
 
     let raw = std::fs::read_to_string(&records_path).expect("records file exists");
@@ -934,7 +940,7 @@ async fn chat_telegram_growth_promotes_records_into_the_hot_layer() {
     drop(env);
 
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(promoted, "no hot row within 30s; child stderr: {err}");
+    assert!(promoted, "no hot row within 120s; child stderr: {err}");
 
     // The hot row keeps the cold row's id (id stability across layers).
     let id_of = |path: &std::path::Path| -> String {

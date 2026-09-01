@@ -199,6 +199,16 @@ impl ToolExecutor for ReadFileTool {
                         format!("Read {} bytes from {}", content.len().min(max_chars), path),
                     )
                 }
+                // A missing file gets one stable message on every OS —
+                // the raw io::Error text is platform-specific ("No such
+                // file" vs "The system cannot find the file specified"),
+                // and the agent reasons over this string.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => make_result(
+                    call,
+                    false,
+                    serde_json::json!({"error": format!("File not found: {}", path), "path": path}),
+                    format!("Read failed: file not found: {}", path),
+                ),
                 Err(e) => make_result(
                     call,
                     false,
