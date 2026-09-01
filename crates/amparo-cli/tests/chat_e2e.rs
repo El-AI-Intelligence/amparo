@@ -1139,8 +1139,21 @@ async fn chat_config_directory_roundtrip_per_user_workspace() {
     let child_stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let telegram_requests = format!("{:?}", telegram.log());
     let bodies = llm.bodies.lock().unwrap();
+    // The bodies are serialized request JSON, so every backslash in the
+    // echoed path appears doubled — the needle must match the body's
+    // encoding. A raw single-backslash path can never match on Windows,
+    // where every separator is a backslash (this failed on the first
+    // Windows CI run: the tool ran fine, the needle just wasn't in the
+    // body's encoding). Backslash doubling is the only JSON
+    // transformation a Windows path undergoes — quotes and control
+    // characters cannot appear in Windows path components — and on Unix
+    // the replace is a no-op.
+    let cwd_needle = per_user
+        .to_string_lossy()
+        .to_string()
+        .replace('\\', "\\\\");
     assert!(
-        bodies.iter().any(|b| b.contains(&per_user.to_string_lossy().to_string())),
+        bodies.iter().any(|b| b.contains(&cwd_needle)),
         "the run_command result echoed the per-user cwd: {bodies:?}\nchild stderr: {child_stderr}\ntelegram requests: {telegram_requests}"
     );
     assert!(
