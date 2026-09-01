@@ -32,6 +32,10 @@
 //!   the whole gate chain rendered live — banner, gutter rows, approval
 //!   cards, status line. Piped, it degrades to one task per stdin line with
 //!   zero escapes.
+//! - `amparo wizard` writes the first-run profile: four ruled steps —
+//!   workspace, LLM endpoint, optional policy URL, optional memory URL —
+//!   saved locally (mode 0600) and read back at boot to fill environment
+//!   gaps (env always wins).
 //! - `amparo version` prints the version.
 //!
 //! stdout carries the final answer only (a scripting contract); progress,
@@ -48,6 +52,7 @@ mod schedule;
 mod skill;
 mod stderr_subscriber;
 mod tui;
+mod wizard;
 
 use amparo_mcp::serve::{self, ParseResult};
 
@@ -64,6 +69,7 @@ USAGE:
   amparo doctor [FLAGS]
   amparo schedule list|cancel [FLAGS]
   amparo tui [FLAGS]
+  amparo wizard
   amparo version
 
 SUBCOMMANDS:
@@ -83,12 +89,15 @@ SUBCOMMANDS:
   tui        the interactive terminal surface: one prompt, the whole gate
              chain rendered live (banner, gutter rows, approval cards,
              status line); piped: one task per stdin line
+  wizard     the first-run profile: workspace, LLM endpoint, optional
+             policy URL, optional memory URL — saved locally (0600),
+             read back at boot to fill environment gaps
   version    print the version
 
 Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help`,
 `amparo skill --help`, `amparo notebook --help`, `amparo privacy --help`,
-`amparo doctor --help`, `amparo schedule --help` or `amparo tui --help`
-for flags.";
+`amparo doctor --help`, `amparo schedule --help`, `amparo tui --help` or
+`amparo wizard --help` for flags.";
 
 #[tokio::main]
 async fn main() {
@@ -112,6 +121,7 @@ async fn main() {
         "doctor" => doctor::dispatch(args).await,
         "schedule" => schedule::dispatch(args),
         "tui" => tui::dispatch(args).await,
+        "wizard" => wizard::dispatch(args).await,
         "version" | "-V" | "--version" => println!("amparo {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{USAGE}"),
         other => {

@@ -4181,3 +4181,187 @@ async fn tui_piped_runs_a_task_and_renders_the_chain() {
         "piped mode emits zero escapes: {text}"
     );
 }
+
+// ── wizard ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn wizard_writes_0600_profile_and_a_run_reads_it() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![vec![content_frame("Hello.")]]).await;
+    // Strip every inference/policy/memory variable: the profile alone
+    // must carry the follow-up run.
+    let env = set_env(
+        &[],
+        &[
+            "AMPARO_INFERENCE_URL",
+            "AMPARO_INFERENCE_MODEL",
+            "AMPARO_INFERENCE_KEY",
+            "AMPARO_INFERENCE_PROVIDER",
+            "AMPARO_POLICY_KEY",
+            "AMPARO_MEMORY_BACKEND",
+            "AMPARO_ENGRAM_URL",
+            "AMPARO_ENGRAM_KEY",
+        ],
+    );
+    let ws = fresh_workspace("wizard");
+    let prior = set_workspace_env_to(&ws);
+
+    // Nine answers, one per prompt: workspace (empty = the env root),
+    // url, model, then Enter for provider, key, policy url/key and
+    // memory url/key.
+    let answers = format!("\n{}\nmock-model\n\n\n\n\n\n\n", mock.url());
+    let out = run_with_stdin(&["wizard"], answers.as_bytes()).await;
+
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let profile_path = ws.join(".amparo").join("profile.json");
+    assert!(
+        text.contains(&format!(
+            "[wizard] profile written to {} (mode 0600)",
+            profile_path.display()
+        )),
+        "{text}"
+    );
+    // The summary and the boot-banner preview render the chain from the
+    // answers — provider defaults to openai, policy to deny-all, memory
+    // to the built-in store, and no key is ever echoed.
+    assert!(
+        text.contains("[chain] registry → trust ceiling (system_control)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("policy (deny-all (no --policy-url or --allow-all))"),
+        "{text}"
+    );
+    // The infer line shows the ledger's scheme://host[:port] shape — the
+    // /v1 path is stripped by site_desc.
+    let host = mock.url().trim_end_matches("/v1").to_string();
+    assert!(
+        text.contains(&format!("[infer] openai · mock-model · {host}")),
+        "{text}"
+    );
+    assert!(text.contains("[memory] built-in store"), "{text}");
+    assert!(text.contains("[wake] Amparo is awake."), "{text}");
+
+    // The captured profile carries exactly the answers, owner-only.
+    let profile: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&profile_path).unwrap()).unwrap();
+    assert_eq!(profile["inference_url"], mock.url());
+    assert_eq!(profile["inference_model"], "mock-model");
+    assert!(profile["inference_provider"].is_null());
+    assert!(profile["policy_url"].is_null());
+    assert!(profile["memory_url"].is_null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&profile_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the profile must be owner-only");
+    }
+
+    // A fresh process with the same stripped env resolves the inference
+    // config from the profile alone.
+    let out = run_with(&["run", "--allow-all", "say hello"]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Hello."), "{}", stdout(&out));
+
+    restore_workspace_env(prior);
+    drop(env);
+    drop(mock);
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn wizard_rejects_arguments() {
+    let out = run_with(&["wizard", "extra"]).await;
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("takes no arguments (got extra)"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[tokio::test]
+async fn wizard_at_eof_fails_instead_of_half_capturing() {
+    let out = run_with(&["wizard"]).await;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("needs answers"), "{}", stderr(&out));
+}
+
+#[tokio::test]
+async fn profile_policy_url_wires_the_engine_and_allow_all_suppresses_it() {
+    let _guard = LOCK.lock().await;
+    let mock = MockLlm::start(vec![
+        tool_script("read_file", r#"{"path":"README.md"}"#),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    let policy = MockPolicy::start().await;
+    let env = set_env(
+        &[],
+        &[
+            "AMPARO_INFERENCE_URL",
+            "AMPARO_INFERENCE_MODEL",
+            "AMPARO_INFERENCE_KEY",
+            "AMPARO_INFERENCE_PROVIDER",
+            "AMPARO_POLICY_KEY",
+            "AMPARO_MEMORY_BACKEND",
+            "AMPARO_ENGRAM_URL",
+            "AMPARO_ENGRAM_KEY",
+        ],
+    );
+    let ws = fresh_workspace("wizard-policy");
+    let prior = set_workspace_env_to(&ws);
+    // A hand-written profile carrying the policy URL — the wizard's shape,
+    // minus the interactive capture.
+    std::fs::create_dir_all(ws.join(".amparo")).unwrap();
+    std::fs::write(
+        ws.join(".amparo").join("profile.json"),
+        json!({
+            "inference_url": mock.url(),
+            "inference_model": "mock-model",
+            "policy_url": policy.url(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // No --policy-url, no --allow-all: the profile URL is the engine, and
+    // the banner marks the provenance. --auto-approve keeps the approval
+    // gate out of the picture (stdin is closed) without touching policy.
+    let out = run_with(&["run", "--auto-approve", "read the readme"]).await;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "Done.");
+    assert!(stderr(&out).contains("(profile)"), "{}", stderr(&out));
+    // The engine saw exactly one check — the run carried no policy flag.
+    assert_eq!(policy.bodies().await.len(), 1);
+
+    // Under --allow-all the profile's policy URL is suppressed entirely:
+    // a fresh env points the same workspace at a fresh mock, and no
+    // second check reaches the engine.
+    let mock2 = MockLlm::start(vec![vec![content_frame("Hello.")]]).await;
+    let env2 = set_env(
+        &[
+            ("AMPARO_INFERENCE_URL", mock2.url().as_str()),
+            ("AMPARO_INFERENCE_MODEL", "mock-model"),
+        ],
+        &[],
+    );
+    let out = run_with(&["run", "--allow-all", "say hello"]).await;
+    drop(env2);
+    drop(mock2);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Hello."), "{}", stdout(&out));
+    assert!(!stderr(&out).contains("(profile)"), "{}", stderr(&out));
+    assert_eq!(policy.bodies().await.len(), 1);
+
+    restore_workspace_env(prior);
+    drop(env);
+    drop(policy);
+    drop(mock);
+    let _ = std::fs::remove_dir_all(&ws);
+}

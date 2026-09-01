@@ -1,0 +1,570 @@
+//! `amparo wizard` — the first-run profile wizard (#167).
+//!
+//! Local-first: four ruled steps — workspace → LLM endpoint → optional
+//! Guardrail policy URL → optional Engram memory URL — captured line by
+//! line (Enter skips; piped stdin answers one line per prompt, in order)
+//! and written to `{workspace}/.amparo/profile.json`, mode 0600 — the
+//! profile can carry keys, so it is never world-readable.
+//!
+//! Every later wire reads the profile to fill environment gaps: the
+//! environment wins, the profile fills what is unset. `amparo tui` boots
+//! into the wizard when no LLM is configured anywhere (env or profile);
+//! `amparo run` never starts it — the run surface keeps its fail-fast
+//! environment error. The wizard ends with a boot-banner preview built
+//! from the answers: the same five lines the next boot greets with.
+
+use crate::run::site_desc;
+use amparo_tools::PathPolicy;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
+
+/// The first-run profile: the wizard's captured answers, one optional
+/// field per prompt. `None` means "skipped" — the environment's value
+/// (if any) stands.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Profile {
+    /// The BYO-LLM base URL (`AMPARO_INFERENCE_URL`).
+    #[serde(default)]
+    pub inference_url: Option<String>,
+    /// The default model id (`AMPARO_INFERENCE_MODEL`).
+    #[serde(default)]
+    pub inference_model: Option<String>,
+    /// The API key (`AMPARO_INFERENCE_KEY`); never echoed back.
+    #[serde(default)]
+    pub inference_key: Option<String>,
+    /// `openai` (default) or `anthropic` (`AMPARO_INFERENCE_PROVIDER`).
+    #[serde(default)]
+    pub inference_provider: Option<String>,
+    /// The Guardrail wire-protocol engine URL — the `--policy-url`
+    /// fallback, never under `--allow-all`.
+    #[serde(default)]
+    pub policy_url: Option<String>,
+    /// The policy key (`AMPARO_POLICY_KEY`); never echoed back.
+    #[serde(default)]
+    pub policy_key: Option<String>,
+    /// The engramd base URL (`AMPARO_ENGRAM_URL`, with
+    /// `AMPARO_MEMORY_BACKEND=engram`).
+    #[serde(default)]
+    pub memory_url: Option<String>,
+    /// The engramd key (`AMPARO_ENGRAM_KEY`); never echoed back.
+    #[serde(default)]
+    pub memory_key: Option<String>,
+}
+
+/// The workspace root every wire starts from — `AMPARO_WORKSPACE` or the
+/// documented default. The wizard's workspace step may choose a
+/// different one; callers decide whether to honor it.
+pub(crate) fn workspace_root() -> PathBuf {
+    PathPolicy::from_env().workspace_root
+}
+
+/// The profile path under a workspace root.
+fn profile_path(root: &Path) -> PathBuf {
+    root.join(".amparo").join("profile.json")
+}
+
+/// Loads the profile under `root`. Missing → `None` (not an error);
+/// unreadable or malformed → one `[amparo-cli]` warning and `None` —
+/// a broken profile must never block a run, the environment may still
+/// be complete.
+pub(crate) fn load(root: &Path) -> Option<Profile> {
+    let path = profile_path(root);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!("[amparo-cli] cannot read {}: {e}", path.display());
+            return None;
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(profile) => Some(profile),
+        Err(e) => {
+            tracing::warn!(
+                "[amparo-cli] ignoring malformed profile {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Fills environment gaps from the profile: each captured answer lands
+/// only where the variable is unset. The environment always wins — a
+/// profile can repair, never override.
+pub(crate) fn fill_env_gaps(profile: &Profile) {
+    let set = |key: &str, value: &Option<String>| {
+        if std::env::var_os(key).is_none() {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            }
+        }
+    };
+    set("AMPARO_INFERENCE_URL", &profile.inference_url);
+    set("AMPARO_INFERENCE_MODEL", &profile.inference_model);
+    set("AMPARO_INFERENCE_KEY", &profile.inference_key);
+    set("AMPARO_INFERENCE_PROVIDER", &profile.inference_provider);
+    set("AMPARO_POLICY_KEY", &profile.policy_key);
+    if std::env::var_os("AMPARO_MEMORY_BACKEND").is_none() && profile.memory_url.is_some() {
+        std::env::set_var("AMPARO_MEMORY_BACKEND", "engram");
+    }
+    set("AMPARO_ENGRAM_URL", &profile.memory_url);
+    set("AMPARO_ENGRAM_KEY", &profile.memory_key);
+}
+
+/// Whether both required inference variables are missing — the wizard's
+/// trigger. Present-but-invalid values are left alone: the wire's own
+/// error names them far better than a first-run prompt would.
+pub(crate) fn inference_unset() -> bool {
+    std::env::var_os("AMPARO_INFERENCE_URL").is_none()
+        || std::env::var_os("AMPARO_INFERENCE_MODEL").is_none()
+}
+
+/// Writes the profile, mode 0600 — it can carry keys.
+pub(crate) fn save(root: &Path, profile: &Profile) -> Result<PathBuf, String> {
+    let dir = root.join(".amparo");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join("profile.json");
+    let json = serde_json::to_string_pretty(profile)
+        .map_err(|e| format!("cannot encode the profile: {e}"))?;
+    write_0600(&path, json.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Windows has no mode bits — the directory-level ACLs stand.
+    std::fs::write(path, bytes)
+}
+
+/// The policy segment in the banner's grammar, from the answers.
+pub(crate) fn policy_desc(profile: &Profile) -> String {
+    match &profile.policy_url {
+        Some(url) => format!("wire {}", site_desc(url)),
+        None => "deny-all (no --policy-url or --allow-all)".to_string(),
+    }
+}
+
+/// The memory segment in the banner's grammar, from the answers.
+pub(crate) fn memory_desc(profile: &Profile) -> String {
+    match &profile.memory_url {
+        Some(url) => format!("engram @ {}", site_desc(url)),
+        None => "built-in store".to_string(),
+    }
+}
+
+/// The infer line in the banner's grammar, from the answers — the host
+/// in the ledger's `scheme://host[:port]` shape, never a key-carrying
+/// URL.
+pub(crate) fn infer_desc(profile: &Profile) -> String {
+    match (&profile.inference_url, &profile.inference_model) {
+        (Some(url), Some(model)) => format!(
+            "{} · {} · {}",
+            profile.inference_provider.as_deref().unwrap_or("openai"),
+            model,
+            site_desc(url)
+        ),
+        _ => "not configured — set AMPARO_INFERENCE_URL and AMPARO_INFERENCE_MODEL".to_string(),
+    }
+}
+
+/// The one-line chain the next boot will enforce, from the answers. The
+/// ceiling is the flag default — the wizard captures configuration, the
+/// run's flags still decide the run.
+pub(crate) fn chain_line(profile: &Profile) -> String {
+    format!(
+        "registry → trust ceiling (system_control) → policy ({}) → human approval (terminal y/N, 60s fail-closed)",
+        policy_desc(profile)
+    )
+}
+
+/// One prompt: print, then read one line. EOF is an error — the wizard
+/// must not half-capture a profile from a silent pipe.
+fn ask(reader: &mut dyn BufRead, prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => Err("the wizard needs answers — one line per prompt (Enter skips)".to_string()),
+        Ok(_) => Ok(line.trim().to_string()),
+        Err(e) => Err(format!("cannot read the wizard answers: {e}")),
+    }
+}
+
+/// An empty answer keeps the fallback; a non-empty one replaces it.
+fn pick(answer: String, fallback: Option<String>) -> Option<String> {
+    if answer.is_empty() {
+        fallback
+    } else {
+        Some(answer)
+    }
+}
+
+/// A prompt's default: the environment's value when set, else the
+/// existing profile's — re-runs repair a profile instead of blanking it.
+fn env_or(
+    existing: &Option<Profile>,
+    from_profile: impl Fn(&Profile) -> Option<String>,
+    env_key: &str,
+) -> Option<String> {
+    std::env::var(env_key)
+        .ok()
+        .or_else(|| existing.as_ref().and_then(from_profile))
+}
+
+/// The wizard itself: four ruled steps, one line per prompt, then the
+/// profile (0600), the `[chain]` summary and the boot-banner preview.
+/// Returns the chosen workspace root and the captured profile.
+pub(crate) fn run(
+    reader: &mut dyn BufRead,
+    default_root: &Path,
+) -> Result<(PathBuf, Profile), String> {
+    // Re-runs use the existing profile's values as defaults.
+    let existing = load(default_root);
+    println!("Greetings! My name is Amparo, built by EL AI Intelligence.");
+    println!("[wake] first run — four steps and you're awake: workspace, LLM, policy, memory.");
+    println!("[wizard] policy and memory are recommended, never required — Enter skips any line.");
+    println!("[wizard] keys you type here are never echoed back.");
+
+    println!();
+    println!("▐ step 1/4 — workspace");
+    println!("  where Amparo lives: the profile, ledger and sessions root");
+    let workspace = ask(
+        reader,
+        &format!("  workspace [default {}] › ", default_root.display()),
+    )?;
+    let root = if workspace.is_empty() {
+        default_root.to_path_buf()
+    } else {
+        let chosen = PathBuf::from(workspace);
+        if chosen.is_absolute() {
+            chosen
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(chosen))
+                .map_err(|e| format!("cannot resolve the workspace: {e}"))?
+        }
+    };
+    if root != default_root {
+        println!(
+            "[wizard] later runs root at {} — set AMPARO_WORKSPACE (or pass --workspace) to keep them together",
+            root.display()
+        );
+    }
+
+    let url_default = env_or(
+        &existing,
+        |p| p.inference_url.clone(),
+        "AMPARO_INFERENCE_URL",
+    );
+    let model_default = env_or(
+        &existing,
+        |p| p.inference_model.clone(),
+        "AMPARO_INFERENCE_MODEL",
+    );
+    let provider_default = env_or(
+        &existing,
+        |p| p.inference_provider.clone(),
+        "AMPARO_INFERENCE_PROVIDER",
+    );
+    println!();
+    println!("▐ step 2/4 — LLM endpoint");
+    println!("  a BYO-LLM URL and model (openai or anthropic wire format)");
+    let url = ask(
+        reader,
+        &format!("  url [{}] › ", url_default.as_deref().unwrap_or("none")),
+    )?;
+    let model = ask(
+        reader,
+        &format!(
+            "  model [{}] › ",
+            model_default.as_deref().unwrap_or("none")
+        ),
+    )?;
+    let provider = ask(
+        reader,
+        &format!(
+            "  provider [default {}] › ",
+            provider_default.as_deref().unwrap_or("openai")
+        ),
+    )?;
+    let key_hint = if existing
+        .as_ref()
+        .and_then(|p| p.inference_key.as_ref())
+        .is_some()
+    {
+        " (set)"
+    } else {
+        " (empty = keyless)"
+    };
+    let key = ask(reader, &format!("  key{key_hint} › "))?;
+
+    let policy_default = existing.as_ref().and_then(|p| p.policy_url.clone());
+    let policy_key_default = existing.as_ref().and_then(|p| p.policy_key.clone());
+    println!();
+    println!("▐ step 3/4 — policy (recommended, never required)");
+    println!("  a Guardrail wire-protocol engine URL — verdicts in, keys stay local");
+    let policy_url = ask(
+        reader,
+        &format!(
+            "  url [recommended, never required{}] › ",
+            if policy_default.is_some() {
+                " — set"
+            } else {
+                ""
+            }
+        ),
+    )?;
+    let policy_key = ask(
+        reader,
+        &format!(
+            "  key{} › ",
+            if policy_key_default.is_some() {
+                " (set)"
+            } else {
+                " (empty = none)"
+            }
+        ),
+    )?;
+
+    let memory_default = std::env::var("AMPARO_ENGRAM_URL")
+        .ok()
+        .or_else(|| existing.as_ref().and_then(|p| p.memory_url.clone()));
+    let memory_key_default = existing.as_ref().and_then(|p| p.memory_key.clone());
+    println!();
+    println!("▐ step 4/4 — memory (recommended, never required)");
+    println!("  an engramd URL — memories that outlive the session");
+    let memory_url = ask(
+        reader,
+        &format!(
+            "  url [recommended, never required{}] › ",
+            if memory_default.is_some() {
+                " — set"
+            } else {
+                ""
+            }
+        ),
+    )?;
+    let memory_key = ask(
+        reader,
+        &format!(
+            "  key{} › ",
+            if memory_key_default.is_some() {
+                " (set)"
+            } else {
+                " (empty = none)"
+            }
+        ),
+    )?;
+
+    // Skipped answers keep their defaults; key answers keep the existing
+    // profile value (an environment key is never copied silently).
+    let profile = Profile {
+        inference_url: pick(url, url_default),
+        inference_model: pick(model, model_default),
+        inference_key: pick(key, existing.as_ref().and_then(|p| p.inference_key.clone())),
+        inference_provider: pick(provider, provider_default),
+        policy_url: pick(policy_url, policy_default),
+        policy_key: pick(policy_key, policy_key_default),
+        memory_url: pick(memory_url, memory_default),
+        memory_key: pick(memory_key, memory_key_default),
+    };
+
+    let path = save(&root, &profile)?;
+    println!();
+    println!("[wizard] profile written to {} (mode 0600)", path.display());
+    println!("[chain] {}", chain_line(&profile));
+    println!("[infer] {}", infer_desc(&profile));
+    println!("[memory] {}", memory_desc(&profile));
+    println!();
+    println!("[wizard] the next boot greets with:");
+    println!();
+    println!("Greetings! My name is Amparo, built by EL AI Intelligence.");
+    println!("[wake] Amparo is awake.");
+    println!("[gate] chain: {}", chain_line(&profile));
+    println!("[infer] {}", infer_desc(&profile));
+    println!("[memory] {}", memory_desc(&profile));
+    Ok((root, profile))
+}
+
+/// The TUI boot's first-run path: load + fill; when the required pair is
+/// still missing, run the wizard and honor its workspace for the rest of
+/// this process. The interactive boot only — piped mode never starts the
+/// wizard, it would eat the task stream.
+pub(crate) fn ensure_configured() -> Result<(), String> {
+    let root = workspace_root();
+    if let Some(profile) = load(&root) {
+        fill_env_gaps(&profile);
+    }
+    if !inference_unset() {
+        return Ok(());
+    }
+    let (root, profile) = run(&mut std::io::stdin().lock(), &root)?;
+    std::env::set_var("AMPARO_WORKSPACE", &root);
+    fill_env_gaps(&profile);
+    Ok(())
+}
+
+/// The `amparo wizard --help` copy.
+const WIZARD_USAGE: &str = "\
+amparo wizard — the first-run profile wizard
+
+USAGE:
+  amparo wizard
+
+Four steps — workspace → LLM endpoint → optional Guardrail policy URL →
+optional Engram memory URL — written to {workspace}/.amparo/profile.json
+(mode 0600). Policy and memory are recommended, never required; Enter
+skips any line; keys are never echoed. Piped stdin answers one line per
+prompt, in order: workspace, url, model, provider, key, policy url,
+policy key, memory url, memory key.
+
+The profile fills environment gaps on every later run (the environment
+wins). The TUI boots into the wizard when no LLM is configured anywhere;
+`amparo run` keeps its fail-fast environment error instead.";
+
+/// The `amparo wizard` entry point — no flags, one interactive (or
+/// piped) capture. Exit codes: 0 captured, 1 capture failed, 2 usage.
+pub(crate) async fn dispatch(args: impl Iterator<Item = String>) {
+    let args: Vec<String> = args.collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("--help") | Some("-h") => {
+            println!("{WIZARD_USAGE}");
+            return;
+        }
+        Some(other) => {
+            eprintln!("amparo wizard takes no arguments (got {other}); see `amparo wizard --help`");
+            std::process::exit(2);
+        }
+    }
+    let root = workspace_root();
+    if let Err(message) = run(&mut std::io::stdin().lock(), &root) {
+        eprintln!("amparo wizard: {message}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn full() -> Profile {
+        Profile {
+            inference_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            inference_model: Some("qwen2.5:14b".to_string()),
+            inference_key: Some("secret".to_string()),
+            inference_provider: Some("openai".to_string()),
+            policy_url: Some("http://127.0.0.1:8080".to_string()),
+            policy_key: Some("gk_test".to_string()),
+            memory_url: Some("http://127.0.0.1:8787".to_string()),
+            memory_key: Some("mem_key".to_string()),
+        }
+    }
+
+    #[test]
+    fn profile_round_trips() {
+        let json = serde_json::to_string(&full()).unwrap();
+        let back: Profile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.inference_url, full().inference_url);
+        assert_eq!(back.inference_model, full().inference_model);
+        assert_eq!(back.inference_key, full().inference_key);
+        assert_eq!(back.policy_url, full().policy_url);
+        assert_eq!(back.memory_url, full().memory_url);
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let profile: Profile =
+            serde_json::from_str(r#"{"inference_url":"http://x/v1","future_field":1}"#).unwrap();
+        assert_eq!(profile.inference_url.as_deref(), Some("http://x/v1"));
+        assert!(profile.inference_model.is_none());
+    }
+
+    #[test]
+    fn chain_line_names_every_segment() {
+        let wired = chain_line(&full());
+        assert!(
+            wired.contains("registry → trust ceiling (system_control)"),
+            "{wired}"
+        );
+        assert!(
+            wired.contains("policy (wire http://127.0.0.1:8080)"),
+            "{wired}"
+        );
+        assert!(
+            wired.contains("human approval (terminal y/N, 60s fail-closed)"),
+            "{wired}"
+        );
+        let bare = chain_line(&Profile::default());
+        assert!(
+            bare.contains("policy (deny-all (no --policy-url or --allow-all))"),
+            "{bare}"
+        );
+    }
+
+    #[test]
+    fn descs_never_echo_keys() {
+        let mut profile = full();
+        profile.inference_url = Some("http://user:pass@host:8080/v1".to_string());
+        let infer = infer_desc(&profile);
+        assert!(infer.contains("host:8080"), "{infer}");
+        assert!(!infer.contains("pass"), "{infer}");
+        assert!(!infer.contains("secret"), "{infer}");
+        let mut policy = full();
+        policy.policy_url = Some("http://gk_secret@127.0.0.1:8080".to_string());
+        let desc = policy_desc(&policy);
+        assert!(desc.contains("127.0.0.1:8080"), "{desc}");
+        assert!(!desc.contains("gk_secret"), "{desc}");
+    }
+
+    #[test]
+    fn scripted_stdin_captures_the_profile() {
+        let root = std::env::temp_dir().join(format!("amparo-wizard-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut stdin: &[u8] = b"/tmp/unused-workspace\nhttp://127.0.0.1:11434/v1\nqwen\n\n\nhttp://127.0.0.1:8080\n\n\n\n";
+        let (chosen, profile) = run(&mut stdin, &root).unwrap();
+        assert_eq!(chosen, PathBuf::from("/tmp/unused-workspace"));
+        assert_eq!(
+            profile.inference_url.as_deref(),
+            Some("http://127.0.0.1:11434/v1")
+        );
+        assert_eq!(profile.inference_model.as_deref(), Some("qwen"));
+        assert_eq!(profile.policy_url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert!(profile.memory_url.is_none());
+        let path = profile_path(&chosen);
+        let back: Profile = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.inference_model.as_deref(), Some("qwen"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the profile must be owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&chosen);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eof_is_an_error_not_a_half_profile() {
+        let mut stdin: &[u8] = b"";
+        let root = std::env::temp_dir().join(format!("amparo-wizard-eof-{}", std::process::id()));
+        let err = run(&mut stdin, &root).unwrap_err();
+        assert!(err.contains("needs answers"), "{err}");
+    }
+}

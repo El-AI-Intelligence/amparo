@@ -519,7 +519,7 @@ pub(crate) struct WiredRun {
 /// status line. Userinfo (`user:pass@`) never survives
 /// [`amparo_privacy::ledger::site_host_only`], and it must never survive
 /// into stderr either — a key can ride exactly there by mistake.
-fn site_desc(url: &str) -> String {
+pub(crate) fn site_desc(url: &str) -> String {
     amparo_privacy::ledger::site_host_only(url).unwrap_or_else(|| "(unparseable url)".to_string())
 }
 
@@ -634,6 +634,16 @@ pub(crate) async fn wire_with(
     parent_task_id: String,
     surface: Surface,
 ) -> Result<WiredRun, String> {
+    // The first-run profile (wizard, #167): load the workspace-local
+    // profile and fill any environment gaps before the configs read the
+    // environment — env always wins, the profile only fills unset vars.
+    // The workspace root resolves once here and is reused below (ledger,
+    // notebook, checkpoint store).
+    let workspace_root = PathPolicy::from_env().workspace_root;
+    let profile = crate::wizard::load(&workspace_root);
+    if let Some(profile) = &profile {
+        crate::wizard::fill_env_gaps(profile);
+    }
     let mut config = InferenceConfig::from_env().map_err(|e| {
         format!(
             "{e}\nset AMPARO_INFERENCE_URL and AMPARO_INFERENCE_MODEL — see the README \
@@ -676,8 +686,20 @@ pub(crate) async fn wire_with(
     // layer (skills) is the only thing layered on top for the main task.
     let mut registry = fire_registry(flags, Arc::clone(&memory));
 
+    // Policy-URL fallback (wizard, #167): a profile URL fills a missing
+    // --policy-url — but never under --allow-all (that flag explicitly
+    // opts out of policy) and never over an explicit flag.
+    let policy_from_profile = flags.policy_url.is_none() && !flags.allow_all;
+    let policy_url = flags.policy_url.clone().or_else(|| {
+        if policy_from_profile {
+            profile.as_ref().and_then(|p| p.policy_url.clone())
+        } else {
+            None
+        }
+    });
+
     let (policy, policy_desc): (Arc<dyn PolicyEngine>, String) =
-        match (&flags.policy_url, flags.allow_all) {
+        match (&policy_url, flags.allow_all) {
             (Some(url), false) => {
                 let api_key = std::env::var("AMPARO_POLICY_KEY").ok();
                 // M9 W3: every check carries the run's session id (the task id
@@ -688,13 +710,21 @@ pub(crate) async fn wire_with(
                     .session_id
                     .clone()
                     .unwrap_or_else(|| parent_task_id.clone());
+                // The banner marks the URL's provenance: "(profile)" when
+                // it came from the first-run profile, nothing when the
+                // flag said it outright.
+                let desc = if policy_from_profile {
+                    format!("wire {} (profile)", site_desc(url))
+                } else {
+                    format!("wire {}", site_desc(url))
+                };
                 (
                     Arc::new(AuditNoticeEngine::with_printer(
                         WirePolicyEngine::new(url.clone(), api_key).with_session_id(session_id),
                         Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         surface.notice,
                     )),
-                    format!("wire {}", site_desc(url)),
+                    desc,
                 )
             }
             (None, true) => (Arc::new(AllowAllPolicyEngine), "allow-all".to_string()),
@@ -745,10 +775,9 @@ pub(crate) async fn wire_with(
     // before. Kept outside the fanout so `flush` can await the final write.
     // The same store feeds the case library (M6b): prior `cli` records are
     // retrieved into the self-verification prompt — growth is write + read.
-    // The workspace root anchors the privacy ledger (always-on) and the
-    // growth notebook (--growth only). The tools' path policy already
-    // read AMPARO_WORKSPACE above.
-    let workspace_root = PathPolicy::from_env().workspace_root;
+    // The workspace root (resolved at the top of wire_with, with the
+    // profile) anchors the privacy ledger (always-on) and the growth
+    // notebook (--growth only).
     let mut case_library: Option<Arc<dyn CaseLibrary>> = None;
     let mut skills: Option<Arc<dyn SkillLibrary>> = None;
     let notebook: Option<Arc<NotebookSink>> = if flags.growth {

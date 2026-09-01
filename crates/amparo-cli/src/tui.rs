@@ -2114,6 +2114,13 @@ async fn run_tui(flags: RunFlags) -> Result<(), String> {
 
     run::apply_workspace(&flags);
 
+    // First-run wizard (#167): an interactive boot with no LLM configured
+    // falls into the wizard instead of the prompt. Piped mode never starts
+    // it — the wizard would eat the task stream.
+    if controls {
+        crate::wizard::ensure_configured()?;
+    }
+
     let (main_tx, main_rx) = mpsc::unbounded_channel::<ReaderMsg>();
     #[cfg(not(unix))]
     let keys: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<char>>>> =
