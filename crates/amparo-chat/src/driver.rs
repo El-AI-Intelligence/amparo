@@ -2660,7 +2660,15 @@ mod tests {
         // Five turns on one FIFO queue: the parent's spawn, the child's
         // answer, the parent's schedule call and final answer, then the
         // fired promise's answer.
-        let at = (Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+        //
+        // The instant must stay ahead of the schedule call, which runs
+        // only after a spawn_agent turn AND a child sub-task. The old
+        // two-second horizon flaked on loaded Windows runners: the turn
+        // outran the instant, the schedule tool honestly refused a past
+        // instant (schedule.rs, fail-closed), and the store was empty at
+        // the assert. Ten minutes is beyond any plausible turn length;
+        // the synthetic scan below still drives the fire without waiting.
+        let at = (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
         let provider = StubProvider::new(vec![
             turn_tool_call("call_1", "spawn_agent", r#"{"task":"run the child"}"#),
             turn_text("child done"),
@@ -2703,9 +2711,13 @@ mod tests {
         let id = tasks[0].id.clone();
 
         // The same ticker that fires the promise scans the queue the
-        // swarm task wrote — a synthetic `now` past the instant.
+        // swarm task wrote — a synthetic `now` past the instant (and
+        // within the 60 s grace window, so the scan fires rather than
+        // misses).
         let scan = driver
-            .scan_schedules(Utc::now() + chrono::Duration::seconds(30))
+            .scan_schedules(
+                Utc::now() + chrono::Duration::minutes(10) + chrono::Duration::seconds(30),
+            )
             .await;
         assert_eq!(
             scan,

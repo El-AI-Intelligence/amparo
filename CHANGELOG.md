@@ -90,6 +90,13 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   gate auto-denied after its 60 s timeout (observed on Windows CI). The
   gate now registers first — a press cannot outrun the buttons it
   presses — and unregisters if the message send fails.
+- **Swarm+schedule test's two-second horizon**: the cross-feature test
+  committed its promise to `now + 2 s`, but the schedule call runs only
+  after a spawn_agent turn AND a child sub-task — on loaded Windows
+  runners the turn outran the instant, the schedule tool honestly
+  refused the past instant (fail-closed), and the store was empty at the
+  assert. The instant is now ten minutes out; the synthetic scan drives
+  the fire without waiting.
 
 ## [0.11.0] — 2026-09-01
 
