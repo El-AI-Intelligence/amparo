@@ -33,9 +33,10 @@
 //!   cards, status line. Piped, it degrades to one task per stdin line with
 //!   zero escapes.
 //! - `amparo wizard` writes the first-run profile: four ruled steps —
-//!   workspace, LLM endpoint, optional policy URL, optional memory URL —
-//!   saved locally (mode 0600) and read back at boot to fill environment
-//!   gaps (env always wins).
+//!   workspace, LLM endpoint, optional Guardrail policy (wire check URL,
+//!   key, console URL), optional Engram memory URL — saved locally (mode
+//!   0600) and read back at boot to fill environment gaps (env always
+//!   wins).
 //! - `amparo version` prints the version.
 //!
 //! stdout carries the final answer only (a scripting contract); progress,
@@ -90,8 +91,9 @@ SUBCOMMANDS:
              chain rendered live (banner, gutter rows, approval cards,
              status line); piped: one task per stdin line
   wizard     the first-run profile: workspace, LLM endpoint, optional
-             policy URL, optional memory URL — saved locally (0600),
-             read back at boot to fill environment gaps
+             Guardrail policy (check URL, key, console URL), optional
+             Engram memory URL — saved locally (0600), read back at boot
+             to fill environment gaps
   version    print the version
 
 Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help`,

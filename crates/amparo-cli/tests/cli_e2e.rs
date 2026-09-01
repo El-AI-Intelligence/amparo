@@ -4811,6 +4811,7 @@ async fn wizard_writes_0600_profile_and_a_run_reads_it() {
             "AMPARO_INFERENCE_KEY",
             "AMPARO_INFERENCE_PROVIDER",
             "AMPARO_POLICY_KEY",
+            "AMPARO_CONSOLE_POLICY_URL",
             "AMPARO_MEMORY_BACKEND",
             "AMPARO_ENGRAM_URL",
             "AMPARO_ENGRAM_KEY",
@@ -4819,10 +4820,38 @@ async fn wizard_writes_0600_profile_and_a_run_reads_it() {
     let ws = fresh_workspace("wizard");
     let prior = set_workspace_env_to(&ws);
 
-    // Nine answers, one per prompt: workspace (empty = the env root),
-    // url, model, then Enter for provider, key, policy url/key and
-    // memory url/key.
-    let answers = format!("\n{}\nmock-model\n\n\n\n\n\n\n", mock.url());
+    // A fake bin dir first on PATH with a `guardrail` and an `engram`
+    // executable — the delegation lines must report the sibling CLIs as
+    // found (the real system PATH stays attached for the follow-up run).
+    let fake_bin = ws.join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["guardrail", "engram"] {
+            let f = fake_bin.join(name);
+            std::fs::write(&f, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(fake_bin.join("guardrail.exe"), "x").unwrap();
+        std::fs::write(fake_bin.join("engram.exe"), "x").unwrap();
+    }
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let joined = format!(
+        "{}{sep}{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let joined: &'static str = Box::leak(joined.into_boxed_str());
+    let path_env = set_env(&[("PATH", joined)], &[]);
+
+    // Ten answers, one per prompt: workspace (empty = the env root),
+    // url, model, then Enter for provider, key, policy url/key, a
+    // console url, then Enter for memory url/key.
+    let answers = format!("\n{}\nmock-model\n\n\n\n\nhttps://console.example\n\n\n", mock.url());
     let out = run_with_stdin(&["wizard"], answers.as_bytes()).await;
 
     let text = stdout(&out);
@@ -4855,6 +4884,20 @@ async fn wizard_writes_0600_profile_and_a_run_reads_it() {
     );
     assert!(text.contains("[memory] built-in store"), "{text}");
     assert!(text.contains("[wake] Amparo is awake."), "{text}");
+    // Both sibling CLIs were found on the fake PATH, and the console
+    // answer echoes back host-only in the summary.
+    assert!(
+        text.contains("[wizard] found the guardrail CLI — `guardrail link` pairs this machine with an org key"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[wizard] found the engram CLI — `engram pair` pairs this machine with the memory daemon"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[policy] console https://console.example — /policy commands write org rules there"),
+        "{text}"
+    );
 
     // The captured profile carries exactly the answers, owner-only.
     let profile: serde_json::Value =
@@ -4863,6 +4906,7 @@ async fn wizard_writes_0600_profile_and_a_run_reads_it() {
     assert_eq!(profile["inference_model"], "mock-model");
     assert!(profile["inference_provider"].is_null());
     assert!(profile["policy_url"].is_null());
+    assert_eq!(profile["console_url"], "https://console.example");
     assert!(profile["memory_url"].is_null());
     #[cfg(unix)]
     {
@@ -4882,6 +4926,7 @@ async fn wizard_writes_0600_profile_and_a_run_reads_it() {
     assert!(stdout(&out).contains("Hello."), "{}", stdout(&out));
 
     restore_workspace_env(prior);
+    drop(path_env);
     drop(env);
     drop(mock);
     let _ = std::fs::remove_dir_all(&ws);
@@ -4903,6 +4948,42 @@ async fn wizard_at_eof_fails_instead_of_half_capturing() {
     let out = run_with(&["wizard"]).await;
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("needs answers"), "{}", stderr(&out));
+}
+
+#[tokio::test]
+async fn wizard_prints_install_hints_when_sibling_clis_are_missing() {
+    let _guard = LOCK.lock().await;
+    let ws = fresh_workspace("wizard-missing");
+    let prior = set_workspace_env_to(&ws);
+    // A PATH holding only an empty directory: neither sibling CLI can
+    // resolve, so both delegation lines fall back to the install
+    // one-liners. The wizard spawns nothing, so the bare PATH is safe.
+    let empty_bin = ws.join("no-clis");
+    std::fs::create_dir_all(&empty_bin).unwrap();
+    let path_env: &'static str = Box::leak(empty_bin.display().to_string().into_boxed_str());
+    let guard = set_env(&[("PATH", path_env)], &[]);
+
+    // Ten empty answers — every step skipped, the delegation lines still
+    // print before the first prompt of each step.
+    let out = run_with_stdin(&["wizard"], b"\n\n\n\n\n\n\n\n\n\n").await;
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        text.contains(
+            "[wizard] no guardrail CLI on PATH — install one with: curl -fsSL https://downloads.ellmstack.dev/install.sh | bash"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "[wizard] no engram CLI on PATH — install one with: curl -fsSL https://engram.ellmstack.dev/install.sh | bash"
+        ),
+        "{text}"
+    );
+
+    restore_workspace_env(prior);
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&ws);
 }
 
 #[tokio::test]

@@ -1,10 +1,14 @@
 //! `amparo wizard` — the first-run profile wizard (#167).
 //!
 //! Local-first: four ruled steps — workspace → LLM endpoint → optional
-//! Guardrail Console policy URL → optional Engram Vault memory URL — captured line by
-//! line (Enter skips; piped stdin answers one line per prompt, in order)
-//! and written to `{workspace}/.amparo/profile.json`, mode 0600 — the
-//! profile can carry keys, so it is never world-readable.
+//! Guardrail policy (wire check URL, key, console URL) → optional Engram
+//! Vault memory URL — captured line by line (Enter skips; piped stdin
+//! answers one line per prompt, in order) and written to
+//! `{workspace}/.amparo/profile.json`, mode 0600 — the profile can carry
+//! keys, so it is never world-readable. Each policy/memory step prints a
+//! delegation line: the sibling CLI on PATH pairs this machine
+//! (`guardrail link`, `engram pair`), a missing one gets its install
+//! one-liner.
 //!
 //! Every later wire reads the profile to fill environment gaps: the
 //! environment wins, the profile fills what is unset. `amparo tui` boots
@@ -42,6 +46,11 @@ pub(crate) struct Profile {
     /// The policy key (`AMPARO_POLICY_KEY`); never echoed back.
     #[serde(default)]
     pub policy_key: Option<String>,
+    /// The Guardrail Console URL (`AMPARO_CONSOLE_POLICY_URL`) — where the
+    /// TUI's `/policy` commands write org rules. Falls back to
+    /// [`amparo_tools::DEFAULT_CONSOLE_POLICY_URL`] when unset.
+    #[serde(default)]
+    pub console_url: Option<String>,
     /// The Engram Vault daemon (engramd) base URL (`AMPARO_ENGRAM_URL`, with
     /// `AMPARO_MEMORY_BACKEND=engram`).
     #[serde(default)]
@@ -105,6 +114,7 @@ pub(crate) fn fill_env_gaps(profile: &Profile) {
     set("AMPARO_INFERENCE_KEY", &profile.inference_key);
     set("AMPARO_INFERENCE_PROVIDER", &profile.inference_provider);
     set("AMPARO_POLICY_KEY", &profile.policy_key);
+    set("AMPARO_CONSOLE_POLICY_URL", &profile.console_url);
     if std::env::var_os("AMPARO_MEMORY_BACKEND").is_none() && profile.memory_url.is_some() {
         std::env::set_var("AMPARO_MEMORY_BACKEND", "engram");
     }
@@ -119,16 +129,12 @@ pub(crate) fn fill_env_gaps(profile: &Profile) {
 /// The Guardrail install one-liner shown when the `guardrail` CLI is not
 /// on PATH — `guardrail link` pairs this machine with a gk_ org key
 /// (verified 2026-09-01).
-// Callers land in M12 W4 (wizard delegation lines).
-#[allow(dead_code)]
 pub(crate) const GUARDRAIL_INSTALL_HINT: &str =
     "curl -fsSL https://downloads.ellmstack.dev/install.sh | bash";
 
 /// The Engram install one-liner shown when the `engram` CLI is not on
 /// PATH — `engram pair` pairs this machine with the memory daemon
 /// (verified 2026-09-01).
-// Callers land in M12 W4 (wizard delegation lines).
-#[allow(dead_code)]
 pub(crate) const ENGRAM_INSTALL_HINT: &str =
     "curl -fsSL https://engram.ellmstack.dev/install.sh | bash";
 
@@ -136,8 +142,6 @@ pub(crate) const ENGRAM_INSTALL_HINT: &str =
 /// the wizard's delegation lines: a found sibling CLI delegates setup to
 /// its own flow (`guardrail link`, `engram pair`), a missing one gets the
 /// install one-liner. Windows also probes `.exe`/`.cmd`/`.bat` suffixes.
-// Callers land in M12 W4 (wizard delegation lines).
-#[allow(dead_code)]
 pub(crate) fn command_on_path(name: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -171,6 +175,18 @@ fn executable(_path: &Path) -> bool {
     // Windows has no mode bits — `is_file` on the probed suffix is the
     // whole check.
     true
+}
+
+/// One sibling-CLI delegation line: a found CLI delegates setup to its own
+/// flow (`guardrail link`, `engram pair`), a missing one gets the install
+/// one-liner. A pure helper so both branches are unit-pinned without
+/// touching PATH.
+fn delegation_line(cli: &str, pairing: &str, install: &str, on_path: bool) -> String {
+    if on_path {
+        format!("[wizard] found the {cli} CLI — {pairing}")
+    } else {
+        format!("[wizard] no {cli} CLI on PATH — install one with: {install}")
+    }
 }
 
 /// Whether both required inference variables are missing — the wizard's
@@ -226,6 +242,18 @@ pub(crate) fn memory_desc(profile: &Profile) -> String {
         Some(url) => format!("Engram Vault @ {}", site_desc(url)),
         None => "built-in store".to_string(),
     }
+}
+
+/// The console line in the wizard summary — the effective console host,
+/// never a key-carrying URL. `None` when no console is configured (the
+/// client falls back to [`amparo_tools::DEFAULT_CONSOLE_POLICY_URL`]).
+pub(crate) fn console_desc(profile: &Profile) -> Option<String> {
+    profile.console_url.as_deref().map(|url| {
+        format!(
+            "[policy] console {} — /policy commands write org rules there",
+            site_desc(url)
+        )
+    })
 }
 
 /// The infer line in the banner's grammar, from the answers — the host
@@ -379,11 +407,22 @@ pub(crate) fn run(
     let policy_key_default = existing.as_ref().and_then(|p| p.policy_key.clone());
     println!();
     println!("▐ step 3/4 — Guardrail Console policy (recommended, never required)");
-    println!("  a Guardrail wire-protocol engine URL — the engine Guardrail Console manages; keys stay local");
+    println!("  the wire check URL — routed through the console, org rules apply to every check");
+    println!("  the console URL — the TUI's /policy commands write org rules there");
+    println!("  keys stay local");
+    println!(
+        "{}",
+        delegation_line(
+            "guardrail",
+            "`guardrail link` pairs this machine with an org key",
+            GUARDRAIL_INSTALL_HINT,
+            command_on_path("guardrail")
+        )
+    );
     let policy_url = ask(
         reader,
         &format!(
-            "  url [recommended, never required{}] › ",
+            "  engine url [recommended, never required{}] › ",
             if policy_default.is_some() {
                 " — set"
             } else {
@@ -402,6 +441,18 @@ pub(crate) fn run(
             }
         ),
     )?;
+    let console_default = std::env::var("AMPARO_CONSOLE_POLICY_URL")
+        .ok()
+        .or_else(|| existing.as_ref().and_then(|p| p.console_url.clone()));
+    let console_url = ask(
+        reader,
+        &format!(
+            "  console url [default {}] › ",
+            console_default
+                .as_deref()
+                .unwrap_or(amparo_tools::DEFAULT_CONSOLE_POLICY_URL)
+        ),
+    )?;
 
     let memory_default = std::env::var("AMPARO_ENGRAM_URL")
         .ok()
@@ -410,6 +461,15 @@ pub(crate) fn run(
     println!();
     println!("▐ step 4/4 — Engram Vault memory (recommended, never required)");
     println!("  an Engram Vault daemon (engramd) URL — memories that outlive the session");
+    println!(
+        "{}",
+        delegation_line(
+            "engram",
+            "`engram pair` pairs this machine with the memory daemon",
+            ENGRAM_INSTALL_HINT,
+            command_on_path("engram")
+        )
+    );
     let memory_url = ask(
         reader,
         &format!(
@@ -442,6 +502,7 @@ pub(crate) fn run(
         inference_provider: pick(provider, provider_default),
         policy_url: pick(policy_url, policy_default),
         policy_key: pick(policy_key, policy_key_default),
+        console_url: pick(console_url, console_default),
         memory_url: pick(memory_url, memory_default),
         memory_key: pick(memory_key, memory_key_default),
     };
@@ -452,6 +513,9 @@ pub(crate) fn run(
     println!("[chain] {}", chain_line(&profile));
     println!("[infer] {}", infer_desc(&profile));
     println!("[memory] {}", memory_desc(&profile));
+    if let Some(line) = console_desc(&profile) {
+        println!("{line}");
+    }
     println!();
     println!("[wizard] the next boot greets with:");
     println!();
@@ -488,12 +552,14 @@ amparo wizard — the first-run profile wizard
 USAGE:
   amparo wizard
 
-Four steps — workspace → LLM endpoint → optional Guardrail Console policy URL →
-optional Engram Vault memory URL — written to {workspace}/.amparo/profile.json
-(mode 0600). Policy and memory are recommended, never required; Enter
-skips any line; keys are never echoed. Piped stdin answers one line per
-prompt, in order: workspace, url, model, provider, key, policy url,
-policy key, memory url, memory key.
+Four steps — workspace → LLM endpoint → optional Guardrail policy (wire
+check URL, key, console URL) → optional Engram Vault memory URL — written
+to {workspace}/.amparo/profile.json (mode 0600). Policy and memory are
+recommended, never required; Enter skips any line; keys are never echoed.
+Piped stdin answers one line per prompt, in order: workspace, url, model,
+provider, key, policy url, policy key, console url, memory url, memory key.
+Steps 3 and 4 note the sibling CLI (`guardrail link`, `engram pair`) or
+its install one-liner.
 
 The profile fills environment gaps on every later run (the environment
 wins). The TUI boots into the wizard when no LLM is configured anywhere;
@@ -535,6 +601,7 @@ mod tests {
             policy_key: Some("gk_test".to_string()),
             memory_url: Some("http://127.0.0.1:8787".to_string()),
             memory_key: Some("mem_key".to_string()),
+            console_url: Some("http://127.0.0.1:9101".to_string()),
         }
     }
 
@@ -546,6 +613,7 @@ mod tests {
         assert_eq!(back.inference_model, full().inference_model);
         assert_eq!(back.inference_key, full().inference_key);
         assert_eq!(back.policy_url, full().policy_url);
+        assert_eq!(back.console_url, full().console_url);
         assert_eq!(back.memory_url, full().memory_url);
     }
 
@@ -592,13 +660,21 @@ mod tests {
         let desc = policy_desc(&policy);
         assert!(desc.contains("127.0.0.1:8080"), "{desc}");
         assert!(!desc.contains("gk_secret"), "{desc}");
+        let mut console = full();
+        console.console_url = Some("http://gk_console_secret@console:8080".to_string());
+        let line = console_desc(&console).unwrap();
+        assert!(line.contains("console:8080"), "{line}");
+        assert!(!line.contains("gk_console_secret"), "{line}");
+        assert!(console_desc(&Profile::default()).is_none());
     }
 
     #[test]
     fn scripted_stdin_captures_the_profile() {
         let root = std::env::temp_dir().join(format!("amparo-wizard-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let mut stdin: &[u8] = b"/tmp/unused-workspace\nhttp://127.0.0.1:11434/v1\nqwen\n\n\nhttp://127.0.0.1:8080\n\n\n\n";
+        // Ten answers: workspace, url, model, provider, key, policy url,
+        // policy key, console url, memory url, memory key.
+        let mut stdin: &[u8] = b"/tmp/unused-workspace\nhttp://127.0.0.1:11434/v1\nqwen\n\n\nhttp://127.0.0.1:8080\n\nhttp://127.0.0.1:9101\n\n\n";
         let (chosen, profile) = run(&mut stdin, &root).unwrap();
         assert_eq!(chosen, PathBuf::from("/tmp/unused-workspace"));
         assert_eq!(
@@ -607,10 +683,18 @@ mod tests {
         );
         assert_eq!(profile.inference_model.as_deref(), Some("qwen"));
         assert_eq!(profile.policy_url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(
+            profile.console_url.as_deref(),
+            Some("http://127.0.0.1:9101")
+        );
         assert!(profile.memory_url.is_none());
         let path = profile_path(&chosen);
         let back: Profile = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back.inference_model.as_deref(), Some("qwen"));
+        assert_eq!(
+            back.console_url.as_deref(),
+            Some("http://127.0.0.1:9101")
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -627,6 +711,33 @@ mod tests {
         let root = std::env::temp_dir().join(format!("amparo-wizard-eof-{}", std::process::id()));
         let err = run(&mut stdin, &root).unwrap_err();
         assert!(err.contains("needs answers"), "{err}");
+    }
+
+    #[test]
+    fn delegation_line_pins_both_branches() {
+        let found = delegation_line(
+            "guardrail",
+            "`guardrail link` pairs this machine with an org key",
+            GUARDRAIL_INSTALL_HINT,
+            true,
+        );
+        assert!(
+            found.contains(
+                "[wizard] found the guardrail CLI — `guardrail link` pairs this machine with an org key"
+            ),
+            "{found}"
+        );
+        let missing = delegation_line(
+            "engram",
+            "`engram pair` pairs this machine with the memory daemon",
+            ENGRAM_INSTALL_HINT,
+            false,
+        );
+        assert!(
+            missing.contains("[wizard] no engram CLI on PATH — install one with: "),
+            "{missing}"
+        );
+        assert!(missing.contains(ENGRAM_INSTALL_HINT), "{missing}");
     }
 
     #[test]
