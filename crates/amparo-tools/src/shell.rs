@@ -123,6 +123,7 @@ impl ToolExecutor for RunCommandTool {
         std::fs::create_dir_all(&workspace).ok();
 
         // ── Execute with wall-clock timeout ────────────────────────────
+        #[cfg(not(windows))]
         let run = async {
             Command::new("bash")
                 .arg("-c")
@@ -130,6 +131,22 @@ impl ToolExecutor for RunCommandTool {
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin:/usr/local/bin")
                 .env("HOME", workspace.to_string_lossy().to_string())
+                .current_dir(&workspace)
+                .output()
+                .await
+        };
+        // On Windows there is no `bash` on PATH — the name resolves to the
+        // WSL shim, which fails without a WSL distro. Run through `cmd /C`
+        // instead (cmd has no `pwd`; `cd` with no arguments prints the
+        // current directory, the same echo of the cwd the shell tool relies
+        // on).
+        #[cfg(windows)]
+        let run = async {
+            Command::new("cmd")
+                .arg("/C")
+                .arg(&command)
+                .env_clear()
+                .env("PATH", "C:\\Windows\\System32;C:\\Windows")
                 .current_dir(&workspace)
                 .output()
                 .await

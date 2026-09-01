@@ -1083,7 +1083,11 @@ async fn chat_config_directory_roundtrip_per_user_workspace() {
     let _guard = LOCK.lock().await;
     let cfg = write_chat_config("per-user-ws", "[users.\"telegram:111\"]\n");
     let ws = fresh_workspace("per-user-ws");
-    let llm = MockLlm::start(vec![tool_call_script("pwd"), vec![content_frame("Done.")]]).await;
+    // The probe that prints the working directory: `pwd` on Unix shells,
+    // `cd` (no arguments) on `cmd` — the run_command tool runs `bash -c`
+    // on Unix and `cmd /C` on Windows.
+    let probe = if cfg!(windows) { "cd" } else { "pwd" };
+    let llm = MockLlm::start(vec![tool_call_script(probe), vec![content_frame("Done.")]]).await;
     let telegram = MockTelegram::start().await;
     telegram.push_update(message_update(301, 111, 111, "do it"));
     telegram.push_update(callback_update(302, 111, 111, "approve:call_1"));

@@ -32,6 +32,11 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ### Fixed
 
+- **`run_command` on Windows**: the shell tool hardcoded `bash -c`, which
+  on Windows resolves to the WSL shim and fails without a WSL distro —
+  commands never ran and the working-directory echo was absent. The tool
+  now runs `cmd /C` on Windows (the cwd echo is `cd` with no arguments,
+  cmd's equivalent of `pwd`); the Unix `bash` path is unchanged.
 - **Integration tests at the pinned MSRV**: cargo 1.85 builds the package
   binaries for `cargo test` but does not set `CARGO_BIN_EXE_<name>`
   (that arrived in a later cargo), so the real-process e2e suites
