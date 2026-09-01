@@ -52,6 +52,11 @@ mod run;
 mod schedule;
 mod skill;
 mod stderr_subscriber;
+// The interactive reader (raw mode, keypress approvals, picker) is
+// Unix-only by design — on Windows the surface runs piped, so the
+// machinery compiles but is never constructed. Allow the dead code there
+// instead of faking a Windows reader.
+#[cfg_attr(not(unix), allow(dead_code, unused_variables))]
 mod tui;
 mod wizard;
 

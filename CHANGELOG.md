@@ -37,6 +37,15 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   (that arrived in a later cargo), so the real-process e2e suites
   (`cli_e2e`, `chat_e2e`, `bin_e2e`) now fall back to locating the
   binaries next to the test executables in the profile directory.
+- **Symlinked temp dirs on macOS**: the sandbox boundary now resolves
+  comparison roots the same way candidates are resolved (canonical when
+  they exist on disk). On macOS the temp dir and `/tmp` are symlinks
+  into `/private/…`, and the canonical-vs-lexical mismatch silently
+  denied every workspace write under them.
+- **Windows TUI dead code**: the interactive reader (raw mode, keypress
+  approvals, picker) is Unix-only by design — on Windows the surface
+  runs piped. The Unix-only machinery is now allow-listed for dead code
+  on non-unix instead of faking a Windows reader.
 
 ## [0.11.0] — 2026-09-01
 

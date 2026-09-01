@@ -123,8 +123,13 @@ impl PathPolicy {
         // Canonicalize if possible; fall back to normalized path
         let resolved = path.canonicalize().unwrap_or_else(|_| normalize_path(path));
 
-        // Always allow paths inside workspace_root
-        if resolved.starts_with(&self.workspace_root) {
+        // Always allow paths inside workspace_root. The boundary root is
+        // resolved the same way as the candidate — on macOS the temp dir
+        // (`/var/folders/…`) and `/tmp` are symlinks into `/private/…`, so
+        // a canonical candidate compared against a lexical root would be
+        // wrongly denied.
+        let workspace_root = resolve_boundary(&self.workspace_root);
+        if resolved.starts_with(&workspace_root) {
             return true;
         }
 
@@ -132,14 +137,17 @@ impl PathPolicy {
         // writable. They must appear in the same filesystem view for both
         // file tools and shell tools, avoiding the path-resolution asymmetry
         // that would otherwise make run_command→read_file workflows fail.
-        if scratch_roots().iter().any(|root| resolved.starts_with(root)) {
+        if scratch_roots()
+            .iter()
+            .any(|root| resolved.starts_with(&resolve_boundary(root)))
+        {
             return true;
         }
 
         // Read-only paths are allowed for reads only
         if !write {
             for ro_path in &self.read_only_paths {
-                if resolved.starts_with(ro_path) {
+                if resolved.starts_with(&resolve_boundary(ro_path)) {
                     return true;
                 }
             }
@@ -232,6 +240,15 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+/// Resolve a boundary root the same way candidates are resolved:
+/// canonicalized when the path exists on disk, lexical otherwise. Both
+/// sides of a boundary comparison must use the same view — see
+/// [`PathPolicy::is_path_allowed`].
+fn resolve_boundary(root: &std::path::Path) -> PathBuf {
+    root.canonicalize()
+        .unwrap_or_else(|_| normalize_path(&root.to_path_buf()))
 }
 
 /// Normalize a path lexically: resolve `.` and `..` without touching the
