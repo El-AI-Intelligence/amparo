@@ -13,6 +13,7 @@ pub mod filesystem;
 pub mod git;
 pub mod memory;
 pub mod notification;
+pub mod org_policy;
 pub mod paths;
 pub mod process_env;
 pub mod registry;
@@ -30,6 +31,9 @@ pub use memory::{InMemoryStore, Memory, MemoryEntry, MemorySearchTool, MemoryWri
 pub use notification::{
     Notification, NotificationTransport, SendNotificationTool, StderrTransport, WebhookTransport,
     SEND_NOTIFICATION,
+};
+pub use org_policy::{
+    OrgInfo, OrgPolicyClient, OrgPolicyError, OrgPolicyRule, DEFAULT_CONSOLE_POLICY_URL,
 };
 pub use paths::PathPolicy;
 pub use registry::{

@@ -112,6 +112,67 @@ pub(crate) fn fill_env_gaps(profile: &Profile) {
     set("AMPARO_ENGRAM_KEY", &profile.memory_key);
 }
 
+// ---------------------------------------------------------------------------
+// Sibling CLI delegation (M12 W2)
+// ---------------------------------------------------------------------------
+
+/// The Guardrail install one-liner shown when the `guardrail` CLI is not
+/// on PATH — `guardrail link` pairs this machine with a gk_ org key
+/// (verified 2026-09-01).
+// Callers land in M12 W4 (wizard delegation lines).
+#[allow(dead_code)]
+pub(crate) const GUARDRAIL_INSTALL_HINT: &str =
+    "curl -fsSL https://downloads.ellmstack.dev/install.sh | bash";
+
+/// The Engram install one-liner shown when the `engram` CLI is not on
+/// PATH — `engram pair` pairs this machine with the memory daemon
+/// (verified 2026-09-01).
+// Callers land in M12 W4 (wizard delegation lines).
+#[allow(dead_code)]
+pub(crate) const ENGRAM_INSTALL_HINT: &str =
+    "curl -fsSL https://engram.ellmstack.dev/install.sh | bash";
+
+/// True when `name` resolves to an executable on PATH — the check behind
+/// the wizard's delegation lines: a found sibling CLI delegates setup to
+/// its own flow (`guardrail link`, `engram pair`), a missing one gets the
+/// install one-liner. Windows also probes `.exe`/`.cmd`/`.bat` suffixes.
+// Callers land in M12 W4 (wizard delegation lines).
+#[allow(dead_code)]
+pub(crate) fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let suffixes: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    for dir in std::env::split_paths(&path) {
+        for suffix in suffixes {
+            let candidate = dir.join(format!("{name}{suffix}"));
+            if candidate.is_file() && executable(&candidate) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn executable(_path: &Path) -> bool {
+    // Windows has no mode bits — `is_file` on the probed suffix is the
+    // whole check.
+    true
+}
+
 /// Whether both required inference variables are missing — the wizard's
 /// trigger. Present-but-invalid values are left alone: the wire's own
 /// error names them far better than a first-run prompt would.
@@ -566,5 +627,49 @@ mod tests {
         let root = std::env::temp_dir().join(format!("amparo-wizard-eof-{}", std::process::id()));
         let err = run(&mut stdin, &root).unwrap_err();
         assert!(err.contains("needs answers"), "{err}");
+    }
+
+    #[test]
+    fn command_on_path_finds_executable_files_only() {
+        let dir = std::env::temp_dir().join(format!("amparo-on-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exe = dir.join("fake-guardrail");
+            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let plain = dir.join("fake-engram");
+            std::fs::write(&plain, "not executable").unwrap();
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+            // Keep the system PATH after the temp dir so nothing else in
+            // this process loses its binaries while the probe runs.
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+            assert!(command_on_path("fake-guardrail"));
+            assert!(!command_on_path("fake-engram"));
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(dir.join("fake-guardrail.exe"), "x").unwrap();
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{};{}",
+                    dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+            assert!(command_on_path("fake-guardrail"));
+        }
+        assert!(!command_on_path("never-installed"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

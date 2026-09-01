@@ -178,9 +178,10 @@ impl Memory for EngramStore {
     }
 }
 
-/// Loopback hosts the engramd URL may name without a warning — the
-/// documented local-daemon shapes, plus the full 127/8 block.
-fn is_loopback_host(host: &str) -> bool {
+/// Loopback hosts a sibling URL may name without a warning — the
+/// documented local-daemon shapes, plus the full 127/8 block. Shared with
+/// the org-policy client ([`crate::org_policy`]).
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     // The `url` crate returns IPv6 hosts bracketed ("[::1]").
     let host = host.trim_matches(|c| c == '[' || c == ']');
     matches!(host, "127.0.0.1" | "::1" | "localhost") || host.starts_with("127.")
@@ -190,7 +191,8 @@ fn is_loopback_host(host: &str) -> bool {
 /// the shape the audit flags (2026-08-31 LOW-5): a remote daemon over
 /// HTTP sends the key and unstripped content in the clear. Unparseable
 /// URLs are not flagged here; reqwest fails them closed downstream.
-fn non_loopback_http(url: &str) -> bool {
+/// Shared with the org-policy client ([`crate::org_policy`]).
+pub(crate) fn non_loopback_http(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };

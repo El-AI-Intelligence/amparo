@@ -571,10 +571,11 @@ fn link(paint: &Paint, controls: bool, url: &str, text: &str) -> String {
     }
 }
 
-/// The policy console URL — overridable for self-hosted consoles.
+/// The policy console URL — overridable for self-hosted consoles; the
+/// default lives with the org-policy client so every surface names one.
 fn console_policy_url() -> String {
     std::env::var("AMPARO_CONSOLE_POLICY_URL")
-        .unwrap_or_else(|_| "https://guardrail.elai-intelligence.com".to_string())
+        .unwrap_or_else(|_| amparo_tools::org_policy::DEFAULT_CONSOLE_POLICY_URL.to_string())
 }
 
 /// The memory console URL — overridable for self-hosted consoles.
