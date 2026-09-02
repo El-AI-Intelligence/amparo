@@ -1144,70 +1144,25 @@ async fn chat_config_directory_roundtrip_per_user_workspace() {
     let child_stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let telegram_requests = format!("{:?}", telegram.log());
     let bodies = llm.bodies.lock().unwrap();
-    // The bodies are serialized request JSON, so every backslash in the
-    // echoed path appears doubled — the needle must match the body's
-    // encoding, not the raw path. Backslash doubling is the only JSON
-    // transformation a Windows path undergoes — quotes and control
-    // characters cannot appear in Windows path components — and on Unix
-    // the replace is a no-op.
-    let cwd_needle = per_user
-        .to_string_lossy()
-        .to_string()
-        .replace('\\', "\\\\");
-    // TEMP DIAGNOSTIC — remove after the Windows byte-diff is read.
-    // Byte-level picture of the mismatch: the needle in both forms, the
-    // process's own temp dir (and TMP/TEMP on Windows), and per body the
-    // raw/doubled containment plus the regions around the needle and any
-    // "stdout" occurrence, all debug-escaped so every backslash is
-    // countable.
-    let raw_needle = per_user.to_string_lossy().to_string();
-    let mut diag = format!(
-        "raw needle {:?} ({} chars, {} bytes)\ncwd needle {:?} ({} chars, {} bytes)\ntemp_dir {:?}",
-        raw_needle,
-        raw_needle.chars().count(),
-        raw_needle.len(),
-        cwd_needle,
-        cwd_needle.chars().count(),
-        cwd_needle.len(),
-        std::env::temp_dir(),
-    );
-    #[cfg(windows)]
-    for var in ["TMP", "TEMP"] {
-        diag.push_str(&format!(
-            "\n{} {:?}",
-            var,
-            std::env::var(var).unwrap_or_else(|_| "<unset>".to_string())
-        ));
-    }
-    for (i, body) in bodies.iter().enumerate() {
-        diag.push_str(&format!(
-            "\nbody[{i}]: raw={} doubled={}",
-            body.contains(&raw_needle),
-            body.contains(&cwd_needle),
-        ));
-        for (m, needle) in [("raw", &raw_needle), ("doubled", &cwd_needle)] {
-            if let Some(pos) = body.find(needle) {
-                let lo = pos.saturating_sub(40);
-                let hi = (pos + needle.len() + 40).min(body.len());
-                if let Some(slice) = body.get(lo..hi) {
-                    diag.push_str(&format!("\n  {m} needle hit at {pos}: {slice:?}"));
-                }
-            }
-        }
-        let mut from = 0;
-        while let Some(pos) = body[from..].find("stdout") {
-            let p = from + pos;
-            let lo = p.saturating_sub(30);
-            let hi = (p + 260).min(body.len());
-            if let Some(slice) = body.get(lo..hi) {
-                diag.push_str(&format!("\n  stdout region at {p}: {slice:?}"));
-            }
-            from = p + 6;
-        }
-    }
+    // The tool result reaches the model as JSON text inside a message
+    // content string, so in the serialized request body the path is
+    // JSON-escaped TWICE — once when the result becomes the content
+    // text, once when the request is serialized. On Unix a `/` is never
+    // escaped, so the body holds the raw path at any depth; on Windows
+    // every separator is a backslash, and the body holds the path with
+    // four backslashes per separator (measured byte-level on the CI
+    // runner). Build the needle by escaping the path at both levels and
+    // stripping the quotes each escape adds — the identity on Unix, the
+    // measured body encoding on Windows. (The content string also
+    // carries a trailing SYSTEM: note, so decode-and-compare does not
+    // survive it.)
+    let path_str = per_user.to_string_lossy().to_string();
+    let once = serde_json::to_string(&path_str).unwrap();
+    let twice = serde_json::to_string(&once[1..once.len() - 1]).unwrap();
+    let cwd_needle = &twice[1..twice.len() - 1];
     assert!(
-        bodies.iter().any(|b| b.contains(&cwd_needle)),
-        "the run_command result echoed the per-user cwd: {bodies:?}\nchild stderr: {child_stderr}\ntelegram requests: {telegram_requests}\nDIAGNOSTIC:\n{diag}"
+        bodies.iter().any(|b| b.contains(cwd_needle)),
+        "the run_command result echoed the per-user cwd: {bodies:?}\nchild stderr: {child_stderr}\ntelegram requests: {telegram_requests}"
     );
     assert!(
         bodies.iter().any(|b| b.contains("\\\"exit_code\\\":0")),

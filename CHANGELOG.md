@@ -38,14 +38,16 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   now runs `cmd /C` on Windows (the cwd echo is `cd` with no arguments,
   cmd's equivalent of `pwd`); the Unix `bash` path is unchanged.
 - **Chat e2e cwd assertion on Windows**: the per-user-workspace round trip
-  asserted the raw workspace path against the recorded LLM request
-  bodies, which differ from the needle at two levels: the bodies are
-  serialized JSON (every backslash appears doubled), and the needle was
-  built by joining the string `users/telegram-111`, whose inner `/` is
-  kept verbatim on Windows while the driver derives the tenant workspace
-  per-component — all `\` — which is what `cmd /C cd` echoes. The tool
-  itself ran fine (right cwd, exit 0); the needle now matches the
-  driver's construction and the body's JSON encoding.
+  asserted the workspace path against the recorded LLM request bodies as
+  a string needle, but the tool result is a JSON-encoded string inside
+  the messages, and the request serializer escapes it a second time — a
+  Windows path lands in the body with its separators quadrupled, so any
+  escaped needle fails on Windows while Unix passes untouched (no
+  backslashes to escape). Byte-level CI diagnostics pinned the levels;
+  the assert now builds the needle by double-encoding the path
+  (`serde_json::to_string` twice) — the identity on Unix, the measured
+  body encoding on Windows. The tool itself ran fine (right cwd, exit 0)
+  throughout.
 - **Integration tests at the pinned MSRV**: cargo 1.85 builds the package
   binaries for `cargo test` but does not set `CARGO_BIN_EXE_<name>`
   (that arrived in a later cargo), so the real-process e2e suites
