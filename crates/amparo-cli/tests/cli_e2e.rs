@@ -101,6 +101,15 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
+/// Hard ceiling for one child run. Linux/macOS finish the slowest test in
+/// seconds; Windows runners resolve refused connections to the mock's dead
+/// target port (`127.0.0.1:1`) only after TCP SYN retransmits (~2s each),
+/// and `fetch_url` retries failed calls up to `MAX_TOOL_RETRIES` times, so
+/// the quota test legitimately needs ~60-90s there. The timeout still
+/// bounds a real regression hang — it just stops confusing one with
+/// platform speed.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Spawn `amparo` with a closed stdin and a hard timeout so a regression
 /// can never hang the suite. On timeout the child is killed and its
 /// partial output rides in the panic — a stall and a slow runner look
@@ -125,7 +134,7 @@ async fn run_with(args: &[&str]) -> Output {
         );
         (so, se)
     });
-    match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+    match tokio::time::timeout(CHILD_TIMEOUT, child.wait()).await {
         Ok(status) => {
             let status = status.expect("wait amparo");
             let (so, se) = collect.await.expect("collect child output");
@@ -139,7 +148,7 @@ async fn run_with(args: &[&str]) -> Output {
             let _ = child.start_kill();
             let (so, se) = collect.await.expect("collect child output");
             panic!(
-                "amparo timed out after 30s: {args:?}\npartial stdout:\n{}\npartial stderr:\n{}",
+                "amparo timed out after 120s: {args:?}\npartial stdout:\n{}\npartial stderr:\n{}",
                 String::from_utf8_lossy(&so),
                 String::from_utf8_lossy(&se),
             )
@@ -162,7 +171,7 @@ async fn run_with_stdin(args: &[&str], answer: &[u8]) -> Output {
         si.write_all(answer).await.expect("write to child stdin");
         // Dropping the handle sends EOF after the answer.
     }
-    tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+    tokio::time::timeout(CHILD_TIMEOUT, child.wait_with_output())
         .await
         .expect("amparo run timed out")
         .expect("wait for amparo")
