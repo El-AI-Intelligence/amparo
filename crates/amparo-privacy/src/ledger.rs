@@ -301,8 +301,10 @@ impl LedgerStore {
     /// Callers hold `self.file`; the handle is reopened onto the
     /// renamed path before returning.
     fn rotate(&self, file: &mut MutexGuard<'_, File>, max_bytes: u64) -> Result<(), String> {
+        eprintln!("[dbg] rotate begin");
         let content = std::fs::read_to_string(&self.path)
             .map_err(|e| format!("cannot read ledger {}: {e}", self.path.display()))?;
+        eprintln!("[dbg] rotate read done");
         let rows: Vec<LedgerRow> = content
             .lines()
             .filter_map(|line| serde_json::from_str::<LedgerRow>(line).ok())
@@ -378,6 +380,7 @@ impl LedgerStore {
         }
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| format!("cannot rotate ledger {}: {e}", self.path.display()))?;
+        eprintln!("[dbg] rotate renamed");
         // The append handle still points at the pre-rename inode —
         // reopen onto the rotated file or the next append is lost.
         let reopened = ledger_options()
@@ -389,6 +392,7 @@ impl LedgerStore {
                 )
             })?;
         **file = reopened;
+        eprintln!("[dbg] rotate done");
         Ok(())
     }
 

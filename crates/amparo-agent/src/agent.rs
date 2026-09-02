@@ -1074,9 +1074,13 @@ impl Agent {
                 web_search: None,
                 challenge_level: None,
             };
+            eprintln!("[dbg] infer send step {step}");
             let turn = match self.inference.complete_chat_stream(request).await {
                 Ok(stream) => match accumulate_turn(stream).await {
-                    Ok(turn) => turn,
+                    Ok(turn) => {
+                        eprintln!("[dbg] infer recv step {step}");
+                        turn
+                    }
                     Err(e) => {
                         let message = format!("Inference stream failed: {}", e);
                         steps.push(AgentStep::Error {
