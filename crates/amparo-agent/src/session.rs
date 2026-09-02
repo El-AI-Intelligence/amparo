@@ -221,9 +221,14 @@ impl JsonCheckpointStore {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let tmp = dir.join(format!("{}.tmp", checkpoint.task_id));
         let final_path = dir.join(format!("{}.json", checkpoint.task_id));
+        eprintln!("[dbg] ckpt write begin");
         fs::write(&tmp, json)?;
+        eprintln!("[dbg] ckpt write end");
         amparo_privacy::perms::owner_only(&tmp)?;
-        fs::rename(&tmp, &final_path)
+        eprintln!("[dbg] ckpt rename begin");
+        fs::rename(&tmp, &final_path)?;
+        eprintln!("[dbg] ckpt rename end");
+        Ok(())
     }
 }
 
