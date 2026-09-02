@@ -528,19 +528,33 @@ mod tests {
         assert!(read.success, "output: {}", read.output);
         assert_eq!(read.output["content"], "injected content");
 
+        // cmd has no `pwd`; `cd` with no arguments prints the current
+        // directory (documented in shell.rs), so pick the cwd-echo each
+        // platform's shell understands.
+        #[cfg(unix)]
+        let cwd_cmd = "pwd";
+        #[cfg(windows)]
+        let cwd_cmd = "cd";
         let pwd = reg
             .dispatch(&ToolCall {
                 id: "2".to_string(),
                 name: "run_command".to_string(),
-                arguments: serde_json::json!({"command": "pwd"}),
+                arguments: serde_json::json!({"command": cwd_cmd}),
             })
             .await
             .expect("run_command must be registered");
         assert!(pwd.success, "output: {}", pwd.output);
         let stdout = pwd.output["stdout"].as_str().unwrap_or("");
+        // Windows paths compare case-insensitively and the runner may
+        // resolve the temp dir to a different spelling of the same root.
+        let root_str = root.to_string_lossy();
+        #[cfg(unix)]
+        let reported = stdout.contains(&*root_str);
+        #[cfg(windows)]
+        let reported = stdout.to_lowercase().contains(&root_str.to_lowercase());
         assert!(
-            stdout.contains(&root.to_string_lossy().to_string()),
-            "pwd must report the injected root, got: {}",
+            reported,
+            "cwd must report the injected root, got: {}",
             stdout
         );
     }

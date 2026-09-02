@@ -248,10 +248,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_timeout_kills() {
         let tool = RunCommandTool::with_policy(test_policy());
+        // A long-running command in each platform's shell: cmd has no
+        // `sleep`; `ping -n` is the classic Windows stand-in.
+        #[cfg(unix)]
+        let long_running = "sleep 30";
+        #[cfg(windows)]
+        let long_running = "ping -n 31 127.0.0.1 >nul";
         let call = ToolCall {
             id: "t".to_string(),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"command": "sleep 30", "timeout_secs": 1}),
+            arguments: serde_json::json!({"command": long_running, "timeout_secs": 1}),
         };
         let result = tool.execute(&call).await;
         assert!(!result.success);
