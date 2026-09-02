@@ -1154,9 +1154,60 @@ async fn chat_config_directory_roundtrip_per_user_workspace() {
         .to_string_lossy()
         .to_string()
         .replace('\\', "\\\\");
+    // TEMP DIAGNOSTIC — remove after the Windows byte-diff is read.
+    // Byte-level picture of the mismatch: the needle in both forms, the
+    // process's own temp dir (and TMP/TEMP on Windows), and per body the
+    // raw/doubled containment plus the regions around the needle and any
+    // "stdout" occurrence, all debug-escaped so every backslash is
+    // countable.
+    let raw_needle = per_user.to_string_lossy().to_string();
+    let mut diag = format!(
+        "raw needle {:?} ({} chars, {} bytes)\ncwd needle {:?} ({} chars, {} bytes)\ntemp_dir {:?}",
+        raw_needle,
+        raw_needle.chars().count(),
+        raw_needle.len(),
+        cwd_needle,
+        cwd_needle.chars().count(),
+        cwd_needle.len(),
+        std::env::temp_dir(),
+    );
+    #[cfg(windows)]
+    for var in ["TMP", "TEMP"] {
+        diag.push_str(&format!(
+            "\n{} {:?}",
+            var,
+            std::env::var(var).unwrap_or_else(|_| "<unset>".to_string())
+        ));
+    }
+    for (i, body) in bodies.iter().enumerate() {
+        diag.push_str(&format!(
+            "\nbody[{i}]: raw={} doubled={}",
+            body.contains(&raw_needle),
+            body.contains(&cwd_needle),
+        ));
+        for (m, needle) in [("raw", &raw_needle), ("doubled", &cwd_needle)] {
+            if let Some(pos) = body.find(needle) {
+                let lo = pos.saturating_sub(40);
+                let hi = (pos + needle.len() + 40).min(body.len());
+                if let Some(slice) = body.get(lo..hi) {
+                    diag.push_str(&format!("\n  {m} needle hit at {pos}: {slice:?}"));
+                }
+            }
+        }
+        let mut from = 0;
+        while let Some(pos) = body[from..].find("stdout") {
+            let p = from + pos;
+            let lo = p.saturating_sub(30);
+            let hi = (p + 260).min(body.len());
+            if let Some(slice) = body.get(lo..hi) {
+                diag.push_str(&format!("\n  stdout region at {p}: {slice:?}"));
+            }
+            from = p + 6;
+        }
+    }
     assert!(
         bodies.iter().any(|b| b.contains(&cwd_needle)),
-        "the run_command result echoed the per-user cwd: {bodies:?}\nchild stderr: {child_stderr}\ntelegram requests: {telegram_requests}"
+        "the run_command result echoed the per-user cwd: {bodies:?}\nchild stderr: {child_stderr}\ntelegram requests: {telegram_requests}\nDIAGNOSTIC:\n{diag}"
     );
     assert!(
         bodies.iter().any(|b| b.contains("\\\"exit_code\\\":0")),
