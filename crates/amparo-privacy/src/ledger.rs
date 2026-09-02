@@ -23,6 +23,19 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
+/// The append handle must survive the rotation rename: POSIX renames
+/// over an open file freely, Windows refuses unless the handle was
+/// opened with delete sharing.
+fn ledger_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(windows)]
+    opts.share_mode(0x0000_0007); // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    opts
+}
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -226,9 +239,7 @@ impl LedgerStore {
                 })?;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let file = ledger_options()
             .open(&path)
             .map_err(|e| format!("cannot open ledger {}: {e}", path.display()))?;
         crate::perms::owner_only(&path)
@@ -369,9 +380,7 @@ impl LedgerStore {
             .map_err(|e| format!("cannot rotate ledger {}: {e}", self.path.display()))?;
         // The append handle still points at the pre-rename inode —
         // reopen onto the rotated file or the next append is lost.
-        let reopened = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let reopened = ledger_options()
             .open(&self.path)
             .map_err(|e| {
                 format!(

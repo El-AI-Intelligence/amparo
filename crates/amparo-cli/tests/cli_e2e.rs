@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn bin() -> String {
     // cargo ≥ 1.89 sets CARGO_BIN_EXE_<name> for integration tests; the
@@ -102,20 +102,49 @@ fn stderr(out: &Output) -> String {
 }
 
 /// Spawn `amparo` with a closed stdin and a hard timeout so a regression
-/// can never hang the suite.
+/// can never hang the suite. On timeout the child is killed and its
+/// partial output rides in the panic — a stall and a slow runner look
+/// identical from outside, the bytes tell them apart.
 async fn run_with(args: &[&str]) -> Output {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::process::Command::new(bin())
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .expect("spawn amparo")
-    })
-    .await
-    .expect("amparo run timed out")
+    let mut child = tokio::process::Command::new(bin())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn amparo");
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    // Collect the pipes in a detached task: it survives the timeout
+    // future's drop and completes once the child exits (or is killed).
+    let collect = tokio::spawn(async move {
+        let (mut so, mut se) = (Vec::new(), Vec::new());
+        let (_a, _b) = tokio::join!(
+            stdout_pipe.read_to_end(&mut so),
+            stderr_pipe.read_to_end(&mut se),
+        );
+        (so, se)
+    });
+    match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(status) => {
+            let status = status.expect("wait amparo");
+            let (so, se) = collect.await.expect("collect child output");
+            Output {
+                status,
+                stdout: so,
+                stderr: se,
+            }
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let (so, se) = collect.await.expect("collect child output");
+            panic!(
+                "amparo timed out after 30s: {args:?}\npartial stdout:\n{}\npartial stderr:\n{}",
+                String::from_utf8_lossy(&so),
+                String::from_utf8_lossy(&se),
+            )
+        }
+    }
 }
 
 /// Spawn `amparo` with stdin piped so the test can answer the approval
@@ -4807,7 +4836,14 @@ async fn tui_bang_runs_the_child_inline() {
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(text.contains("hello-from-bang"), "{text}");
-    assert!(text.contains("[shell] exited exit status: 3"), "{text}");
+    // The status line formats the std ExitStatus Display impl: Unix
+    // renders "exit status: 3", Windows "exit code: 3".
+    let status_needle = if cfg!(unix) {
+        "[shell] exited exit status: 3"
+    } else {
+        "[shell] exited exit code: 3"
+    };
+    assert!(text.contains(status_needle), "{text}");
     assert!(!text.contains("\x1b["), "zero escapes: {text}");
 }
 

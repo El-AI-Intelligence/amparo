@@ -48,6 +48,16 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   (`serde_json::to_string` twice) — the identity on Unix, the measured
   body encoding on Windows. The tool itself ran fine (right cwd, exit 0)
   throughout.
+- **Ledger rotation on Windows**: rotation renames the tmp ledger over the
+  live append handle — POSIX allows renaming over an open file, Windows
+  refuses it without delete sharing, so every rotation failed with an
+  access-denied append warning on Windows. The append and reopen handles
+  now open with `FILE_SHARE_DELETE` on Windows.
+- **cli_e2e harness**: a `run_with` timeout now kills the child and carries
+  its partial stdout/stderr in the panic (a stall and a slow runner look
+  identical from outside; the bytes tell them apart), and the TUI `!`
+  shell test accepts the platform `ExitStatus` wording — "exit status"
+  on Unix, "exit code" on Windows.
 - **Integration tests at the pinned MSRV**: cargo 1.85 builds the package
   binaries for `cargo test` but does not set `CARGO_BIN_EXE_<name>`
   (that arrived in a later cargo), so the real-process e2e suites
