@@ -256,11 +256,6 @@ impl MockLlm {
                     }
 
                     let streaming = String::from_utf8_lossy(&body).contains("\"stream\":true");
-                    eprintln!(
-                        "[dbg] mock request arrived: stream={streaming} len={} body={}",
-                        body.len(),
-                        String::from_utf8_lossy(&body[..body.len().min(80)])
-                    );
                     if streaming {
                         if let Ok(value) = serde_json::from_slice::<Value>(&body) {
                             stream_requests.lock().await.push(value);
@@ -312,7 +307,6 @@ impl MockLlm {
                         )
                     };
                     let _ = sock.write_all(response.as_bytes()).await;
-                    eprintln!("[dbg] mock response written");
                 });
             }
         });

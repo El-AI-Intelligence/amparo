@@ -973,7 +973,6 @@ impl Agent {
 
         for step in 0..self.config.max_steps.saturating_sub(starting_steps) {
             steps_used = starting_steps + step + 1;
-            eprintln!("[dbg] iter {step} top");
 
             // ── Checkpoint (M7): once per iteration, before the LLM call —
             // a crash loses at most one turn. Failures warn, never fatal.
@@ -994,7 +993,6 @@ impl Agent {
                 },
                 None,
             );
-            eprintln!("[dbg] checkpoint {step} done");
 
             // ── Trim conversation to prevent unbounded growth ───────────────
             if conversation.len() > MAX_CONVERSATION_TAIL + 1 {
@@ -1076,11 +1074,9 @@ impl Agent {
                 web_search: None,
                 challenge_level: None,
             };
-            eprintln!("[dbg] infer send step {step}");
             let turn = match self.inference.complete_chat_stream(request).await {
                 Ok(stream) => match accumulate_turn(stream).await {
                     Ok(turn) => {
-                        eprintln!("[dbg] infer recv step {step}");
                         turn
                     }
                     Err(e) => {

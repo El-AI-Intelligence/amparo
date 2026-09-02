@@ -147,13 +147,11 @@ impl LedgerSink {
     /// Append one row; a write failure warns once per task and never
     /// propagates — the ledger is observational.
     fn append(&self, row: LedgerRow) {
-        eprintln!("[dbg] ledger append begin");
         if let Err(error) = self.store.append(&row) {
             if !self.warn_on_write.swap(true, Ordering::Relaxed) {
                 eprintln!("[ledger] row failed to persist: {error}");
             }
         }
-        eprintln!("[dbg] ledger append end");
     }
 }
 
