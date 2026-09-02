@@ -1123,7 +1123,12 @@ async fn chat_config_directory_roundtrip_per_user_workspace() {
     let output = child.wait_with_output().await.expect("wait for amparo chat");
     drop(env);
 
-    let per_user = ws.join("users/telegram-111");
+    // Built per-component, exactly as the driver derives the tenant
+    // workspace (`workspace_root/users/{platform}-{user_id}`) — joining
+    // the string "users/telegram-111" would keep the inner `/` on
+    // Windows, and `cmd /C cd` echoes the driver's all-`\` path, so a
+    // mixed-separator needle can never match.
+    let per_user = ws.join("users").join("telegram-111");
     assert!(
         done,
         "the per-user workspace round trip never completed; child stderr: {}",
@@ -1141,10 +1146,7 @@ async fn chat_config_directory_roundtrip_per_user_workspace() {
     let bodies = llm.bodies.lock().unwrap();
     // The bodies are serialized request JSON, so every backslash in the
     // echoed path appears doubled — the needle must match the body's
-    // encoding. A raw single-backslash path can never match on Windows,
-    // where every separator is a backslash (this failed on the first
-    // Windows CI run: the tool ran fine, the needle just wasn't in the
-    // body's encoding). Backslash doubling is the only JSON
+    // encoding, not the raw path. Backslash doubling is the only JSON
     // transformation a Windows path undergoes — quotes and control
     // characters cannot appear in Windows path components — and on Unix
     // the replace is a no-op.
