@@ -2012,7 +2012,12 @@ impl Agent {
     /// executions up to [`MAX_TOOL_RETRIES`] times.
     async fn execute_call(&self, call: &ToolCall) -> ToolResult {
         let execute = || async {
-            match self.registry.get_executor(&call.name) {
+            // Wall-clock the attempt so `[exec]` lines carry the real
+            // elapsed time — a hardcoded 0 would report multi-second
+            // calls (network fetch, builds) as instant. The MCP path's
+            // `registry.dispatch` already stamps this the same way.
+            let started = std::time::Instant::now();
+            let mut result = match self.registry.get_executor(&call.name) {
                 Some(executor) => executor.execute(call).await,
                 // Pre-checked by the gate; keep an honest fallback.
                 None => ToolResult {
@@ -2023,7 +2028,9 @@ impl Agent {
                     display_summary: "Unknown tool".to_string(),
                     duration_ms: 0,
                 },
-            }
+            };
+            result.duration_ms = started.elapsed().as_millis() as u64;
+            result
         };
         let mut result = execute().await;
         let mut retry = 0usize;
