@@ -1086,6 +1086,29 @@ impl Ui {
         let _ = out.flush();
     }
 
+    /// The `resolve_approval` recovery minus the decision line: restores
+    /// `Mode::Normal`, the cursor, and the lines buffered while the card
+    /// was up. Drop-based so a card future cancelled mid-wait (the fan-out
+    /// gate drops the local arm the moment the hub decides first) cannot
+    /// leave the surface buffering every later line forever.
+    fn restore_approval_mode(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let UiInner { out, state: st } = &mut *inner;
+        if !matches!(st.mode, Mode::Approval) {
+            return;
+        }
+        st.mode = Mode::Normal;
+        if self.controls {
+            let _ = out.write_all(b"\x1b[6 q\x1b]12;#e2e8f0\x07");
+        }
+        let pending = std::mem::take(&mut st.pending);
+        for p in pending {
+            let _ = out.write_all(p.as_bytes());
+            let _ = out.write_all(b"\n");
+        }
+        let _ = out.flush();
+    }
+
     /// The amber underline cursor + matching title-bar tint while an
     /// approval waits.
     fn cursor_approval(&self) {
@@ -1494,6 +1517,17 @@ struct TuiApprovalGate {
     slot: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Leaves the approval mode when a card future is dropped — the fan-out
+/// gate (R3) drops the local arm the moment the hub decides first, and
+/// the surface must not stay in card mode for the rest of the run.
+struct ApprovalCardGuard(Arc<Ui>);
+
+impl Drop for ApprovalCardGuard {
+    fn drop(&mut self) {
+        self.0.restore_approval_mode();
+    }
+}
+
 impl TuiApprovalGate {
     fn new(
         ui: Arc<Ui>,
@@ -1513,6 +1547,10 @@ impl ApprovalGate for TuiApprovalGate {
         let _slot = self.slot.lock().await;
         let paint = self.ui.paint();
         self.ui.set_mode(Mode::Approval);
+        // Cancellation-safe: if this future is dropped before the card
+        // resolves (the hub arm of the fan-out gate won the race), the
+        // guard restores the surface instead of leaving it in card mode.
+        let _guard = ApprovalCardGuard(Arc::clone(&self.ui));
         self.ui.set_title("amparo · awaiting approval");
         self.ui.cursor_approval();
         self.ui.bell();
@@ -3414,6 +3452,16 @@ mod tests {
     }
 
     #[test]
+    /// A card future dropped mid-wait (the fan-out gate's hub arm winning
+    /// the race) must not leave the surface buffering every line.
+    #[test]
+    fn approval_card_guard_restores_normal_mode_on_drop() {
+        let ui = Arc::new(Ui::new(Paint::with_colors(false), false, 80));
+        ui.set_mode(Mode::Approval);
+        drop(ApprovalCardGuard(Arc::clone(&ui)));
+        assert!(matches!(ui.mode(), Mode::Normal));
+    }
+
     fn parse_tui_flags_rejects_the_approval_wiring_with_tui_copy() {
         let cases = [
             ("--auto-approve", "human gate"),
