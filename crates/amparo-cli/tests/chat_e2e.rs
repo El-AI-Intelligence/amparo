@@ -325,6 +325,7 @@ fn tool_call_script(command: &str) -> Script {
 struct Recorded {
     method: String,
     path: String,
+    head: String,
     body: String,
 }
 
@@ -397,13 +398,13 @@ async fn serve_connection(
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     loop {
-        let Some((request_line, body)) = read_request(&mut reader).await? else {
+        let Some((head, request_line, body)) = read_request(&mut reader).await? else {
             return Ok(()); // clean close — reqwest ended the connection
         };
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let path = parts.next().unwrap_or("").to_string();
-        log.lock().unwrap().push(Recorded { method, path: path.clone(), body: body.clone() });
+        log.lock().unwrap().push(Recorded { method, path: path.clone(), head, body: body.clone() });
 
         let endpoint = path
             .rsplit_once('/')
@@ -440,10 +441,11 @@ async fn serve_connection(
 }
 
 /// Read one request: head (up to `\r\n\r\n`) plus the `Content-Length`
-/// body. `Ok(None)` = clean close between requests.
+/// body. Returns the raw head, the request line, and the body.
+/// `Ok(None)` = clean close between requests.
 async fn read_request(
     reader: &mut (impl AsyncRead + Unpin),
-) -> std::io::Result<Option<(String, String)>> {
+) -> std::io::Result<Option<(String, String, String)>> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -482,7 +484,11 @@ async fn read_request(
     }
     body.truncate(content_length);
     let request_line = head.lines().next().unwrap_or("").to_string();
-    Ok(Some((request_line, String::from_utf8_lossy(&body).to_string())))
+    Ok(Some((
+        head,
+        request_line,
+        String::from_utf8_lossy(&body).to_string(),
+    )))
 }
 
 /// Whether a form-url-encoded request body contains `needle` after
@@ -1350,5 +1356,187 @@ async fn chat_config_per_user_trust_ceiling() {
     assert!(
         !bodies.iter().any(|b| b.contains("\\\"exit_code\\\":0")),
         "the tool never executed (no success result reached the LLM): {bodies:?}"
+    );
+}
+
+// ── R3b receiver mode ─────────────────────────────────────────────────────────
+
+/// A scripted mock of the approval hub on 127.0.0.1:0: the pending
+/// listing (GET root) and the decide route (POST `{root}/{call_id}/decide`).
+struct MockHub {
+    addr: SocketAddr,
+    log: Arc<Mutex<Vec<Recorded>>>,
+}
+
+impl MockHub {
+    async fn start() -> Arc<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock hub");
+        let addr = listener.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(serve_hub(listener, Arc::clone(&log)));
+        Arc::new(Self { addr, log })
+    }
+
+    /// The `--receiver` URL — the hub's approvals root.
+    fn url(&self) -> String {
+        format!("http://{}/api/approvals", self.addr)
+    }
+
+    /// Every recorded request, in arrival order.
+    fn log(&self) -> Vec<Recorded> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+/// Accept connections and answer each on its own task.
+async fn serve_hub(listener: tokio::net::TcpListener, log: Arc<Mutex<Vec<Recorded>>>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else { return };
+        tokio::spawn(serve_hub_connection(stream, Arc::clone(&log)));
+    }
+}
+
+/// Answer requests on one connection until the client closes it — the
+/// same repeat-per-connection shape as the Bot API mock, because reqwest
+/// pools connections.
+async fn serve_hub_connection(
+    stream: tokio::net::TcpStream,
+    log: Arc<Mutex<Vec<Recorded>>>,
+) -> std::io::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    loop {
+        let Some((head, request_line, body)) = read_request(&mut reader).await? else {
+            return Ok(());
+        };
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts.next().unwrap_or("").to_string();
+        log.lock().unwrap().push(Recorded { method: method.clone(), path: path.clone(), head, body: body.clone() });
+
+        let answer = match (method.as_str(), path.as_str()) {
+            ("GET", "/api/approvals") => json!({"approvals": [{
+                "call_id": "call_r3",
+                "tool_name": "run_command",
+                "arguments": {"command": "git push origin main"},
+                "reasons": ["policy escalated: needs human review"],
+                "blast_radius": "destructive",
+                "session_label": "sub-agent sess-123.1 of task sess-123",
+                "receivedAt": "2026-09-04T00:00:00Z",
+                "expiresAt": "2026-09-05T00:00:00Z",
+                "status": "pending",
+                "decision": null,
+                "auto": false
+            }]}),
+            ("POST", "/api/approvals/call_r3/decide") => json!({
+                "call_id": "call_r3",
+                "status": "decided",
+                "decision": true
+            }),
+            _ => json!({"error": "unknown route"}),
+        };
+        write_response(&mut writer, &answer.to_string()).await?;
+    }
+}
+
+/// The R3b relay end to end against the shipped binary: NO inference or
+/// policy env is set at all (the receiver has no way to execute
+/// anything), the hub listing becomes an inline-keyboard approval in the
+/// operator chat, the press POSTs the decide route with the
+/// approval-scoped bearer, and the message is edited to the latched
+/// outcome.
+#[tokio::test]
+async fn receiver_relays_the_hub_listing_and_posts_the_press_back() {
+    let _guard = LOCK.lock().await;
+    let hub = MockHub::start().await;
+    let telegram = MockTelegram::start().await;
+    telegram.push_update(callback_update(103, 111, 111, "approve:call_r3"));
+
+    let env = set_env(
+        &[
+            ("AMPARO_CHAT_TELEGRAM_TOKEN", "test-token"),
+            ("AMPARO_CHAT_ALLOWLIST", "111"),
+            ("AMPARO_CHAT_TELEGRAM_BASE", telegram.url().as_str()),
+            ("AMPARO_APPROVAL_TOKEN", "hub-token-1"),
+        ],
+        &[
+            "AMPARO_INFERENCE_URL",
+            "AMPARO_INFERENCE_MODEL",
+            "AMPARO_INFERENCE_KEY",
+            "AMPARO_POLICY_URL",
+            "AMPARO_WORKSPACE",
+        ],
+    );
+    let mut child = tokio::process::Command::new(bin())
+        .args(["chat", "telegram", "--receiver", hub.url().as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn amparo chat receiver");
+
+    let sent = wait_until(|| {
+        telegram.log().iter().any(|r| {
+            r.path.contains("/sendMessage")
+                && body_contains(&r.body, "approve:call_r3")
+                && body_contains(&r.body, "deny:call_r3")
+        })
+    })
+    .await;
+    let pressed = wait_until(|| {
+        hub.log().iter().any(|r| {
+            r.method == "POST"
+                && r.path == "/api/approvals/call_r3/decide"
+                && r.body.contains("\"decision\":true")
+        })
+    })
+    .await;
+    let edited = wait_until(|| {
+        telegram.log().iter().any(|r| {
+            r.path.contains("/editMessageText") && body_contains(&r.body, "Approved")
+        })
+    })
+    .await;
+    let answered = wait_until(|| {
+        telegram.log().iter().any(|r| r.path.contains("/answerCallbackQuery"))
+    })
+    .await;
+
+    let _ = child.kill().await;
+    let output = child.wait_with_output().await.expect("wait for receiver");
+    drop(env);
+
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        sent,
+        "the listing became an approval message in the operator chat; child stderr: {err}"
+    );
+    assert!(
+        pressed,
+        "the press POSTed the decide route; hub log: {:#?}",
+        hub.log()
+    );
+    assert!(edited, "the approval message was edited to the outcome");
+    assert!(answered, "the callback was answered so the spinner stops");
+
+    let hub_log = hub.log();
+    let listing = hub_log
+        .iter()
+        .find(|r| r.method == "GET" && r.path == "/api/approvals")
+        .expect("the receiver polled the listing");
+    assert!(
+        listing.head.to_ascii_lowercase().contains("authorization: bearer hub-token-1"),
+        "the listing carries the approval-scoped bearer: {}",
+        listing.head
+    );
+    let decide = hub_log
+        .iter()
+        .find(|r| r.method == "POST" && r.path == "/api/approvals/call_r3/decide")
+        .expect("the decide POST was recorded");
+    assert!(
+        decide.head.to_ascii_lowercase().contains("authorization: bearer hub-token-1"),
+        "the press carries the same approval-scoped bearer: {}",
+        decide.head
     );
 }
