@@ -63,6 +63,7 @@ pub mod agent;
 pub mod approval;
 pub mod cases;
 pub mod events;
+pub mod fanout_approval;
 pub mod ledger_sink;
 pub mod preflight;
 pub mod qc;
@@ -81,6 +82,7 @@ pub use agent::{
 };
 pub use approval::{ApprovalGate, ApprovalRequest, AutoApprove, AutoDeny};
 pub use cases::{evidence_section, CaseLibrary, EvidenceCase};
+pub use fanout_approval::FanOutApprovalGate;
 pub use events::{
     format_event, format_rollback, truncate, AgentEvent, EventSink, FanoutSink, InMemoryEventSink,
     TRUNCATE,

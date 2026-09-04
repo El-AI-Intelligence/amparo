@@ -39,7 +39,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use amparo_agent::{
     estimate_tokens, format_cost_line, format_event, AgentEvent, AgentReport, ApprovalGate,
-    ApprovalRequest, Checkpoint, CheckpointStore, EventSink, JsonCheckpointStore, TaskStatus,
+    ApprovalRequest, Checkpoint, CheckpointStore, EventSink, FanOutApprovalGate,
+    JsonCheckpointStore, TaskStatus,
 };
 use amparo_policy::PolicyEngine;
 use amparo_tools::{Memory, PathPolicy};
@@ -1640,17 +1641,43 @@ fn maybe_reprint_chain(ui: &Ui, live: &Option<Live>) {
 // ───────────────────────────────────────────────────────────── wiring ──
 
 /// Builds the TUI's surface: the TUI sink, the TUI approval gate, and the
-/// shared banner/line hooks.
+/// shared banner/line hooks. With an `--approval-endpoint` (R3) the gate
+/// is a [`FanOutApprovalGate`]: the cards render here as always, and the
+/// hub's deny-wins latch is the final word either surface asks for.
 fn tui_surface(
     ui: &Arc<Ui>,
     task_id: &str,
     keys: &Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<char>>>>,
+    endpoint: Option<&str>,
 ) -> (Surface, Arc<TuiSink>) {
     let sink = Arc::new(TuiSink::new(Arc::clone(ui), task_id.to_string()));
-    let gate = Arc::new(TuiApprovalGate::new(Arc::clone(ui), Arc::clone(keys)));
+    let (gate, approval_desc): (Arc<dyn ApprovalGate>, String) = match endpoint {
+        Some(url) => {
+            let local: Arc<dyn ApprovalGate> =
+                Arc::new(TuiApprovalGate::new(Arc::clone(ui), Arc::clone(keys)));
+            let mut fan = FanOutApprovalGate::new(local, url.to_string());
+            // Tokens ride env only (never argv): the approval-scoped
+            // secret a non-loopback hub checks on the publish/decision
+            // routes. Absent or empty, the gate sends no header and a
+            // remote hub fails it closed at the publish.
+            if let Ok(token) = std::env::var("AMPARO_APPROVAL_TOKEN") {
+                if !token.is_empty() {
+                    fan = fan.with_token(token);
+                }
+            }
+            (
+                Arc::new(fan),
+                format!("you, here and at {url} — deny wins at the hub"),
+            )
+        }
+        None => (
+            Arc::new(TuiApprovalGate::new(Arc::clone(ui), Arc::clone(keys))),
+            "you, at this terminal — 60s fail-closed".to_string(),
+        ),
+    };
     let surface = Surface {
         events: Arc::clone(&sink) as Arc<dyn EventSink>,
-        approval: Some((gate, "you, at this terminal — 60s fail-closed".to_string())),
+        approval: Some((gate, approval_desc)),
         banner: tui_banner,
         line: tui_line,
         notice: tui_notice,
@@ -1667,7 +1694,7 @@ async fn boot_wire(
     live: &Arc<Mutex<Option<Live>>>,
     keys: &Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<char>>>>,
 ) -> Result<(), String> {
-    let (surface, _sink) = tui_surface(ui, "boot", keys);
+    let (surface, _sink) = tui_surface(ui, "boot", keys, flags.approval_endpoint.as_deref());
     let mut wired = run::wire_with(flags, run::new_task_id(), surface).await?;
     update_live(ui, live, &wired);
     let fires = wired.schedule_fires.drain(..).collect::<Vec<_>>();
@@ -1695,7 +1722,7 @@ async fn run_one_task(
         Some(c) => c.task_id.clone(),
         None => run::new_task_id(),
     };
-    let (surface, _sink) = tui_surface(ui, &task_id, keys);
+    let (surface, _sink) = tui_surface(ui, &task_id, keys, flags.approval_endpoint.as_deref());
     let mut wired = tokio::select! {
         r = run::wire_with(flags, task_id.clone(), surface) => r?,
         _ = cancel.changed() => return Ok(()),
@@ -2452,7 +2479,9 @@ enum ParseTuiResult {
 }
 
 /// Parses `amparo tui` flags: the `amparo run` set minus the approval
-/// wiring, which the TUI replaces with itself.
+/// wiring, which the TUI replaces with itself — except
+/// `--approval-endpoint`, which (R3) names the hub the fan-out gate
+/// publishes the TUI's cards to.
 fn parse_tui_flags(args: impl Iterator<Item = String>) -> ParseTuiResult {
     let args: Vec<String> = args.collect();
     // TUI-specific rejections first, so the messages speak the TUI's
@@ -2471,10 +2500,11 @@ fn parse_tui_flags(args: impl Iterator<Item = String>) -> ParseTuiResult {
                 )
             }
             "--approval-endpoint" => {
-                return ParseTuiResult::Error(
-                    "--approval-endpoint has no place in `amparo tui` — approvals render here, not on a server"
-                        .to_string(),
-                )
+                // R3: the TUI keeps rendering its cards — the endpoint is
+                // the *publication target* the fan-out gate posts to, so
+                // other surfaces (the web app, the Telegram receiver) can
+                // answer the same request. Parse it like run does.
+                continue;
             }
             "--resume" => {
                 return ParseTuiResult::Error(
@@ -2524,10 +2554,13 @@ FLAGS (the `amparo run` set, minus the approval wiring):
   --max-sub-agents N       swarm budget (0 = off)
   --session-id ID          policy-engine session tag
   --webhook-url URL        send_notification transport
+  --approval-endpoint URL  publish approval cards to the hub (R3) — this
+                           terminal and the other surfaces answer the
+                           same request, and a deny always wins
   --help                   this help
 
-The TUI is the human gate: --auto-approve, --auto-deny,
---approval-endpoint and --resume are rejected here.
+The TUI is the human gate: --auto-approve, --auto-deny and --resume
+are rejected here.
 
 PIPED: `echo \"task\" | amparo tui` runs one task per stdin line
 (zero escapes; approvals fail closed). /resume needs a terminal.";
@@ -3385,7 +3418,6 @@ mod tests {
         let cases = [
             ("--auto-approve", "human gate"),
             ("--auto-deny", "human gate"),
-            ("--approval-endpoint", "approvals render here"),
             ("--resume", "picker"),
         ];
         for (flag, needle) in cases {
@@ -3393,6 +3425,21 @@ mod tests {
                 ParseTuiResult::Error(m) => assert!(m.contains(needle), "{flag}: {m}"),
                 other => panic!("{flag} accepted: {:?}", variant(&other)),
             }
+        }
+    }
+
+    #[test]
+    fn parse_tui_flags_accepts_an_approval_endpoint_as_the_publication_target() {
+        // R3: the endpoint names the hub the fan-out gate publishes to —
+        // the cards still render here.
+        match parse_tui_flags(args(&["--approval-endpoint", "http://127.0.0.1:47910/approvals"])) {
+            ParseTuiResult::Run(flags) => {
+                assert_eq!(
+                    flags.approval_endpoint.as_deref(),
+                    Some("http://127.0.0.1:47910/approvals")
+                );
+            }
+            other => panic!("endpoint rejected: {:?}", variant(&other)),
         }
     }
 

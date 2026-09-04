@@ -170,8 +170,8 @@ pub fn valid_approval_endpoint(url: &str) -> bool {
 /// unchanged; anything else becomes `%XX` — against the first-party
 /// endpoint (which accepts only that charset) a hostile id still 404s and
 /// the gate denies, and against query-parsing endpoints the injection is
-/// neutralized.
-fn encode_path_segment(id: &str) -> String {
+/// neutralized. Shared with the fan-out gate's decision route (R3).
+pub(crate) fn encode_path_segment(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     for b in id.bytes() {
         match b {
