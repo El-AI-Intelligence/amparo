@@ -49,6 +49,9 @@ use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, watch};
 
+#[cfg(unix)]
+use crate::raw::{enter_raw_mode, read_byte, RawGuard};
+use crate::raw::term_width;
 use crate::run::{self, BannerInfo, RunFlags, Surface, WiredRun};
 
 /// How long an approval waits for a key before it denies itself.
@@ -2621,60 +2624,8 @@ pub(crate) async fn dispatch(args: impl Iterator<Item = String>) {
 }
 
 // ─────────────────────────────────────────────────── terminal control ──
-
-#[cfg(unix)]
-fn term_width() -> Option<usize> {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            Some(ws.ws_col as usize)
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn term_width() -> Option<usize> {
-    None
-}
-
-/// Restores the original terminal settings on drop.
-#[cfg(unix)]
-struct RawGuard {
-    orig: libc::termios,
-}
-
-/// Enters raw mode for the reader: no canonical line, no echo, no
-/// signals, no flow control — but output processing stays, and reads
-/// return within 0.1s so a lone ESC resolves as the Esc key.
-#[cfg(unix)]
-fn enter_raw_mode() -> Option<RawGuard> {
-    unsafe {
-        let mut orig: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
-            return None;
-        }
-        let mut raw = orig;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
-        raw.c_iflag &= !(libc::IXON | libc::ICRNL);
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 1;
-        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
-            return None;
-        }
-        Some(RawGuard { orig })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig);
-        }
-    }
-}
+// Raw mode, the byte reader and the width probe live in `crate::raw`,
+// shared with the `code` surface.
 
 /// The raw-mode slot the `!` escape borrows: the child runs on a cooked
 /// terminal, and raw mode re-enters afterwards. Empty in piped mode and
@@ -2710,23 +2661,6 @@ impl RawSlot {
     #[cfg(unix)]
     fn reenter(&self) {
         *self.guard.lock().unwrap() = enter_raw_mode();
-    }
-}
-
-#[cfg(unix)]
-use std::io::Read;
-
-/// One byte, or `None` on a read timeout (VMIN=1, VTIME=1).
-#[cfg(unix)]
-fn read_byte(stdin: &mut std::io::Stdin) -> Option<u8> {
-    let mut b = [0u8; 1];
-    loop {
-        match stdin.read(&mut b) {
-            Ok(0) => return None,
-            Ok(_) => return Some(b[0]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
     }
 }
 
@@ -3451,7 +3385,6 @@ mod tests {
         assert_eq!(ago(now - 172800), "2d ago");
     }
 
-    #[test]
     /// A card future dropped mid-wait (the fan-out gate's hub arm winning
     /// the race) must not leave the surface buffering every line.
     #[test]
@@ -3462,6 +3395,7 @@ mod tests {
         assert!(matches!(ui.mode(), Mode::Normal));
     }
 
+    #[test]
     fn parse_tui_flags_rejects_the_approval_wiring_with_tui_copy() {
         let cases = [
             ("--auto-approve", "human gate"),

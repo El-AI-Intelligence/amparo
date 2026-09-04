@@ -32,6 +32,10 @@
 //!   the whole gate chain rendered live — banner, gutter rows, approval
 //!   cards, status line. Piped, it degrades to one task per stdin line with
 //!   zero escapes.
+//! - `amparo code [DIR]` is the coding-terminal surface (M13): an
+//!   alternate-screen file tree with the workspace's git marks, file
+//!   opening, and (later) diff-accept editing and the run/build pane.
+//!   Piped, it degrades to a plain-text report with zero escapes.
 //! - `amparo wizard` writes the first-run profile: four ruled steps —
 //!   workspace, LLM endpoint, optional Guardrail policy (wire check URL,
 //!   key, console URL), optional Engram memory URL — saved locally (mode
@@ -44,10 +48,17 @@
 //! exception: it renders its whole surface on stdout.
 
 mod approve;
+// The coding surface's interactive reader is Unix-only by design — on
+// Windows the surface runs piped (the report), so the machinery
+// compiles but is never constructed. Allow the dead code there instead
+// of faking a Windows reader.
+#[cfg_attr(not(unix), allow(dead_code, unused_variables))]
+mod code;
 mod doctor;
 mod events;
 mod notebook;
 mod privacy;
+mod raw;
 mod run;
 mod schedule;
 mod skill;
@@ -75,6 +86,7 @@ USAGE:
   amparo doctor [FLAGS]
   amparo schedule list|cancel [FLAGS]
   amparo tui [FLAGS]
+  amparo code [DIR]
   amparo wizard
   amparo version
 
@@ -95,6 +107,8 @@ SUBCOMMANDS:
   tui        the interactive terminal surface: one prompt, the whole gate
              chain rendered live (banner, gutter rows, approval cards,
              status line); piped: one task per stdin line
+  code       the coding-terminal surface: an alternate-screen file tree
+             with git marks; piped: a plain-text report
   wizard     the first-run profile: workspace, LLM endpoint, optional
              Guardrail policy (check URL, key, console URL), optional
              Engram memory URL — saved locally (0600), read back at boot
@@ -103,8 +117,8 @@ SUBCOMMANDS:
 
 Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help`,
 `amparo skill --help`, `amparo notebook --help`, `amparo privacy --help`,
-`amparo doctor --help`, `amparo schedule --help`, `amparo tui --help` or
-`amparo wizard --help` for flags.";
+`amparo doctor --help`, `amparo schedule --help`, `amparo tui --help`,
+`amparo code --help` or `amparo wizard --help` for flags.";
 
 #[tokio::main]
 async fn main() {
@@ -128,6 +142,7 @@ async fn main() {
         "doctor" => doctor::dispatch(args).await,
         "schedule" => schedule::dispatch(args),
         "tui" => tui::dispatch(args).await,
+        "code" => code::dispatch(args).await,
         "wizard" => wizard::dispatch(args).await,
         "version" | "-V" | "--version" => println!("amparo {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{USAGE}"),

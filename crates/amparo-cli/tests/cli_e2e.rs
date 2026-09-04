@@ -5120,3 +5120,66 @@ async fn profile_policy_url_wires_the_engine_and_allow_all_suppresses_it() {
     drop(mock);
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+#[tokio::test]
+async fn code_help_exits_0() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["code", "--help"]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(stdout(&out).contains("amparo code"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("amparo code [DIR]"), "{}", stdout(&out));
+}
+
+#[tokio::test]
+async fn code_report_piped_zero_escapes() {
+    let _guard = LOCK.lock().await;
+    // A unique scratch tree under the shared workspace (the #174 lesson:
+    // never share a fixture path across tests that may run in parallel).
+    let tree = workspace().join("code-e2e-tree");
+    std::fs::remove_dir_all(&tree).ok();
+    std::fs::create_dir_all(tree.join("src")).expect("src dir");
+    std::fs::write(tree.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+    std::fs::write(tree.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("Cargo.toml");
+    let prior = set_workspace_env();
+
+    // stdin is null (piped), so the surface degrades to the report.
+    let out = run_with(&["code", tree.to_str().expect("utf8 path")]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let text = stdout(&out);
+    assert!(text.contains("amparo code"), "{text}");
+    assert!(text.contains("src"), "{text}");
+    assert!(text.contains("main.rs"), "{text}");
+    assert!(
+        !text.contains("\x1b["),
+        "piped report must be escape-free:\n{text}"
+    );
+
+    restore_workspace_env(prior);
+    std::fs::remove_dir_all(&tree).ok();
+}
+
+#[tokio::test]
+async fn code_missing_root_exits_1() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["code", "/nonexistent-amparo-root-xyz"]).await;
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("amparo code"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[tokio::test]
+async fn code_two_dirs_exit_2() {
+    let _guard = LOCK.lock().await;
+    let out = run_with(&["code", "a", "b"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("one DIR at most"),
+        "{}",
+        stderr(&out)
+    );
+}
