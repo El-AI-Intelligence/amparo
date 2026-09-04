@@ -445,6 +445,7 @@ fn flags() -> ChatFlags {
         trust_ceiling: ToolTrustTier::SystemControl,
         chat_config: None,
         growth: false,
+        receiver: None,
     }
 }
 

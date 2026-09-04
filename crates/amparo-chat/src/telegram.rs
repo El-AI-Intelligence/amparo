@@ -116,7 +116,7 @@ impl TelegramTransport {
     }
 
     /// Answer one callback query so the client's spinner stops.
-    async fn answer_callback(&self, callback_id: &str, text: &str) -> Result<(), ChatError> {
+    pub(crate) async fn answer_callback(&self, callback_id: &str, text: &str) -> Result<(), ChatError> {
         let params = [("callback_query_id", callback_id), ("text", text)];
         let result = self.api_post("answerCallbackQuery", &params).await?;
         let _ = Self::checked("answerCallbackQuery", result)?;
@@ -248,6 +248,35 @@ impl ChatTransport for TelegramTransport {
     }
 
     async fn receive(self: Arc<Self>, driver: Arc<ChatDriver>) -> Result<(), ChatError> {
+        let this = Arc::clone(&self);
+        self.pump(move |update| {
+            let this = Arc::clone(&this);
+            let driver = Arc::clone(&driver);
+            async move {
+                if let Some(message) = &update.message {
+                    this.handle_message(message, &driver).await;
+                }
+                if let Some(query) = &update.callback_query {
+                    this.handle_callback(query, &driver).await;
+                }
+            }
+        })
+        .await
+    }
+}
+
+impl TelegramTransport {
+    /// The `getUpdates` long-poll loop shared by the driver mode and the
+    /// R3b receiver: `handle` is called with every confirmed update, in
+    /// order. The loop exits on Ctrl-C or a fatal token rejection (401/409)
+    /// and retries everything else after 5 seconds.
+    pub(crate) async fn pump<Fut>(
+        self: Arc<Self>,
+        mut handle: impl FnMut(Update) -> Fut,
+    ) -> Result<(), ChatError>
+    where
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let mut offset: Option<i64> = None;
         loop {
             let mut params: Vec<(String, String)> = vec![
@@ -318,12 +347,7 @@ impl ChatTransport for TelegramTransport {
                 // Confirmed updates are never re-delivered: the next poll
                 // starts one past the last id we saw.
                 offset = Some(update.update_id + 1);
-                if let Some(message) = &update.message {
-                    self.handle_message(message, &driver).await;
-                }
-                if let Some(query) = &update.callback_query {
-                    self.handle_callback(query, &driver).await;
-                }
+                handle(update).await;
             }
         }
     }
@@ -343,19 +367,25 @@ struct GetUpdatesResponse {
 }
 
 /// One update: a message, a callback query, or (rarely) both.
+///
+/// `pub(crate)` so the R3b receiver can reuse [`TelegramTransport::pump`]
+/// and the wire structs with it.
 #[derive(Debug, Deserialize)]
-struct Update {
+pub(crate) struct Update {
+    /// The Telegram update id — the pump's offset cursor; a handler
+    /// never needs it.
+    #[allow(dead_code)]
     update_id: i64,
     #[serde(default)]
-    message: Option<Message>,
+    pub(crate) message: Option<Message>,
     #[serde(default)]
-    callback_query: Option<CallbackQuery>,
+    pub(crate) callback_query: Option<CallbackQuery>,
 }
 
 /// A chat message. `from` is absent for channel posts and `text` for
 /// non-text messages — both are skipped by the receive loop.
 #[derive(Debug, Deserialize)]
-struct Message {
+pub(crate) struct Message {
     /// Kept for wire fidelity; inbound message ids are not used by the
     /// receive loop (outbound ids come from sendMessage responses).
     #[allow(dead_code)]
@@ -369,30 +399,32 @@ struct Message {
 
 /// A chat — `id` is the chat identifier used everywhere outbound.
 #[derive(Debug, Deserialize)]
-struct Chat {
+pub(crate) struct Chat {
     id: i64,
 }
 
 /// A Telegram user — `id` becomes the `user_id` of a [`ChatRef`].
 #[derive(Debug, Deserialize)]
-struct User {
-    id: i64,
+pub(crate) struct User {
+    pub(crate) id: i64,
 }
 
 /// A callback query — the wire form of an inline-button press.
 #[derive(Debug, Deserialize)]
-struct CallbackQuery {
-    id: String,
-    from: User,
+pub(crate) struct CallbackQuery {
+    pub(crate) id: String,
+    pub(crate) from: User,
     #[serde(default)]
-    message: Option<Message>,
+    pub(crate) message: Option<Message>,
     #[serde(default)]
-    data: Option<String>,
+    pub(crate) data: Option<String>,
 }
 
 /// Parse an inline-button payload (`approve:<id>` / `deny:<id>`) into the
 /// approval id and the decision. Anything else is not one of our buttons.
-fn parse_button(data: &Option<String>) -> Option<(String, bool)> {
+/// Shared with the R3b receiver, whose buttons carry the hub call_id in
+/// the same grammar.
+pub(crate) fn parse_button(data: &Option<String>) -> Option<(String, bool)> {
     let data = data.as_deref()?;
     let (action, id) = data.split_once(':')?;
     match action {
@@ -421,7 +453,7 @@ const DEFAULT_TELEGRAM_BASE: &str = "https://api.telegram.org";
 
 /// The Bot API base [`serve`] roots the transport at: the value of
 /// `AMPARO_CHAT_TELEGRAM_BASE`, or [`DEFAULT_TELEGRAM_BASE`] when unset.
-fn telegram_base() -> String {
+pub(crate) fn telegram_base() -> String {
     std::env::var("AMPARO_CHAT_TELEGRAM_BASE").unwrap_or_else(|_| DEFAULT_TELEGRAM_BASE.to_string())
 }
 

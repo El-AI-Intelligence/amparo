@@ -4,15 +4,17 @@
 //! [`parse_chat_flags`] follows the `amparo run` idiom: one positional
 //! platform (`telegram` | `discord` | `slack`), then `--policy-url` /
 //! `--allow-all` (mutually exclusive), `--auto-approve`,
-//! `--trust-ceiling`, `--chat-config` and `--help`. [`build_driver`] is the
-//! shared assembly the adapters use so Discord and Slack do not duplicate
-//! it: the inference provider from the environment (fail-closed, with the
-//! same README-pointer hint as `amparo run`), the policy match with
-//! byte-identical strings to `amparo run`, the shared tool registry, and
-//! the tenancy — a `--chat-config`/`AMPARO_CHAT_CONFIG` TOML tenant
-//! directory (per-user workspaces and ceilings), or the
+//! `--trust-ceiling`, `--chat-config`, `--receiver` and `--help`.
+//! [`build_driver`] is the shared assembly the adapters use so Discord and
+//! Slack do not duplicate it: the inference provider from the environment
+//! (fail-closed, with the same README-pointer hint as `amparo run`), the
+//! policy match with byte-identical strings to `amparo run`, the shared
+//! tool registry, and the tenancy — a `--chat-config`/`AMPARO_CHAT_CONFIG`
+//! TOML tenant directory (per-user workspaces and ceilings), or the
 //! `AMPARO_CHAT_ALLOWLIST` user allowlist — absent or empty means nobody,
-//! and the startup warning says so.
+//! and the startup warning says so. `--receiver` switches Telegram to the
+//! R3b approval receiver ([`crate::receiver`]), which needs none of that
+//! assembly.
 //!
 //! Fail-closed everywhere: a missing bot token is exit 2, a missing
 //! inference configuration is exit 1, a config file that fails to load is
@@ -56,6 +58,8 @@ FLAGS:
   --trust-ceiling T   observational | local_mutating |
                       external_effector | system_control (default)
   --chat-config PATH  load the tenant directory from a TOML config file
+  --receiver URL      telegram: relay the hub's pending approvals to the
+                      operator chat (no inference — see RECEIVER MODE)
   --growth            record PII-stripped run records (off by default)
   --no-growth         never record (overrides an earlier --growth)
   --help              print this help and exit
@@ -78,7 +82,19 @@ recorded as a PII-stripped JSON line at
 <workspace>/.amparo/notebook/records.jsonl, tagged platform:user_id (task
 text, tool-sequence hash, per-call gate log, verification, truncated
 answer). Recording is off by default — growth never happens unless asked
-for — and the last --growth/--no-growth wins.";
+for — and the last --growth/--no-growth wins.
+
+RECEIVER MODE (`amparo chat telegram --receiver URL`): the bot relays
+approvals instead of serving tasks — it lists the hub's pending approvals
+(URL = the hub's /api/approvals root), sends each to the operator chat
+with inline Approve/Deny buttons, and posts the press back to the hub.
+Deny wins at the hub, so a deny from any surface dominates. The operators
+are the chats listed in AMPARO_CHAT_ALLOWLIST (comma-separated ids, one
+per private chat); the hub credentials are AMPARO_APPROVAL_TOKEN, and the
+bot token stays AMPARO_CHAT_TELEGRAM_TOKEN. No inference or policy is
+needed — --policy-url, --allow-all, --auto-approve, --trust-ceiling and
+--growth do not apply, and --chat-config is rejected (the allowlist is
+the operator list).";
 
 /// The messaging platform `amparo chat` serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +145,11 @@ pub struct ChatFlags {
     pub chat_config: Option<PathBuf>,
     /// Record PII-stripped run records to the workspace notebook.
     pub growth: bool,
+    /// The R3b receiver-mode hub URL (the hub's `/api/approvals` root) —
+    /// `Some` switches `amparo chat telegram` from the driver loop to the
+    /// approval receiver: pending approvals are relayed to the operator
+    /// chat with inline buttons, and presses are posted back to the hub.
+    pub receiver: Option<String>,
 }
 
 impl Default for ChatFlags {
@@ -141,6 +162,7 @@ impl Default for ChatFlags {
             trust_ceiling: ToolTrustTier::SystemControl,
             chat_config: None,
             growth: false,
+            receiver: None,
         }
     }
 }
@@ -206,6 +228,14 @@ pub fn parse_chat_flags(args: impl Iterator<Item = String>) -> ParseChatResult {
                 None => return ParseChatResult::Error("--chat-config requires a path".into()),
             },
             "--auto-approve" => flags.auto_approve = true,
+            "--receiver" => match args.next() {
+                Some(url) => flags.receiver = Some(url),
+                None => {
+                    return ParseChatResult::Error(
+                        "--receiver requires the hub approvals URL".into(),
+                    )
+                }
+            },
             "--trust-ceiling" => match args.next() {
                 Some(tier) => match tier.as_str() {
                     "observational" => flags.trust_ceiling = ToolTrustTier::Observational,
@@ -238,6 +268,23 @@ pub fn parse_chat_flags(args: impl Iterator<Item = String>) -> ParseChatResult {
         1 => match Platform::parse(&positional[0]) {
             Some(platform) => {
                 flags.platform = platform;
+                // The R3b receiver is a Telegram mode: with any other
+                // platform the flag has no meaning and the URL is rejected
+                // here (a decision rides on that wire — refuse a typo at
+                // flag time, not as a hub failure later).
+                if flags.receiver.is_some() && platform != Platform::Telegram {
+                    return ParseChatResult::Error(
+                        "--receiver is the Telegram receiver mode (platform telegram)".into(),
+                    );
+                }
+                if let Some(url) = &flags.receiver {
+                    if !amparo_agent::valid_approval_endpoint(url) {
+                        return ParseChatResult::Error(
+                            "--receiver must be an http(s) URL (the hub's /api/approvals root)"
+                                .into(),
+                        );
+                    }
+                }
                 ParseChatResult::Serve(flags)
             }
             None => ParseChatResult::Error(format!(
@@ -399,7 +446,13 @@ pub async fn build_driver(
 /// Serve `flags.platform` until Ctrl-C or a fatal failure.
 pub async fn serve(flags: &ChatFlags) -> Result<(), ChatServeError> {
     match flags.platform {
-        Platform::Telegram => crate::telegram::serve(flags).await,
+        Platform::Telegram => {
+            if flags.receiver.is_some() {
+                crate::receiver::serve(flags).await
+            } else {
+                crate::telegram::serve(flags).await
+            }
+        }
         Platform::Discord => crate::discord::serve(flags)
             .await
             .map_err(|e| ChatServeError::new(e.to_string(), 1)),
@@ -429,7 +482,8 @@ pub async fn dispatch(args: impl Iterator<Item = String>) {
 
 /// The user allowlist from `AMPARO_CHAT_ALLOWLIST`: comma-split, trimmed,
 /// empties dropped. Absent or empty yields an empty set — deny everyone.
-fn allowlist_from_env() -> HashSet<String> {
+/// Also the R3b receiver's operator list (one id per private chat).
+pub(crate) fn allowlist_from_env() -> HashSet<String> {
     let Ok(raw) = std::env::var("AMPARO_CHAT_ALLOWLIST") else {
         return HashSet::new();
     };
@@ -594,7 +648,58 @@ mod tests {
         assert!(!f.allow_all);
         assert!(!f.auto_approve);
         assert!(!f.growth);
+        assert!(f.receiver.is_none());
         assert_eq!(f.trust_ceiling, ToolTrustTier::SystemControl);
+    }
+
+    #[test]
+    fn receiver_flag_parses_for_telegram_and_requires_a_url() {
+        let f = flags(parse(&[
+            "telegram",
+            "--receiver",
+            "https://console.example/api/approvals",
+        ]));
+        assert_eq!(
+            f.receiver.as_deref(),
+            Some("https://console.example/api/approvals")
+        );
+        assert_eq!(
+            error(parse(&["telegram", "--receiver"])),
+            "--receiver requires the hub approvals URL"
+        );
+        assert_eq!(
+            error(parse(&["telegram", "--receiver", "not a url"])),
+            "--receiver must be an http(s) URL (the hub's /api/approvals root)"
+        );
+        assert_eq!(
+            error(parse(&["telegram", "--receiver", "http://"])),
+            "--receiver must be an http(s) URL (the hub's /api/approvals root)"
+        );
+    }
+
+    #[test]
+    fn receiver_is_telegram_only() {
+        assert_eq!(
+            error(parse(&["discord", "--receiver", "http://hub/api/approvals"])),
+            "--receiver is the Telegram receiver mode (platform telegram)"
+        );
+        assert_eq!(
+            error(parse(&["slack", "--receiver", "http://hub/api/approvals"])),
+            "--receiver is the Telegram receiver mode (platform telegram)"
+        );
+    }
+
+    #[test]
+    fn usage_documents_receiver_mode() {
+        assert!(CHAT_USAGE.contains("--receiver"), "usage lists the flag");
+        assert!(
+            CHAT_USAGE.contains("RECEIVER MODE"),
+            "usage documents the mode"
+        );
+        assert!(
+            CHAT_USAGE.contains("AMPARO_APPROVAL_TOKEN"),
+            "usage documents the hub token"
+        );
     }
 
     #[test]

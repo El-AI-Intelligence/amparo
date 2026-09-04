@@ -14,7 +14,7 @@
 
 use amparo_tools::RollbackSpec;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::preflight::BlastRadius;
@@ -25,7 +25,13 @@ use crate::preflight::BlastRadius;
 /// `docs/web-surface.md` §3): the gate POSTs exactly these fields —
 /// `call_id`, `tool_name`, `arguments`, `reasons`, `blast_radius`,
 /// `session_label`, `rollback` — to the approvals endpoint.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Deserialization accepts that same shape back (R3b: the Telegram
+/// receiver parses the hub's listing entries into a request so the
+/// approval copy renders identically on every surface). Missing optional
+/// fields are `None` and fields the hub adds alongside (status, timestamps)
+/// are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     /// The tool call's id — echoed back in the tool-role answer.
     pub call_id: String,

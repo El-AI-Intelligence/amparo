@@ -41,6 +41,7 @@ pub mod dispatch;
 pub mod driver;
 pub mod gate;
 pub mod notification;
+pub mod receiver;
 pub mod router;
 pub mod schedule;
 pub mod sink;
