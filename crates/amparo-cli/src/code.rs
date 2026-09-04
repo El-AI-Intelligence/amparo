@@ -7,11 +7,25 @@
 //! built by a plain recursive walk that skips `.git`/`target`/`node_modules`
 //! and is bounded by a node budget; the git marks come from the tools
 //! crate's [`GitStatusTool`] — the same status the agent sees. Selection
-//! rides in inverse video, dirs collapse with `↵`, files open read-only.
+//! rides in inverse video, dirs collapse with `↵`, files open in the
+//! reading pane.
+//!
+//! Editing (M13 W2): with a file open, `e` turns the status bar into a
+//! one-line instruction prompt. Submitting it runs one agent turn through
+//! the *same* gate chain as `amparo run` ([`crate::run::wire_with`] — the
+//! profile, fail-closed inference, policy engine, approval). The surface's
+//! own [`CodeApprovalGate`] parks each approval request in a shared slot
+//! and the reader loop answers it with a single `y`/`n` press (deny-wins,
+//! 60s fail-closed); while it waits, the right pane renders the proposal
+//! as a diff — `edit_file` as `- old` / `+ new` lines, `patch_file` as the
+//! patch verbatim, anything else as a small approval card. The write
+//! executes through the tools' own [`PathPolicy`] and the policy engine —
+//! no new write path, no policy bypass.
 //!
 //! **Degraded shapes** (all documented, all honest):
 //! - *Piped* (`amparo code DIR < /dev/null`): a plain-text report — the
-//!   tree plus the git summary, zero escapes.
+//!   tree plus the git summary, zero escapes. Editing needs a terminal;
+//!   the report pretends to nothing else.
 //! - *NO_COLOR*: the same surface without color (selection inverse stays —
 //!   an attribute, not a color).
 //! - *Windows*: no raw mode — the piped report prints, with a stderr hint
@@ -20,20 +34,44 @@
 //! **Known simplifications, kept deliberate**: the walk is shallow-metadata
 //! (symlinks never follow — no cycles); files cap at 1 MiB when opened and
 //! binary files show a summary row instead of mojibake; resize is picked up
-//! on the 0.1s read timeout, not by signal. Scientific voice, `[tag]`
-//! lines, `—` in copy, no emoji.
+//! on the 0.1s read timeout, not by signal; the edit prompt edits with
+//! backspace only (no cursor motion). Scientific voice, `[tag]` lines,
+//! `—` in copy, no emoji.
 
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use amparo_tools::git::GitStatusTool;
-use amparo_tools::{PathPolicy, ToolCall, ToolExecutor};
-use serde_json::json;
+#[cfg(unix)]
+use std::sync::{Mutex as StdMutex, OnceLock};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use crate::raw::{enter_raw_mode, read_byte, term_size};
+use amparo_agent::{
+    format_event, AgentEvent, ApprovalGate, ApprovalRequest, EventSink, TaskStatus,
+};
+use amparo_tools::git::GitStatusTool;
+use amparo_tools::{PathPolicy, ToolCall, ToolExecutor};
+#[cfg(unix)]
+use amparo_tools::ToolTrustTier;
+#[cfg(unix)]
+use async_trait::async_trait;
+use serde_json::json;
+#[cfg(unix)]
+use serde_json::Value;
+#[cfg(unix)]
+use tokio::sync::oneshot;
+
+// Every new import above is `cfg(unix)` except the ones the piped report
+// needs: the module-level `allow(dead_code, unused_variables)` on Windows
+// does not cover unused imports.
+#[cfg(unix)]
+use crate::run::{self, RunFlags, Surface};
+#[cfg(unix)]
+use crate::raw::{enter_raw_mode, poll_byte, read_byte, term_size};
 
 const CODE_USAGE: &str = "\
 amparo code — the coding terminal
@@ -46,8 +84,12 @@ ARGS:
 
 On a unix terminal this opens an alternate-screen file tree with the
 workspace's git marks: ↑↓ move, ↵ open a file or toggle a directory,
-r rescan, q quit. Piped, it prints a plain-text report — the tree plus
-the git summary, zero escapes.";
+r rescan, q quit. With a file open, e edits: type an instruction, ↵
+submits it as one agent turn behind the same gate chain as
+`amparo run`, and any proposed write is approved with a single y
+(apply) or n (deny) press under a 60-second fail-closed deadline.
+Piped, it prints a plain-text report — the tree plus the git summary,
+zero escapes.";
 
 /// The node budget for one tree build — a runaway directory (a mount
 /// point, a cache) can never make the surface hang or the frame enormous.
@@ -60,6 +102,16 @@ const MAX_FILE_BYTES: usize = 1 << 20;
 /// Directories the tree always skips. `.git` is a status source, not
 /// content; `target`/`node_modules` are build caches.
 const IGNORED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+
+/// How long an edit approval waits for a key before it denies itself —
+/// the same fail-closed deadline as the TUI's gate.
+#[cfg(unix)]
+const EDIT_APPROVAL_SECS: u64 = 60;
+
+/// The edit turn's event log keeps at most this many lines — the pane
+/// holds a screen's worth; the cap bounds the memory, not the story.
+#[cfg(unix)]
+const EDIT_LOG_LINES: usize = 200;
 
 /// One node of the tree — a directory with children, or a file.
 #[derive(Debug)]
@@ -476,6 +528,27 @@ fn mark_text(mark: char, paint: &Paint) -> String {
     paint.apply(ink, &mark.to_string())
 }
 
+/// Counts display columns in a painted string — SGR escapes count zero.
+#[cfg(unix)]
+fn painted_columns(s: &str) -> usize {
+    let mut seen = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        if in_esc {
+            if c == 'm' {
+                in_esc = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            in_esc = true;
+            continue;
+        }
+        seen += 1;
+    }
+    seen
+}
+
 // ─────────────────────────────────────────────────── the interactive ──
 
 /// One node in the preorder flat array — depth, label, and the index
@@ -578,7 +651,7 @@ fn open_file(path: &Path, root: &Path) -> ViewState {
 
 /// One decoded key, or a tick when the 0.1s read window passed empty.
 #[cfg(unix)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Key {
     Tick,
     Up,
@@ -591,6 +664,18 @@ enum Key {
     Esc,
     Quit,
     Rescan,
+    /// `e` — open the edit prompt (view mode).
+    Edit,
+    /// `y` — apply the parked approval.
+    Yes,
+    /// `n` — deny the parked approval (permanent for that call).
+    No,
+    /// Backspace — delete the prompt's last char.
+    Backspace,
+    /// One printable ASCII char — prompt input.
+    Char(char),
+    /// A byte outside ASCII — feeds the UTF-8 accumulator.
+    Byte(u8),
     Ignore,
 }
 
@@ -605,6 +690,12 @@ fn decode_key(first: u8, next: &mut dyn FnMut() -> Option<u8>) -> Key {
         b'r' | b'R' => Key::Rescan,
         b'j' | b'J' => Key::Down,
         b'k' | b'K' => Key::Up,
+        b'e' | b'E' => Key::Edit,
+        b'y' | b'Y' => Key::Yes,
+        b'n' | b'N' => Key::No,
+        0x7f | 0x08 => Key::Backspace,
+        b if (0x20..=0x7e).contains(&b) => Key::Char(b as char),
+        b if b >= 0x80 => Key::Byte(b),
         0x1b => {
             let Some(b2) = next() else {
                 return Key::Esc; // a lone ESC, resolved by the 0.1s window
@@ -643,10 +734,298 @@ fn decode_key(first: u8, next: &mut dyn FnMut() -> Option<u8>) -> Key {
 
 #[cfg(unix)]
 fn next_key(stdin: &mut std::io::Stdin) -> Key {
-    match read_byte(stdin) {
-        Some(b) => decode_key(b, &mut || read_byte(stdin)),
+    // Polled, not blocking: the turn's parked approval must re-render
+    // its countdown between keypresses (Key::Tick drives the frame),
+    // and the Esc chord window closes on its own instead of waiting
+    // for the next byte forever.
+    match poll_byte(stdin, 250) {
+        Some(b) => decode_key(b, &mut || poll_byte(stdin, 100)),
         None => Key::Tick,
     }
+}
+
+/// The edit prompt's input path — the TUI's prompt-byte pattern: while
+/// the prompt is live, letters are letters. `r`, `q`, `e`, `y`, `n` and
+/// friends stay structural everywhere else but must type here (a
+/// decode-keyed `r` would rescan the tree out from under the prompt).
+/// Only the bare controls are structural: Enter submits, Backspace
+/// deletes, Ctrl-C cancels, and Esc (resolved through the sequence
+/// window, so arrow keys arrive as their arrows and are ignored).
+#[cfg(unix)]
+fn next_prompt_key(stdin: &mut std::io::Stdin) -> Key {
+    // Blocking is right for typed input, but the Esc chord window must
+    // still close on its own (the polled `next` below).
+    match read_byte(stdin) {
+        Some(b) => decode_prompt_key(b, &mut || poll_byte(stdin, 100)),
+        None => Key::Tick,
+    }
+}
+
+/// The prompt-side decoder — [`next_prompt_key`] without the terminal,
+/// for tests (the [`decode_key`] seam's shape).
+#[cfg(unix)]
+fn decode_prompt_key(first: u8, next: &mut dyn FnMut() -> Option<u8>) -> Key {
+    match first {
+        0x1b => decode_key(0x1b, next),
+        b'\r' | b'\n' => Key::Enter,
+        0x03 => Key::Quit,
+        0x7f | 0x08 => Key::Backspace,
+        b if (0x20..=0x7e).contains(&b) => Key::Char(b as char),
+        b if b >= 0x80 => Key::Byte(b),
+        _ => Key::Ignore,
+    }
+}
+
+/// Accumulates UTF-8 input bytes: a complete sequence comes back as its
+/// text (buffer cleared), an incomplete one keeps the buffer, and an
+/// invalid one resets it — mojibake never reaches the prompt.
+#[cfg(unix)]
+fn push_utf8(buf: &mut Vec<u8>, b: u8) -> Option<String> {
+    buf.push(b);
+    match std::str::from_utf8(buf) {
+        Ok(s) => {
+            let out = s.to_string();
+            buf.clear();
+            Some(out)
+        }
+        Err(e) => {
+            if e.error_len().is_some() {
+                buf.clear();
+            }
+            None
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────── edit turn ──
+
+/// The edit turn's event log — a process-global slot (the [`Surface`]
+/// callbacks are fn pointers, so they cannot capture; the TUI's `Ui`
+/// slot uses the same idiom) holding the `[tag]` lines of the running
+/// turn, drawn in the right pane while nothing pends approval.
+#[cfg(unix)]
+static EDIT_LOG: OnceLock<Arc<StdMutex<VecDeque<String>>>> = OnceLock::new();
+
+/// Appends one line to [`EDIT_LOG`], capping it at [`EDIT_LOG_LINES`].
+#[cfg(unix)]
+fn push_log(line: &str) {
+    let log = EDIT_LOG.get_or_init(|| Arc::new(StdMutex::new(VecDeque::new())));
+    let mut log = log.lock().unwrap();
+    log.push_back(line.to_string());
+    while log.len() > EDIT_LOG_LINES {
+        log.pop_front();
+    }
+}
+
+/// The banner callback for the edit turn — the same chain facts as every
+/// surface, one log line each.
+#[cfg(unix)]
+fn edit_banner(info: &crate::run::BannerInfo) {
+    push_log(&format!("[chain] {}", info.chain));
+    push_log(&format!("[infer] {}", info.infer));
+    push_log(&format!("[memory] {}", info.memory));
+}
+
+/// The `[tag]` line callback for the edit turn — status lines and the
+/// policy-audit notice land in the log like every other event.
+#[cfg(unix)]
+fn edit_line(line: &str) {
+    push_log(line);
+}
+
+/// The edit turn's event sink — every loop event arrives in the log as
+/// its canonical `[tag]` line.
+#[cfg(unix)]
+struct EditSink;
+
+#[cfg(unix)]
+impl EventSink for EditSink {
+    fn emit(&self, event: &AgentEvent) {
+        push_log(&format_event(event));
+    }
+}
+
+/// One approval parked for the reader loop's `y`/`n` — the shared slot
+/// between the gate's async side and the blocking reader.
+#[cfg(unix)]
+struct PendingApproval {
+    request: ApprovalRequest,
+    deadline: Instant,
+    answer: Option<oneshot::Sender<bool>>,
+}
+
+/// The surface's approval gate (M13 W2): each request parks in the
+/// shared slot and waits up to [`EDIT_APPROVAL_SECS`] for the reader
+/// loop's single-key answer — timeout denies, like every other gate.
+#[cfg(unix)]
+struct CodeApprovalGate {
+    slot: Arc<StdMutex<Option<PendingApproval>>>,
+    timeout: Duration,
+}
+
+#[cfg(unix)]
+impl CodeApprovalGate {
+    fn new(slot: Arc<StdMutex<Option<PendingApproval>>>) -> Self {
+        Self {
+            slot,
+            timeout: Duration::from_secs(EDIT_APPROVAL_SECS),
+        }
+    }
+
+    /// The time-based test seam — a short window stands in for the 60s.
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl ApprovalGate for CodeApprovalGate {
+    async fn request(&self, request: &ApprovalRequest) -> bool {
+        let (tx, rx) = oneshot::channel();
+        self.slot.lock().unwrap().replace(PendingApproval {
+            request: request.clone(),
+            deadline: Instant::now() + self.timeout,
+            answer: Some(tx),
+        });
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(approved)) => approved,
+            // The deadline passed, or the turn was canceled mid-wait —
+            // either way the call is denied. Clear the slot only when it
+            // still holds *this* request, so a newer one survives.
+            _ => {
+                let mut guard = self.slot.lock().unwrap();
+                if guard
+                    .as_ref()
+                    .map(|p| p.request.call_id == request.call_id)
+                    .unwrap_or(false)
+                {
+                    guard.take();
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Routes one reader-loop press into the parked approval — the first
+/// press wins, and a deny is permanent for that call (deny-wins).
+/// Returns true when a decision was actually delivered.
+#[cfg(unix)]
+fn decide_pending(slot: &StdMutex<Option<PendingApproval>>, approved: bool) -> bool {
+    let mut guard = slot.lock().unwrap();
+    match guard.take() {
+        Some(mut pending) => {
+            if let Some(answer) = pending.answer.take() {
+                let _ = answer.send(approved);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// The whole seconds left on the parked approval — `None` when nothing
+/// pends. Drives the status-bar countdown re-render.
+#[cfg(unix)]
+fn pending_remaining(slot: &StdMutex<Option<PendingApproval>>) -> Option<u64> {
+    slot.lock()
+        .unwrap()
+        .as_ref()
+        .map(|p| p.deadline.saturating_duration_since(Instant::now()).as_secs())
+}
+
+/// Reads one string argument — `(unset)` when the model omitted it.
+#[cfg(unix)]
+fn arg(req: &ApprovalRequest, name: &str) -> String {
+    req.arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or("(unset)")
+        .to_string()
+}
+
+/// Renders the arguments for a card header — a single-string argument
+/// shows the value alone (the TUI's convention).
+#[cfg(unix)]
+fn display_arg(arguments: &Value) -> String {
+    match arguments {
+        Value::Object(map) if map.len() == 1 => {
+            let (_, v) = map.iter().next().expect("len 1");
+            match v {
+                Value::String(s) => clip(s, 60),
+                other => serde_json::to_string(other).unwrap_or_default(),
+            }
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Renders an approval request as the right-pane proposal: `edit_file`
+/// as `- old` / `+ new` lines, `patch_file` as the patch verbatim, and
+/// anything else as the approval card (the TUI's card copy). Pure — the
+/// unit-test seam.
+#[cfg(unix)]
+fn approval_diff(req: &ApprovalRequest) -> Vec<String> {
+    match req.tool_name.as_str() {
+        "edit_file" => {
+            let mut lines = vec![format!("edit_file {}", arg(req, "path"))];
+            for old in arg(req, "old_text").lines() {
+                lines.push(format!("- {old}"));
+            }
+            for new in arg(req, "new_text").lines() {
+                lines.push(format!("+ {new}"));
+            }
+            lines
+        }
+        "patch_file" => {
+            let mut lines = vec![format!("patch_file {}", arg(req, "path"))];
+            for patch_line in arg(req, "patch").lines() {
+                lines.push(patch_line.to_string());
+            }
+            lines
+        }
+        _ => {
+            let why = if req.reasons.is_empty() {
+                "—".to_string()
+            } else {
+                clip(&req.reasons.join("; "), 60)
+            };
+            let blast = req
+                .blast_radius
+                .map(|b| b.note())
+                .unwrap_or("not classified");
+            let rollback = match &req.rollback {
+                Some(r) => clip(&r.undo, 60),
+                None => "none declared".to_string(),
+            };
+            vec![
+                format!(
+                    "approval required — {} {}",
+                    req.tool_name,
+                    display_arg(&req.arguments)
+                ),
+                format!("  why:      {why}"),
+                format!("  blast:    {blast}"),
+                format!("  rollback: {rollback}"),
+            ]
+        }
+    }
+}
+
+/// What the surface is doing right now — the mode drives both the key
+/// routing and the right pane.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum CodeMode {
+    Tree,
+    View,
+    /// The status bar is a one-line instruction prompt (backspace-only).
+    Prompt,
+    /// One agent turn is running — approvals answer with `y`/`n`.
+    Turn,
 }
 
 /// The surface state between frames.
@@ -662,6 +1041,15 @@ struct CodeState {
     /// The node budget was hit during the build — announced in the title.
     truncated: bool,
     view: Option<ViewState>,
+    mode: CodeMode,
+    /// The file the reading pane opened — survives `refresh`, so a
+    /// rescan after an edit reopens the same file.
+    view_path: Option<PathBuf>,
+    /// The instruction prompt's text.
+    prompt: String,
+    /// One-shot status-bar notice (`(is_error, line)`) — a turn outcome
+    /// or a cancelation; any next key clears it.
+    notice: Option<(bool, String)>,
 }
 
 #[cfg(unix)]
@@ -678,6 +1066,10 @@ impl CodeState {
             scroll: 0,
             truncated: has_truncation(tree),
             view: None,
+            mode: CodeMode::Tree,
+            view_path: None,
+            prompt: String::new(),
+            notice: None,
         }
     }
 
@@ -689,6 +1081,10 @@ impl CodeState {
         self.scroll = 0;
         self.truncated = truncated;
         self.view = None;
+        self.view_path = None;
+        self.mode = CodeMode::Tree;
+        self.prompt.clear();
+        self.notice = None;
     }
 
     /// The flat index under the selection.
@@ -715,42 +1111,73 @@ impl CodeState {
         }
     }
 
-    /// Applies one key; returns true when the frame changed.
+    /// Applies one key; returns true when the frame changed. Any key
+    /// clears the one-shot notice.
     fn handle_key(&mut self, k: Key, root: &Path, h: usize) -> bool {
         let body_h = h.saturating_sub(2).max(1);
-        match &mut self.view {
-            Some(v) => match k {
-                Key::Up => {
-                    v.scroll = v.scroll.saturating_sub(1);
-                    true
-                }
-                Key::Down => {
-                    v.scroll = (v.scroll + 1).min(v.lines.len().saturating_sub(1));
-                    true
-                }
-                Key::Home => {
-                    v.scroll = 0;
-                    true
-                }
-                Key::End => {
-                    v.scroll = v.lines.len().saturating_sub(body_h);
-                    true
-                }
-                Key::PageUp => {
-                    v.scroll = v.scroll.saturating_sub(body_h);
-                    true
-                }
-                Key::PageDown => {
-                    v.scroll = (v.scroll + body_h).min(v.lines.len().saturating_sub(body_h));
+        self.notice = None;
+        match self.mode {
+            CodeMode::Prompt => match k {
+                Key::Enter => {
+                    // The submit boundary: the loop reads this mode flip
+                    // and spawns the turn (an empty instruction cancels).
+                    self.mode = CodeMode::Turn;
                     true
                 }
                 Key::Esc | Key::Quit => {
-                    self.view = None;
+                    self.mode = CodeMode::View;
+                    self.prompt.clear();
+                    true
+                }
+                Key::Backspace => {
+                    self.prompt.pop();
+                    true
+                }
+                Key::Char(c) => {
+                    self.prompt.push(c);
                     true
                 }
                 _ => false,
             },
-            None => match k {
+            // The turn owns the reader: only y/n/Esc are routed by the
+            // loop; everything else is ignored here.
+            CodeMode::Turn => false,
+            CodeMode::View => match k {
+                Key::Esc | Key::Quit => {
+                    self.view = None;
+                    self.view_path = None;
+                    self.mode = CodeMode::Tree;
+                    true
+                }
+                Key::Edit => {
+                    self.mode = CodeMode::Prompt;
+                    self.prompt.clear();
+                    true
+                }
+                Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown => {
+                    let v = match self.view.as_mut() {
+                        Some(v) => v,
+                        None => return false,
+                    };
+                    match k {
+                        Key::Up => v.scroll = v.scroll.saturating_sub(1),
+                        Key::Down => {
+                            v.scroll = (v.scroll + 1).min(v.lines.len().saturating_sub(1));
+                        }
+                        Key::Home => v.scroll = 0,
+                        Key::End => v.scroll = v.lines.len().saturating_sub(body_h),
+                        Key::PageUp => v.scroll = v.scroll.saturating_sub(body_h),
+                        Key::PageDown => {
+                            v.scroll =
+                                (v.scroll + body_h).min(v.lines.len().saturating_sub(body_h));
+                        }
+                        _ => unreachable!(),
+                    }
+                    true
+                }
+                _ => false,
+            },
+            CodeMode::Tree => match k {
                 Key::Up => {
                     self.move_sel(-1);
                     true
@@ -800,6 +1227,8 @@ impl CodeState {
                         }
                         path.push(&name);
                         self.view = Some(open_file(&path, root));
+                        self.view_path = Some(path);
+                        self.mode = CodeMode::View;
                     }
                     true
                 }
@@ -819,6 +1248,8 @@ fn draw(
     paint: &Paint,
     w: usize,
     h: usize,
+    pending: Option<(&ApprovalRequest, Instant)>,
+    log: &VecDeque<String>,
 ) -> String {
     let mut out = String::new();
     out.push_str("\x1b[?25l\x1b[H");
@@ -837,6 +1268,28 @@ fn draw(
     let tree_w = if w >= 70 { (w / 2).min(48) } else { 28.min(w) };
     let has_right = w >= tree_w + 22;
     let pane_w = w.saturating_sub(tree_w + 1);
+
+    // The turn's right pane: the pending diff (with its deadline), or
+    // the event-log tail while the agent works.
+    let turn_lines: Vec<String> = if state.mode == CodeMode::Turn {
+        match pending {
+            Some((req, deadline)) => {
+                let mut lines = approval_diff(req);
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs();
+                lines.push(format!("── {remaining}s left — deny on timeout"));
+                lines
+            }
+            None => log
+                .iter()
+                .skip(log.len().saturating_sub(body_h))
+                .cloned()
+                .collect(),
+        }
+    } else {
+        Vec::new()
+    };
 
     for r in 0..body_h {
         // Left: the tree.
@@ -866,32 +1319,58 @@ fn draw(
         line.push_str("\x1b[K");
         if has_right {
             line.push_str(&paint.apply(Ink::Dim, "│"));
-            // Right: the opened file, or the hint.
-            let right = match (&state.view, row_idx) {
-                (Some(v), _) => {
-                    let idx = v.scroll + r;
-                    match v.lines.get(idx) {
-                        Some(content) => {
-                            let num = paint.apply(Ink::Dim, &format!("{:>4} ", idx + 1));
-                            format!("{num}{}", clip(content, pane_w.saturating_sub(5)))
-                        }
-                        None => String::new(),
-                    }
-                }
-                (None, 0) => paint.apply(Ink::Dim, "↵ open a file — it opens here"),
-                (None, 1) => {
-                    let f = &state.flat[state.selected()];
-                    paint.apply(
+            // Right: the mode's pane — the turn's diff or log, the
+            // prompt's hints, the opened file, or the tree hints.
+            let right = match state.mode {
+                CodeMode::Turn => turn_lines.get(r).map_or(String::new(), |line| {
+                    let ink = if line.starts_with('-') {
+                        Ink::Bad
+                    } else if line.starts_with('+') {
+                        Ink::Ok
+                    } else if r == 0 {
+                        Ink::Bold
+                    } else {
+                        Ink::Dim
+                    };
+                    paint.apply(ink, &clip(line, pane_w))
+                }),
+                CodeMode::Prompt => match r {
+                    0 => paint.apply(Ink::Dim, "editing — one instruction, ↵ submits"),
+                    1 => paint.apply(
                         Ink::Dim,
-                        if f.is_dir {
-                            "↵ toggles a directory"
-                        } else {
-                            "↵ opens the selected file read-only"
-                        },
-                    )
-                }
-                (None, 2) => paint.apply(Ink::Dim, "↑↓ move · r rescan · q quit"),
-                (None, _) => String::new(),
+                        "the turn runs behind the same gate chain as `amparo run`",
+                    ),
+                    _ => String::new(),
+                },
+                CodeMode::View => match &state.view {
+                    Some(v) => {
+                        let idx = v.scroll + r;
+                        match v.lines.get(idx) {
+                            Some(content) => {
+                                let num = paint.apply(Ink::Dim, &format!("{:>4} ", idx + 1));
+                                format!("{num}{}", clip(content, pane_w.saturating_sub(5)))
+                            }
+                            None => String::new(),
+                        }
+                    }
+                    None => String::new(),
+                },
+                CodeMode::Tree => match r {
+                    0 => paint.apply(Ink::Dim, "↵ open a file — it opens here"),
+                    1 => {
+                        let f = &state.flat[state.selected()];
+                        paint.apply(
+                            Ink::Dim,
+                            if f.is_dir {
+                                "↵ toggles a directory"
+                            } else {
+                                "↵ opens the selected file — then e edits it"
+                            },
+                        )
+                    }
+                    2 => paint.apply(Ink::Dim, "↑↓ move · r rescan · q quit"),
+                    _ => String::new(),
+                },
             };
             line.push_str(&clip_painted(&right, pane_w));
             line.push_str("\x1b[K");
@@ -900,25 +1379,64 @@ fn draw(
         out.push_str("\r\n");
     }
 
-    // Status bar, inverse across the full width.
-    let legend = match &state.view {
-        Some(v) => {
-            let trunc = if v.truncated { " · truncated" } else { "" };
+    // Status bar, inverse across the full width. A one-shot notice
+    // replaces the legend entirely.
+    let legend = match state.mode {
+        CodeMode::Prompt => {
+            let rel = state
+                .view_path
+                .as_ref()
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+                .unwrap_or_else(|| "file".to_string());
             format!(
-                "viewing {} — line {}/{} · ↑↓ scroll · esc back · q quit{trunc}",
-                v.rel,
-                v.scroll + 1,
-                v.lines.len().max(1)
+                "edit {rel}: {}█ · ↵ submit · esc cancel",
+                clip(&state.prompt, w.saturating_sub(30).max(8))
             )
         }
-        None => "↑↓ move · ↵ open · r rescan · q quit".to_string(),
+        CodeMode::Turn => match pending {
+            Some((_, deadline)) => {
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs();
+                format!("y apply · n deny ({remaining}s)")
+            }
+            None => "edit running — y/n answer approvals · esc cancel".to_string(),
+        },
+        CodeMode::View => {
+            let trunc = state
+                .view
+                .as_ref()
+                .map(|v| if v.truncated { " · truncated" } else { "" })
+                .unwrap_or("");
+            let (rel, line, total) = state
+                .view
+                .as_ref()
+                .map(|v| (v.rel.as_str(), v.scroll + 1, v.lines.len().max(1)))
+                .unwrap_or(("", 1, 1));
+            format!("viewing {rel} — line {line}/{total} · ↑↓ scroll · e edit · esc back · q quit{trunc}")
+        }
+        CodeMode::Tree => "↑↓ move · ↵ open · r rescan · q quit".to_string(),
+    };
+    let legend = match &state.notice {
+        Some((is_error, line)) => paint.apply(
+            if *is_error { Ink::Bad } else { Ink::Warn },
+            &clip(line, w.saturating_sub(20).max(10)),
+        ),
+        None => legend,
     };
     let left = clip(
         &format!("amparo code — {}", root.display()),
         w.saturating_sub(legend.chars().count() + 3).max(8),
     );
     let status = format!(" {left} · {legend}");
-    let bar = format!("{status}{}", " ".repeat(w.saturating_sub(status.chars().count())));
+    let bar = format!(
+        "{status}{}",
+        " ".repeat(w.saturating_sub(painted_columns(&status)))
+    );
     out.push_str(&paint.rev(&clip_painted(&bar, w)));
     out.push('\n');
     out
@@ -940,6 +1458,14 @@ fn run_interactive(
     let paint = Paint::detect();
     let mut branch = branch;
 
+    // The edit machinery: the process-global event log (the Surface
+    // callbacks are fn pointers) and the shared approval slot the gate
+    // parks requests in for the reader loop's y/n. A fresh surface
+    // starts with a fresh log.
+    let pending: Arc<StdMutex<Option<PendingApproval>>> = Arc::new(StdMutex::new(None));
+    let log = EDIT_LOG.get_or_init(|| Arc::new(StdMutex::new(VecDeque::new())));
+    log.lock().unwrap().clear();
+
     // Alternate screen first, then raw mode — a crash mid-entry leaves
     // the terminal in its original screen with cooked input.
     out.write_all(b"\x1b[?1049h\x1b[2J\x1b[H")
@@ -952,6 +1478,9 @@ fn run_interactive(
     let mut state = CodeState::new(&tree);
     let mut dirty = true;
     let mut last_size = term_size().unwrap_or((80, 24));
+    let mut edit_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
+    let mut last_remaining: Option<u64> = None;
+    let mut utf8_buf: Vec<u8> = Vec::new();
 
     let result = (|| -> Result<(), String> {
         loop {
@@ -961,26 +1490,21 @@ fn run_interactive(
                     dirty = true;
                 }
             }
-            if dirty {
-                let (w, h) = last_size;
-                let frame = draw(&state, &root, branch.as_deref(), &paint, w, h);
-                out.write_all(frame.as_bytes()).map_err(|e| e.to_string())?;
-                out.flush().map_err(|e| e.to_string())?;
-                dirty = false;
-            }
-            match next_key(&mut stdin) {
-                Key::Tick => continue, // the size probe above ran; nothing else
-                Key::Quit => {
-                    if state.view.is_none() {
-                        break; // q quits from the tree, backs out of a file
-                    }
-                    state.view = None;
-                    dirty = true;
-                }
-                Key::Rescan => {
-                    // Fresh marks + a fresh tree — the workspace moved
-                    // under us. Blocking the reader thread on the handle
-                    // is fine: this is the only interactive task.
+            // The edit turn finished (or died) since the last frame —
+            // fold its outcome back into the surface.
+            if edit_task.as_ref().map(|t| t.is_finished()).unwrap_or(false) {
+                let task = edit_task.take().expect("checked");
+                let outcome = match handle.block_on(task) {
+                    Ok(r) => r,
+                    Err(_) => Ok("edit canceled".to_string()),
+                };
+                // A parked approval the turn never resolved dies with
+                // the turn — clear the slot.
+                pending.lock().unwrap().take();
+                let reopen = state.view_path.clone();
+                if reopen.is_some() {
+                    // Fresh marks + a fresh tree: the edit may have
+                    // changed the workspace (git status included).
                     let (marks, fresh) = handle.block_on(git_marks(&workspace));
                     if fresh.is_some() {
                         branch = fresh;
@@ -991,14 +1515,176 @@ fn run_interactive(
                         flatten(&t, 0, &mut flat);
                         state.refresh(flat, has_truncation(&t));
                     }
-                    dirty = true;
+                    if let Some(path) = reopen {
+                        state.view = Some(open_file(&path, &root));
+                        state.view_path = Some(path);
+                    }
+                    state.mode = CodeMode::View;
                 }
-                k => {
-                    if state.handle_key(k, &root, last_size.1) {
+                // The outcome always speaks — success and failure alike.
+                state.notice = Some((outcome.is_err(), outcome.unwrap_or_else(|e| e)));
+                last_remaining = None;
+                dirty = true;
+            }
+            if dirty {
+                let (w, h) = last_size;
+                let frame = {
+                    let pending_guard = pending.lock().unwrap();
+                    let pending_view = pending_guard
+                        .as_ref()
+                        .map(|p| (&p.request, p.deadline));
+                    let log_guard = log.lock().unwrap();
+                    draw(
+                        &state,
+                        &root,
+                        branch.as_deref(),
+                        &paint,
+                        w,
+                        h,
+                        pending_view,
+                        &log_guard,
+                    )
+                };
+                out.write_all(frame.as_bytes()).map_err(|e| e.to_string())?;
+                out.flush().map_err(|e| e.to_string())?;
+                dirty = false;
+            }
+            // The prompt takes its input as raw bytes (letters stay
+            // letters); every other mode decodes structural keys.
+            let key = if state.mode == CodeMode::Prompt {
+                next_prompt_key(&mut stdin)
+            } else {
+                next_key(&mut stdin)
+            };
+            match key {
+                Key::Tick => {
+                    // The countdown may have ticked — re-render when the
+                    // remaining seconds changed.
+                    if state.mode == CodeMode::Turn {
+                        let remaining = pending_remaining(&pending);
+                        if last_remaining != remaining {
+                            last_remaining = remaining;
+                            dirty = true;
+                        }
+                    }
+                }
+                Key::Quit => {
+                    if state.mode == CodeMode::Turn {
+                        // Esc/q cancels the whole turn: deny whatever
+                        // pends, stop the task, back to the file.
+                        decide_pending(&pending, false);
+                        if let Some(task) = edit_task.take() {
+                            task.abort();
+                        }
+                        state.mode = CodeMode::View;
+                        state.notice = Some((false, "edit canceled".to_string()));
+                        last_remaining = None;
+                        dirty = true;
+                    } else if state.mode == CodeMode::Tree {
+                        break; // q quits from the tree, backs out elsewhere
+                    } else if state.handle_key(key, &root, last_size.1) {
                         state.follow(last_size.1.saturating_sub(2).max(1));
                         dirty = true;
                     }
                 }
+                Key::Esc => {
+                    if state.mode == CodeMode::Turn {
+                        decide_pending(&pending, false);
+                        if let Some(task) = edit_task.take() {
+                            task.abort();
+                        }
+                        state.mode = CodeMode::View;
+                        state.notice = Some((false, "edit canceled".to_string()));
+                        last_remaining = None;
+                        dirty = true;
+                    } else if state.handle_key(key, &root, last_size.1) {
+                        state.follow(last_size.1.saturating_sub(2).max(1));
+                        dirty = true;
+                    }
+                }
+                Key::Yes | Key::No => {
+                    if state.mode == CodeMode::Turn {
+                        decide_pending(&pending, key == Key::Yes);
+                        last_remaining = None;
+                        dirty = true;
+                    } else if state.handle_key(key, &root, last_size.1) {
+                        // y/n typed into the prompt are plain characters.
+                        state.follow(last_size.1.saturating_sub(2).max(1));
+                        dirty = true;
+                    }
+                }
+                Key::Byte(b) => {
+                    // Multi-byte input accumulates here; complete
+                    // sequences feed the prompt as their characters.
+                    if state.mode == CodeMode::Prompt {
+                        if let Some(s) = push_utf8(&mut utf8_buf, b) {
+                            for c in s.chars() {
+                                state.handle_key(Key::Char(c), &root, last_size.1);
+                            }
+                            dirty = true;
+                        }
+                    }
+                }
+                Key::Rescan => {
+                    if state.mode == CodeMode::Turn {
+                        // The turn owns the reader — nothing else routes.
+                    } else {
+                        // Fresh marks + a fresh tree — the workspace
+                        // moved under us. Blocking the reader thread on
+                        // the handle is fine: this is the only
+                        // interactive task.
+                        let (marks, fresh) = handle.block_on(git_marks(&workspace));
+                        if fresh.is_some() {
+                            branch = fresh;
+                        }
+                        let mut budget = MAX_TREE_NODES;
+                        if let Ok(t) = build_tree(&root, &marks, &mut budget) {
+                            let mut flat = Vec::new();
+                            flatten(&t, 0, &mut flat);
+                            state.refresh(flat, has_truncation(&t));
+                        }
+                        dirty = true;
+                    }
+                }
+                k => {
+                    if state.mode != CodeMode::Turn
+                        && state.handle_key(k, &root, last_size.1)
+                    {
+                        state.follow(last_size.1.saturating_sub(2).max(1));
+                        dirty = true;
+                    }
+                }
+            }
+            // A mode change out of the prompt drops its partial UTF-8
+            // sequence, so stale bytes never leak into the next prompt.
+            if state.mode != CodeMode::Prompt {
+                utf8_buf.clear();
+            }
+            // Prompt → Turn is the submit boundary: spawn the turn, or
+            // treat an empty instruction as a cancel.
+            if state.mode == CodeMode::Turn && edit_task.is_none() {
+                let instruction = std::mem::take(&mut state.prompt);
+                if instruction.trim().is_empty() {
+                    state.mode = CodeMode::View;
+                } else {
+                    let rel = state
+                        .view_path
+                        .as_ref()
+                        .map(|p| {
+                            p.strip_prefix(&root)
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| p.display().to_string())
+                        })
+                        .unwrap_or_else(|| "(file unknown)".to_string());
+                    let prompt = format!("{instruction} (file: {rel})");
+                    edit_task = Some(handle.spawn(run_edit_turn(
+                        prompt,
+                        run::new_task_id(),
+                        Arc::clone(&pending),
+                    )));
+                }
+                last_remaining = None;
+                dirty = true;
             }
         }
         Ok(())
@@ -1010,6 +1696,47 @@ fn run_interactive(
         .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
     result
+}
+
+/// One agent turn for the edit prompt: the same gate chain as
+/// `amparo run` — the profile, fail-closed inference, the policy engine,
+/// and this surface's approval gate — its events drawn into the log and
+/// the right pane. Returns the outcome line for the status bar.
+#[cfg(unix)]
+async fn run_edit_turn(
+    prompt: String,
+    task_id: String,
+    pending: Arc<StdMutex<Option<PendingApproval>>>,
+) -> Result<String, String> {
+    // The diff-accept contract (M13 W2): every edit asks its y/n question,
+    // so edits park at the gate here. No CLI flag — other surfaces keep
+    // the default (ExternalEffector and a policy Escalate still park).
+    let mut flags = RunFlags::default();
+    flags.approval_threshold = ToolTrustTier::LocalMutating;
+    let gate: Arc<dyn ApprovalGate> = Arc::new(CodeApprovalGate::new(Arc::clone(&pending)));
+    let surface = Surface {
+        events: Arc::new(EditSink),
+        approval: Some((
+            gate,
+            "you, at this terminal — 60s fail-closed".to_string(),
+        )),
+        banner: edit_banner,
+        line: edit_line,
+        notice: edit_line,
+    };
+    let mut wired = run::wire_with(&flags, task_id, surface).await?;
+    let fires = wired.schedule_fires.drain(..).collect::<Vec<_>>();
+    let report = wired.agent.run(prompt).await;
+    for fire in fires {
+        let _ = fire.await;
+    }
+    match report.status {
+        TaskStatus::Complete => Ok(format!("[report] complete — {} step(s)", report.steps_used)),
+        TaskStatus::Failed => Err(format!(
+            "edit failed — {}",
+            report.final_answer.unwrap_or_else(|| "no final answer".to_string())
+        )),
+    }
 }
 
 // ───────────────────────────────────────────────────────────── tests ──
@@ -1238,6 +1965,10 @@ mod tests {
             scroll: 0,
             truncated: false,
             view: None,
+            mode: CodeMode::Tree,
+            view_path: None,
+            prompt: String::new(),
+            notice: None,
         };
         // Move the selection to main.rs (root, src, main.rs in preorder).
         state.sel = 2;
@@ -1245,6 +1976,8 @@ mod tests {
         let view = state.view.expect("view opened");
         assert_eq!(view.rel, "src/main.rs");
         assert_eq!(view.lines, vec!["fn main() {}"]);
+        assert_eq!(state.mode, CodeMode::View);
+        assert_eq!(state.view_path, Some(root.join("src/main.rs")));
     }
 
     #[cfg(unix)]
@@ -1256,7 +1989,7 @@ mod tests {
         let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
         let state = CodeState::new(&tree);
         let paint = Paint::with_colors(false);
-        let frame = draw(&state, &root, None, &paint, 80, 24);
+        let frame = draw(&state, &root, None, &paint, 80, 24, None, &VecDeque::new());
         assert_eq!(frame.lines().count(), 24, "{frame}");
         assert!(frame.starts_with("\x1b[?25l\x1b[H"), "{frame}");
     }
@@ -1287,5 +2020,251 @@ mod tests {
         state.sel = 3;
         state.follow(2); // body height 2 — the last row must scroll into view
         assert_eq!(state.scroll, 2);
+    }
+
+    /// A minimal edit_file approval request — the shape the drill's mock
+    /// model produces.
+    #[cfg(unix)]
+    fn edit_request() -> ApprovalRequest {
+        ApprovalRequest {
+            call_id: "call-1".to_string(),
+            tool_name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "note.txt",
+                "old_text": "hello\n",
+                "new_text": "hello from the drill\n"
+            }),
+            reasons: vec!["policy allows this write".to_string()],
+            blast_radius: None,
+            session_label: None,
+            rollback: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_decoder_routes_edit_keys() {
+        assert_eq!(decode_key(b'e', &mut feed(b"")), Key::Edit);
+        assert_eq!(decode_key(b'E', &mut feed(b"")), Key::Edit);
+        assert_eq!(decode_key(b'y', &mut feed(b"")), Key::Yes);
+        assert_eq!(decode_key(b'n', &mut feed(b"")), Key::No);
+        assert_eq!(decode_key(0x7f, &mut feed(b"")), Key::Backspace);
+        assert_eq!(decode_key(0x08, &mut feed(b"")), Key::Backspace);
+        assert_eq!(decode_key(b' ', &mut feed(b"")), Key::Char(' '));
+        assert_eq!(decode_key(0xC3, &mut feed(b"")), Key::Byte(0xC3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_key_keeps_letters_as_letters() {
+        // The prompt must accept every letter — `r`/`q`/`e`/`y`/`n` are
+        // structural outside it, but they type here (a decode-keyed `r`
+        // would rescan the tree out from under the prompt).
+        assert_eq!(decode_prompt_key(b'r', &mut feed(b"")), Key::Char('r'));
+        assert_eq!(decode_prompt_key(b'q', &mut feed(b"")), Key::Char('q'));
+        assert_eq!(decode_prompt_key(b'e', &mut feed(b"")), Key::Char('e'));
+        assert_eq!(decode_prompt_key(b'y', &mut feed(b"")), Key::Char('y'));
+        assert_eq!(decode_prompt_key(b'n', &mut feed(b"")), Key::Char('n'));
+        assert_eq!(decode_prompt_key(b'\r', &mut feed(b"")), Key::Enter);
+        assert_eq!(decode_prompt_key(b'\n', &mut feed(b"")), Key::Enter);
+        assert_eq!(decode_prompt_key(0x03, &mut feed(b"")), Key::Quit);
+        assert_eq!(decode_prompt_key(0x7f, &mut feed(b"")), Key::Backspace);
+        assert_eq!(decode_prompt_key(0xC3, &mut feed(b"")), Key::Byte(0xC3));
+        assert_eq!(decode_prompt_key(b'\t', &mut feed(b"")), Key::Ignore);
+        assert_eq!(decode_prompt_key(0x1b, &mut feed(b"[A")), Key::Up);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_utf8_accumulates_and_resets() {
+        let mut buf = Vec::new();
+        assert_eq!(push_utf8(&mut buf, b'a'), Some("a".to_string()));
+        assert_eq!(push_utf8(&mut buf, 0xC3), None); // first byte of é
+        assert_eq!(push_utf8(&mut buf, 0xA9), Some("é".to_string()));
+        assert_eq!(push_utf8(&mut buf, 0xFF), None); // invalid lead byte — dropped
+        assert_eq!(push_utf8(&mut buf, b'x'), Some("x".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_diff_renders_edit_file_as_a_diff() {
+        let lines = approval_diff(&edit_request());
+        assert_eq!(lines[0], "edit_file note.txt");
+        assert!(lines.contains(&"- hello".to_string()), "{lines:?}");
+        assert!(
+            lines.contains(&"+ hello from the drill".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_diff_renders_patch_file_verbatim() {
+        let mut req = edit_request();
+        req.tool_name = "patch_file".to_string();
+        req.arguments = serde_json::json!({
+            "path": "note.txt",
+            "patch": "@@ -1 +1 @@\n-hello\n+hello from the drill\n"
+        });
+        let lines = approval_diff(&req);
+        assert_eq!(lines[0], "patch_file note.txt");
+        assert!(lines.contains(&"@@ -1 +1 @@".to_string()), "{lines:?}");
+        assert!(lines.contains(&"-hello".to_string()), "{lines:?}");
+        assert!(
+            lines.contains(&"+hello from the drill".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_diff_renders_a_card_for_other_tools() {
+        let mut req = edit_request();
+        req.tool_name = "shell_command".to_string();
+        req.arguments = serde_json::json!({"command": "rm -rf /"});
+        let lines = approval_diff(&req);
+        assert_eq!(lines[0], "approval required — shell_command rm -rf /");
+        assert!(lines[1].starts_with("  why:      policy allows"), "{lines:?}");
+        assert_eq!(lines[2], "  blast:    not classified");
+        assert_eq!(lines[3], "  rollback: none declared");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn code_approval_gate_answers_a_single_key_and_times_out() {
+        let slot: Arc<StdMutex<Option<PendingApproval>>> = Arc::new(StdMutex::new(None));
+        let gate = Arc::new(
+            CodeApprovalGate::new(Arc::clone(&slot)).with_timeout(Duration::from_millis(200)),
+        );
+
+        // A y press while the request parks resolves the gate with true.
+        let req = edit_request();
+        let task = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.request(&req).await })
+        };
+        for _ in 0..100 {
+            if slot.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(decide_pending(&slot, true), "request must be parked");
+        assert!(task.await.expect("task"), "y resolves true");
+
+        // No press: the deadline expires and the call is denied, and the
+        // slot is cleared so the next request starts clean.
+        let req = edit_request();
+        let task = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.request(&req).await })
+        };
+        for _ in 0..100 {
+            if slot.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(!task.await.expect("task"), "timeout denies");
+        assert!(slot.lock().unwrap().is_none(), "slot cleared after the timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decide_pending_first_press_wins() {
+        let (tx, mut rx) = oneshot::channel();
+        let slot = StdMutex::new(Some(PendingApproval {
+            request: edit_request(),
+            deadline: Instant::now() + Duration::from_secs(60),
+            answer: Some(tx),
+        }));
+        assert!(decide_pending(&slot, true));
+        assert!(
+            !decide_pending(&slot, false),
+            "the slot is empty after the first press"
+        );
+        assert_eq!(rx.try_recv(), Ok(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_prompt_input_chars_backspace_esc_enter() {
+        let root = scratch("prompt");
+        touch(&root, "a.txt");
+        let mut budget = MAX_TREE_NODES;
+        let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
+        let mut state = CodeState::new(&tree);
+        state.sel = 1; // a.txt (root, a.txt in preorder)
+        assert!(state.handle_key(Key::Enter, &root, 24));
+        assert_eq!(state.mode, CodeMode::View);
+
+        // e opens the prompt; letters accumulate; backspace deletes.
+        assert!(state.handle_key(Key::Edit, &root, 24));
+        assert_eq!(state.mode, CodeMode::Prompt);
+        assert!(state.handle_key(Key::Char('a'), &root, 24));
+        assert!(state.handle_key(Key::Char('b'), &root, 24));
+        assert!(state.handle_key(Key::Backspace, &root, 24));
+        assert_eq!(state.prompt, "a");
+
+        // Esc cancels back to the file, prompt cleared.
+        assert!(state.handle_key(Key::Esc, &root, 24));
+        assert_eq!(state.mode, CodeMode::View);
+        assert_eq!(state.prompt, "");
+
+        // Enter submits: the mode flips to Turn, the text kept for the
+        // loop's submit boundary.
+        assert!(state.handle_key(Key::Edit, &root, 24));
+        assert!(state.handle_key(Key::Char('x'), &root, 24));
+        assert!(state.handle_key(Key::Enter, &root, 24));
+        assert_eq!(state.mode, CodeMode::Turn);
+        assert_eq!(state.prompt, "x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_edit_renders_the_diff_in_the_right_pane() {
+        let root = scratch("draw-diff");
+        touch(&root, "a.txt");
+        let mut budget = MAX_TREE_NODES;
+        let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
+        let mut state = CodeState::new(&tree);
+        state.mode = CodeMode::Turn;
+        let req = edit_request();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let paint = Paint::with_colors(false);
+        let frame = draw(
+            &state,
+            &root,
+            None,
+            &paint,
+            90,
+            24,
+            Some((&req, deadline)),
+            &VecDeque::new(),
+        );
+        assert!(frame.contains("edit_file note.txt"), "{frame}");
+        assert!(frame.contains("- hello"), "{frame}");
+        assert!(frame.contains("+ hello from the drill"), "{frame}");
+        assert!(frame.contains("y apply · n deny ("), "{frame}");
+        assert!(frame.contains("left — deny on timeout"), "{frame}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn turn_pane_shows_the_event_log_when_nothing_pends() {
+        let root = scratch("draw-log");
+        touch(&root, "a.txt");
+        let mut budget = MAX_TREE_NODES;
+        let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
+        let mut state = CodeState::new(&tree);
+        state.mode = CodeMode::Turn;
+        let mut log = VecDeque::new();
+        log.push_back("[chain] policy → allow".to_string());
+        log.push_back("[infer] mock provider".to_string());
+        log.push_back("[report] complete — 2 step(s)".to_string());
+        let paint = Paint::with_colors(false);
+        let frame = draw(&state, &root, None, &paint, 90, 24, None, &log);
+        assert!(frame.contains("[chain] policy"), "{frame}");
+        assert!(frame.contains("[report] complete"), "{frame}");
     }
 }

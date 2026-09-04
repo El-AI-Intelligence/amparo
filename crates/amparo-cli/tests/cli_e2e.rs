@@ -5161,6 +5161,38 @@ async fn code_report_piped_zero_escapes() {
 }
 
 #[tokio::test]
+async fn code_piped_report_stays_an_honest_report() {
+    let _guard = LOCK.lock().await;
+    // A unique scratch tree under the shared workspace (the #174 lesson:
+    // never share a fixture path across tests that may run in parallel).
+    let tree = workspace().join("code-e2e-honest");
+    std::fs::remove_dir_all(&tree).ok();
+    std::fs::create_dir_all(tree.join("src")).expect("src dir");
+    std::fs::write(tree.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+    std::fs::write(tree.join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("Cargo.toml");
+    let prior = set_workspace_env();
+
+    // Piped mode has no edit surface — the report is all it prints, and
+    // none of the edit copy (diff lines, approval card, y/n status bar)
+    // can leak into it. Editing needs a terminal; the report must not
+    // pretend otherwise.
+    let out = run_with(&["code", tree.to_str().expect("utf8 path")]).await;
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let text = stdout(&out);
+    assert!(text.contains("amparo code —"), "{text}");
+    assert!(text.contains("main.rs"), "{text}");
+    assert!(!text.contains("\x1b["), "zero escapes:\n{text}");
+    assert!(!text.contains("approval"), "{text}");
+    assert!(!text.contains("edit_file"), "{text}");
+    assert!(!text.contains("patch_file"), "{text}");
+    assert!(!text.contains("y apply"), "{text}");
+
+    restore_workspace_env(prior);
+    std::fs::remove_dir_all(&tree).ok();
+}
+
+#[tokio::test]
 async fn code_missing_root_exits_1() {
     let _guard = LOCK.lock().await;
     let out = run_with(&["code", "/nonexistent-amparo-root-xyz"]).await;

@@ -84,7 +84,9 @@ pub(crate) fn term_width() -> Option<usize> {
 #[cfg(unix)]
 use std::io::Read;
 
-/// One byte, or `None` on a read timeout (VMIN=1, VTIME=1).
+/// One byte, or `None` on EOF. With VMIN=1 this read blocks until a
+/// byte arrives — it never times out; [`poll_byte`] is the timed
+/// variant.
 #[cfg(unix)]
 pub(crate) fn read_byte(stdin: &mut std::io::Stdin) -> Option<u8> {
     let mut b = [0u8; 1];
@@ -94,6 +96,40 @@ pub(crate) fn read_byte(stdin: &mut std::io::Stdin) -> Option<u8> {
             Ok(_) => return Some(b[0]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return None,
+        }
+    }
+}
+
+/// One byte if stdin delivers within the window, `None` on timeout —
+/// the code surface's tick source: its reader loop must re-render the
+/// approval countdown between keypresses, so it polls instead of
+/// blocking inside [`read_byte`] (with VMIN=1 that read never times
+/// out). The TUI keeps the blocking reader; only the coding surface
+/// polls.
+#[cfg(unix)]
+pub(crate) fn poll_byte(stdin: &mut std::io::Stdin, millis: u64) -> Option<u8> {
+    let mut fds = [libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    loop {
+        match unsafe { libc::poll(fds.as_mut_ptr(), 1, millis as libc::c_int) } {
+            n if n > 0 => {
+                // POLLHUP can carry a final byte — read it out.
+                if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                    return read_byte(stdin);
+                }
+                return None;
+            }
+            0 => return None,
+            _ => {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
         }
     }
 }

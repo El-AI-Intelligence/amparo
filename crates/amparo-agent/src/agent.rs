@@ -122,6 +122,12 @@ pub struct AgentConfig {
     pub max_steps: usize,
     /// Tools at tiers above this ceiling are blocked outright.
     pub trust_ceiling: ToolTrustTier,
+    /// Tools at or above this tier park at the approval gate before
+    /// execution (a policy Escalate always parks regardless). Default
+    /// `ExternalEffector` — the code surface's edit turns lower it to
+    /// `LocalMutating` so every edit asks its diff-accept question
+    /// (M13 W2).
+    pub approval_threshold: ToolTrustTier,
     /// Override the provider's default model for every request.
     pub model: Option<String>,
     /// Override the provider's default completion token limit.
@@ -139,6 +145,7 @@ impl Default for AgentConfig {
         Self {
             max_steps: DEFAULT_MAX_STEPS,
             trust_ceiling: ToolTrustTier::SystemControl,
+            approval_threshold: ToolTrustTier::ExternalEffector,
             model: None,
             max_tokens: None,
             temperature: None,
@@ -1955,15 +1962,17 @@ impl Agent {
             .as_ref()
             .map(|policy| classify(&self.registry, policy, call));
 
-        // Human-approval gate — tier ≥ ExternalEffector or a policy
-        // Escalate. The gate decides how a human is asked and when to
-        // auto-deny; Amparo's built-ins auto-deny.
-        if escalate_pending || tier >= ToolTrustTier::ExternalEffector {
+        // Human-approval gate — tier at/above the config's threshold or
+        // a policy Escalate. The gate decides how a human is asked and
+        // when to auto-deny; Amparo's built-ins auto-deny. The default
+        // threshold is ExternalEffector; surfaces that want to ask on
+        // local edits (the code surface's diff-accept, M13 W2) lower it.
+        if escalate_pending || tier >= self.config.approval_threshold {
             let mut ask_reasons = reasons.clone();
             if escalate_pending {
                 ask_reasons.push("policy escalated this call for human review".to_string());
             }
-            if tier >= ToolTrustTier::ExternalEffector {
+            if tier >= self.config.approval_threshold {
                 ask_reasons.push(format!("tool tier {:?} requires human approval", tier));
             }
             let approval_request = ApprovalRequest {
@@ -3134,6 +3143,84 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, AgentStep::ToolResult(r) if !r.success)));
+    }
+
+    #[tokio::test]
+    async fn local_mutating_parks_at_the_gate_when_the_threshold_is_lowered() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+
+        let (echo, calls) = EchoTool::new(ToolTrustTier::LocalMutating);
+        let registry = registry_with(Arc::new(echo));
+
+        // The code surface's edit turns run at this threshold (M13 W2):
+        // every local edit asks its diff-accept question, denied here.
+        let gate = RecordingGate::new(false);
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(gate.clone())
+            .with_config(AgentConfig {
+                approval_threshold: ToolTrustTier::LocalMutating,
+                ..Default::default()
+            });
+        let report = agent.run("do a thing").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.requests().len(), 1);
+        assert!(gate.requests()[0]
+            .reasons
+            .iter()
+            .any(|r| r.contains("requires human approval")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| matches!(s, AgentStep::ToolResult(r) if !r.success)));
+    }
+
+    #[tokio::test]
+    async fn local_mutating_executes_when_the_lowered_threshold_approves() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+
+        let (echo, calls) = EchoTool::new(ToolTrustTier::LocalMutating);
+        let registry = registry_with(Arc::new(echo));
+
+        let gate = RecordingGate::new(true);
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(gate.clone())
+            .with_config(AgentConfig {
+                approval_threshold: ToolTrustTier::LocalMutating,
+                ..Default::default()
+            });
+        let report = agent.run("do a thing").await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "approved local edit executes"
+        );
+        assert_eq!(gate.requests().len(), 1);
+        assert_eq!(report.status, TaskStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn default_threshold_does_not_park_local_mutating_calls() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+
+        let (echo, calls) = EchoTool::new(ToolTrustTier::LocalMutating);
+        let registry = registry_with(Arc::new(echo));
+
+        // Default config (threshold ExternalEffector): local mutating calls
+        // run behind the policy chain only — every other surface stays
+        // byte-for-byte as it was; only the code surface lowers it.
+        let gate = RecordingGate::new(false);
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(gate.clone());
+        let report = agent.run("do a thing").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            gate.requests().is_empty(),
+            "the gate is not consulted below the default threshold"
+        );
+        assert_eq!(report.status, TaskStatus::Complete);
     }
 
     #[tokio::test]

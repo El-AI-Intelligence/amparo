@@ -34,8 +34,11 @@
 //!   zero escapes.
 //! - `amparo code [DIR]` is the coding-terminal surface (M13): an
 //!   alternate-screen file tree with the workspace's git marks, file
-//!   opening, and (later) diff-accept editing and the run/build pane.
-//!   Piped, it degrades to a plain-text report with zero escapes.
+//!   opening, and diff-accept editing — one instruction on the open
+//!   file, the proposed change rendered as a diff and applied with a
+//!   single `y` under a 60-second fail-closed deadline (the run/build
+//!   pane is still ahead). Piped, it degrades to a plain-text report
+//!   with zero escapes.
 //! - `amparo wizard` writes the first-run profile: four ruled steps —
 //!   workspace, LLM endpoint, optional Guardrail policy (wire check URL,
 //!   key, console URL), optional Engram memory URL — saved locally (mode
@@ -108,7 +111,8 @@ SUBCOMMANDS:
              chain rendered live (banner, gutter rows, approval cards,
              status line); piped: one task per stdin line
   code       the coding-terminal surface: an alternate-screen file tree
-             with git marks; piped: a plain-text report
+             with git marks and diff-accept editing; piped: a plain-text
+             report
   wizard     the first-run profile: workspace, LLM endpoint, optional
              Guardrail policy (check URL, key, console URL), optional
              Engram memory URL — saved locally (0600), read back at boot

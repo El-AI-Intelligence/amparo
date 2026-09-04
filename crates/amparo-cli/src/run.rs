@@ -148,6 +148,11 @@ pub struct RunFlags {
     pub auto_approve: bool,
     pub auto_deny: bool,
     pub trust_ceiling: ToolTrustTier,
+    /// Tools at or above this tier park at the approval gate (no CLI
+    /// flag — `amparo run`/`tui`/`chat` keep the ExternalEffector
+    /// default; the code surface's edit turns set LocalMutating so every
+    /// edit asks its diff-accept question, M13 W2).
+    pub approval_threshold: ToolTrustTier,
     pub max_steps: Option<usize>,
     pub model: Option<String>,
     pub timeout_secs: Option<u64>,
@@ -185,6 +190,7 @@ impl Default for RunFlags {
             auto_approve: false,
             auto_deny: false,
             trust_ceiling: ToolTrustTier::SystemControl,
+            approval_threshold: ToolTrustTier::ExternalEffector,
             max_steps: None,
             model: None,
             timeout_secs: None,
@@ -765,6 +771,7 @@ pub(crate) async fn wire_with(
         agent_config.max_steps = steps;
     }
     agent_config.trust_ceiling = flags.trust_ceiling;
+    agent_config.approval_threshold = flags.approval_threshold;
     agent_config.model = flags.model.clone();
     // The report's cost lines (M8 W1 + W4) use the same rate the loop
     // carried — captured before the config moves into the agent.
