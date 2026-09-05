@@ -47,9 +47,11 @@
 //! backspace only (no cursor motion). Scientific voice, `[tag]` lines,
 //! `—` in copy, no emoji.
 
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,8 +66,10 @@ use amparo_agent::{
 };
 use amparo_tools::git::GitStatusTool;
 #[cfg(unix)]
+use amparo_tools::ToolResult;
+#[cfg(unix)]
 use amparo_tools::ToolTrustTier;
-use amparo_tools::{PathPolicy, ToolCall, ToolExecutor, ToolResult};
+use amparo_tools::{PathPolicy, ToolCall, ToolExecutor};
 #[cfg(unix)]
 use async_trait::async_trait;
 use serde_json::json;

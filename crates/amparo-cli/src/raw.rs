@@ -67,13 +67,6 @@ pub(crate) fn term_width() -> Option<usize> {
     term_size().map(|(cols, _)| cols)
 }
 
-/// The terminal size, in (columns, rows) — always `None` on non-unix
-/// platforms (no raw mode there at all).
-#[cfg(not(unix))]
-pub(crate) fn term_size() -> Option<(usize, usize)> {
-    None
-}
-
 /// The terminal width, in columns — always `None` on non-unix platforms
 /// (no raw mode there at all).
 #[cfg(not(unix))]
