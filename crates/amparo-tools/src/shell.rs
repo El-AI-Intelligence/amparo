@@ -458,18 +458,24 @@ mod tests {
     async fn test_streaming_stderr_flagged() {
         let policy = test_policy();
         let mut lines: Vec<(bool, String)> = Vec::new();
-        // `1>&2` redirects in both bash and cmd.
+        // `1>&2` redirects in both bash and cmd — but cmd strips the
+        // redirect token and leaves its preceding space behind, so the
+        // emitted line is `err-line ` on Windows, `err-line` on unix.
+        #[cfg(unix)]
+        let expected = "err-line";
+        #[cfg(windows)]
+        let expected = "err-line ";
         let result = run_command_streaming(&policy, "echo err-line 1>&2", 30, |is_stderr, l| {
             lines.push((is_stderr, l.to_string()));
         })
         .await;
         assert!(result.success);
         assert!(
-            lines.iter().any(|(err, l)| *err && l == "err-line"),
+            lines.iter().any(|(err, l)| *err && l == expected),
             "stderr line not flagged: {:?}",
             lines
         );
-        assert_eq!(result.output["stderr"], "err-line\n");
+        assert_eq!(result.output["stderr"], format!("{expected}\n"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
