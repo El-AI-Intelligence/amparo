@@ -8,8 +8,39 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-09-05
+
+M13, landed: the coding surface — `amparo code` opens a directory as an
+interactive editor (file tree with git marks, diff-accept edits through
+the gate chain, a streaming build/shell pane), and the reveal program's
+platform verification and cross-surface handoff land alongside it: CI on
+three OSes at the pinned MSRV, the fan-out approval hub, and the Telegram
+receiver.
+
 ### Added
 
+- **`amparo code [DIR]`** (the M13 coding surface): an alternate-screen
+  editor — a file tree with the workspace's git marks, open-file viewing,
+  diff-accept edits (with a file open, `e` submits one instruction as a
+  one-shot agent turn behind the same gate chain as `amparo run`; the
+  proposed diff renders and each hunk is accepted or rejected), and a run
+  pane (`b` runs the detected build, `!` runs one shell command) that
+  streams the build/shell output live, scrollable, with esc-abort. Piped,
+  it degrades to a one-shot report.
+- **Streaming build/shell seams in `amparo-tools`**:
+  `run_command_streaming` / `run_build_streaming` stream the child's
+  stdout/stderr through a line callback (the first line is the command
+  echo); both share the confined-spawn helpers with `execute()`, so the
+  blocklist, env hygiene and timeouts cannot drift between the two paths.
+- **The fan-out approval gate (R3a)**: with `--approval-endpoint`, the
+  TUI renders the approval card locally *and* publishes it to the hub —
+  the endpoint is now a publication target, not an exclusive web gate.
+  Deny wins and is latched at the hub; a surface timeout is a deny.
+- **The Telegram receiver (R3b)**: `amparo chat telegram --receiver URL`
+  relays the hub's pending approvals to the operator chat with inline
+  approve/deny buttons and posts the press back (`AMPARO_APPROVAL_TOKEN`
+  is the hub credential). The live drill covered the phone-approve and
+  Telegram-press paths against the deployed hub.
 - **CI on three platforms**: a GitHub Actions matrix (Linux, macOS,
   Windows) runs both gates at the pinned MSRV (1.85) with warnings denied,
   and a tag-triggered release workflow builds all five installer targets
@@ -17,6 +48,11 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ### Changed
 
+- **Wall-clock tool timings**: the `[exec]` line renders `duration_ms`,
+  which every tool hardcoded to 0 — multi-second calls (`fetch_url`,
+  builds) displayed as instant. `execute_call` (the CLI run / chat loop
+  path) now stamps real elapsed time per attempt, matching what the MCP
+  path's registry already did.
 - **Platform scratch dirs**: the file/shell sandbox and the preflight
   blast-radius classifier now use platform-aware shared scratch roots —
   `/tmp` and `/dev/shm` on Unix, the system temp directory on Windows

@@ -158,7 +158,7 @@ on a GUI.
   the schedule ticker.
 - **`amparo-cli`** — the one binary: `run`, `resume`, `privacy`,
   `schedule`, `skill`, `notebook`, `doctor`, `chat`, `mcp-serve`, `tui`,
-  `wizard`, `version`.
+  `wizard`, `code`, `version`.
 
 ```sh
 cargo test --workspace            # the behavior gate
@@ -224,6 +224,19 @@ boot to fill environment gaps (env always wins). Steps 3 and 4 print
 delegation guidance: the sibling CLI found on PATH
 ("`guardrail link` pairs this machine") or its install one-liner.
 
+`amparo code [DIR]` is the coding terminal: on a unix terminal it opens
+an alternate-screen file tree with the workspace's git marks — move and
+open files, and with a file open `e` submits one instruction as a
+one-shot agent turn behind the same gate chain as `amparo run`, with the
+proposed diff rendered hunk by hunk for acceptance. `b` runs the
+detected build and `!` runs one shell command, both streaming their
+output live in a scrollable pane (esc aborts a running command). Piped,
+it degrades to a one-shot report. The approval card that gates the edit
+turn can fan out to the hub: `amparo tui --approval-endpoint URL`
+publishes it, and `amparo chat telegram --receiver URL` relays the hub's
+pending approvals to a chat with inline buttons — deny wins, latched at
+the hub.
+
 ## Environment surface
 
 | Variable | Meaning |
@@ -238,6 +251,7 @@ delegation guidance: the sibling CLI found on PATH
 | `AMPARO_WORKSPACE` | Directory the tools are confined to |
 | `AMPARO_POLICY_KEY` | API key for a remote policy engine (with `--policy-url`) |
 | `AMPARO_CONSOLE_POLICY_URL` | Guardrail Console URL the TUI's `/policy` commands write through (the wizard saves it; default `https://guardrail.elai-intelligence.com`) |
+| `AMPARO_APPROVAL_TOKEN` | Hub credential for `amparo chat telegram --receiver` (relaying and pressing back the hub's pending approvals) |
 | `AMPARO_MEMORY_BACKEND` | `engram` selects the Engram backend (with `AMPARO_ENGRAM_URL` / `AMPARO_ENGRAM_KEY`) |
 | `AMPARO_CHAT_TELEGRAM_TOKEN` | Bot token for `amparo chat telegram` |
 | `AMPARO_CHAT_DISCORD_TOKEN` | Bot token for `amparo chat discord` |
@@ -281,6 +295,7 @@ the user who started a task can decide it.
 | 11 | Coordination & surfaces | ✅ landed — the blackboard, `send_notification`, rollback groups, the web-approval seam, MCP spawn, the CLI scheduler |
 | 12 | Engram + Guardrail native, web surface | ✅ landed — the Engram memory backend, Guardrail-native policy, and the web surface live at amparo.ellmstack.dev |
 | 13 | Ecosystem terminal | ✅ landed — the TUI writes into both siblings (`/memory`, `/policy`, `!` escape), the wizard's 10-answer contract delegates credentials, org deny rules apply to console-routed checks |
+| 14 | Coding surface | ✅ landed — `amparo code` opens a directory (file tree, diff-accept edits, streaming build/shell panes, piped report) |
 
 **Giving this to other people** — a shell-executing agent behind a chat
 bot is a security boundary, and the operator owns it: the TOML tenant
