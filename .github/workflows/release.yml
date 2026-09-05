@@ -91,6 +91,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # gh release create shells out to git to resolve the repo —
+      # without a checkout there is no .git and it exits 1.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist-release
