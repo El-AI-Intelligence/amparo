@@ -335,10 +335,38 @@ struct BuildError {
     severity: String,
 }
 
+/// Strips ANSI CSI sequences (SGR colors, cursor controls) so colored
+/// build output — cargo with `CARGO_TERM_COLOR=always`, say, which the
+/// CI gate's environment sets — parses exactly like plain output. Only
+/// ASCII CSI sequences are stripped; everything else is copied through
+/// unchanged.
+fn strip_ansi(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // ESC [ parameters final-byte — skip the whole sequence.
+            let mut j = i + 2;
+            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            i = if j < bytes.len() { j + 1 } else { bytes.len() };
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i] != 0x1b {
+                i += 1;
+            }
+            out.push_str(&line[start..i]);
+        }
+    }
+    out
+}
+
 fn parse_build_errors(output: &str) -> Vec<BuildError> {
     let mut errors = Vec::new();
     for line in output.lines() {
-        let line = line.trim();
+        let line = strip_ansi(line.trim());
         // Rust: "error[E0308]: mismatched types" or "error: could not compile"
         if line.starts_with("error") {
             errors.push(BuildError {
@@ -405,6 +433,14 @@ mod tests {
         assert!(errors.len() >= 2);
         assert_eq!(errors[0].file, "main.go");
         assert_eq!(errors[0].line, Some(12));
+    }
+
+    #[test]
+    fn parse_errors_ignores_ansi_color() {
+        let output = "\u{1b}[1;31merror\u{1b}[0m: could not find `Cargo.toml`\n\
+                      \u{1b}[31merror[E0308]\u{1b}[0m: mismatched types";
+        let errors = parse_build_errors(output);
+        assert!(errors.len() >= 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

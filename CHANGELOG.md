@@ -8,6 +8,13 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+### Fixed
+
+- Colored build output no longer hides errors: `parse_build_errors`
+  strips ANSI CSI sequences before matching, so a build spawned under
+  `CARGO_TERM_COLOR=always` (the CI gate's environment) counts and
+  reports errors exactly like a plain one.
+
 ## [0.12.0] — 2026-09-05
 
 M13, landed: the coding surface — `amparo code` opens a directory as an
