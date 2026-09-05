@@ -36,9 +36,10 @@
 //!   alternate-screen file tree with the workspace's git marks, file
 //!   opening, and diff-accept editing — one instruction on the open
 //!   file, the proposed change rendered as a diff and applied with a
-//!   single `y` under a 60-second fail-closed deadline (the run/build
-//!   pane is still ahead). Piped, it degrades to a plain-text report
-//!   with zero escapes.
+//!   single `y` under a 60-second fail-closed deadline — plus a run
+//!   pane: `b` runs the detected build, `!` runs one shell command,
+//!   both streaming the output live. Piped, it degrades to a
+//!   plain-text report with zero escapes.
 //! - `amparo wizard` writes the first-run profile: four ruled steps —
 //!   workspace, LLM endpoint, optional Guardrail policy (wire check URL,
 //!   key, console URL), optional Engram memory URL — saved locally (mode

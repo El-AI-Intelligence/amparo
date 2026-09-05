@@ -22,6 +22,15 @@
 //! executes through the tools' own [`PathPolicy`] and the policy engine —
 //! no new write path, no policy bypass.
 //!
+//! Running (M13 W3): `b` runs the detected build, `!` opens a one-line
+//! shell prompt — either way the right pane becomes a live run pane
+//! streaming the child's output line by line through the tools crate's
+//! `run_build_streaming` / `run_command_streaming` seams (the same
+//! blocklist, confinement and timeouts the collecting tools use — the
+//! keystroke that opened the pane is the approval, like the TUI's `!`
+//! escape). Esc aborts a running command; a finished run keeps its log
+//! for ↑↓ scrolling until esc closes the pane back to where it opened.
+//!
 //! **Degraded shapes** (all documented, all honest):
 //! - *Piped* (`amparo code DIR < /dev/null`): a plain-text report — the
 //!   tree plus the git summary, zero escapes. Editing needs a terminal;
@@ -54,9 +63,9 @@ use amparo_agent::{
     format_event, AgentEvent, ApprovalGate, ApprovalRequest, EventSink, TaskStatus,
 };
 use amparo_tools::git::GitStatusTool;
-use amparo_tools::{PathPolicy, ToolCall, ToolExecutor};
 #[cfg(unix)]
 use amparo_tools::ToolTrustTier;
+use amparo_tools::{PathPolicy, ToolCall, ToolExecutor, ToolResult};
 #[cfg(unix)]
 use async_trait::async_trait;
 use serde_json::json;
@@ -69,9 +78,9 @@ use tokio::sync::oneshot;
 // needs: the module-level `allow(dead_code, unused_variables)` on Windows
 // does not cover unused imports.
 #[cfg(unix)]
-use crate::run::{self, RunFlags, Surface};
-#[cfg(unix)]
 use crate::raw::{enter_raw_mode, poll_byte, read_byte, term_size};
+#[cfg(unix)]
+use crate::run::{self, RunFlags, Surface};
 
 const CODE_USAGE: &str = "\
 amparo code — the coding terminal
@@ -84,12 +93,12 @@ ARGS:
 
 On a unix terminal this opens an alternate-screen file tree with the
 workspace's git marks: ↑↓ move, ↵ open a file or toggle a directory,
-r rescan, q quit. With a file open, e edits: type an instruction, ↵
-submits it as one agent turn behind the same gate chain as
-`amparo run`, and any proposed write is approved with a single y
-(apply) or n (deny) press under a 60-second fail-closed deadline.
-Piped, it prints a plain-text report — the tree plus the git summary,
-zero escapes.";
+b run the detected build, ! run one shell command, r rescan, q quit.
+With a file open, e edits: type an instruction, ↵ submits it as one
+agent turn behind the same gate chain as `amparo run`, and any
+proposed write is approved with a single y (apply) or n (deny) press
+under a 60-second fail-closed deadline. Piped, it prints a plain-text
+report — the tree plus the git summary, zero escapes.";
 
 /// The node budget for one tree build — a runaway directory (a mount
 /// point, a cache) can never make the surface hang or the frame enormous.
@@ -112,6 +121,11 @@ const EDIT_APPROVAL_SECS: u64 = 60;
 /// holds a screen's worth; the cap bounds the memory, not the story.
 #[cfg(unix)]
 const EDIT_LOG_LINES: usize = 200;
+
+/// The run pane's log keeps at most this many lines — a pane's worth of
+/// tail is enough to read back; the cap bounds the memory, not the story.
+#[cfg(unix)]
+const RUN_LOG_LINES: usize = 500;
 
 /// One node of the tree — a directory with children, or a file.
 #[derive(Debug)]
@@ -340,7 +354,9 @@ fn parse_code_flags(args: impl Iterator<Item = String>) -> ParseCodeResult {
         match a.as_str() {
             "--help" | "-h" => return ParseCodeResult::Help,
             _ if a.starts_with('-') => {
-                return ParseCodeResult::Error(format!("unknown flag {a}; see `amparo code --help`"))
+                return ParseCodeResult::Error(format!(
+                    "unknown flag {a}; see `amparo code --help`"
+                ))
             }
             _ if dir.is_none() => dir = Some(PathBuf::from(a)),
             _ => {
@@ -379,7 +395,9 @@ pub(crate) async fn dispatch(args: impl Iterator<Item = String>) {
             let interactive_asked = std::io::stdin().is_terminal();
             let controls = interactive_asked
                 && std::io::stdout().is_terminal()
-                && std::env::var_os("TERM").map(|t| t != "dumb").unwrap_or(true);
+                && std::env::var_os("TERM")
+                    .map(|t| t != "dumb")
+                    .unwrap_or(true);
 
             #[cfg(unix)]
             if controls {
@@ -666,6 +684,10 @@ enum Key {
     Rescan,
     /// `e` — open the edit prompt (view mode).
     Edit,
+    /// `b` — run the detected build in the run pane.
+    Build,
+    /// `!` — open the run prompt (one shell command).
+    Shell,
     /// `y` — apply the parked approval.
     Yes,
     /// `n` — deny the parked approval (permanent for that call).
@@ -691,6 +713,8 @@ fn decode_key(first: u8, next: &mut dyn FnMut() -> Option<u8>) -> Key {
         b'j' | b'J' => Key::Down,
         b'k' | b'K' => Key::Up,
         b'e' | b'E' => Key::Edit,
+        b'b' | b'B' => Key::Build,
+        b'!' => Key::Shell,
         b'y' | b'Y' => Key::Yes,
         b'n' | b'N' => Key::No,
         0x7f | 0x08 => Key::Backspace,
@@ -931,10 +955,11 @@ fn decide_pending(slot: &StdMutex<Option<PendingApproval>>, approved: bool) -> b
 /// pends. Drives the status-bar countdown re-render.
 #[cfg(unix)]
 fn pending_remaining(slot: &StdMutex<Option<PendingApproval>>) -> Option<u64> {
-    slot.lock()
-        .unwrap()
-        .as_ref()
-        .map(|p| p.deadline.saturating_duration_since(Instant::now()).as_secs())
+    slot.lock().unwrap().as_ref().map(|p| {
+        p.deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+    })
 }
 
 /// Reads one string argument — `(unset)` when the model omitted it.
@@ -1026,6 +1051,38 @@ enum CodeMode {
     Prompt,
     /// One agent turn is running — approvals answer with `y`/`n`.
     Turn,
+    /// The run pane owns the right pane — a command streams, or its
+    /// finished log waits for scrolling.
+    Run,
+}
+
+/// What a prompt is for — the edit instruction and the run command
+/// share the one-line input path but submit to different panes.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PromptKind {
+    /// One instruction for the open file's agent turn.
+    Edit,
+    /// One shell command for the run pane.
+    Shell,
+}
+
+/// One run-pane job — a shell command (`Some`) or the detected build
+/// (`None`), opened from `origin` and returning there when the pane
+/// closes.
+#[cfg(unix)]
+struct RunJob {
+    /// Where esc returns when the pane closes.
+    origin: CodeMode,
+    /// The shell command — `None` runs the auto-detected build.
+    command: Option<String>,
+    /// True while the streaming task owns the child.
+    running: bool,
+    /// The final (success, status-line) once the job finished.
+    outcome: Option<(bool, String)>,
+    /// Log scroll offset, in lines (finished panes only — a running
+    /// pane pins to the tail).
+    scroll: usize,
 }
 
 /// The surface state between frames.
@@ -1047,6 +1104,13 @@ struct CodeState {
     view_path: Option<PathBuf>,
     /// The instruction prompt's text.
     prompt: String,
+    /// What the prompt is for when it opens.
+    prompt_kind: PromptKind,
+    /// Where the prompt returns when canceled (and where its run
+    /// returns when the pane closes).
+    prompt_origin: CodeMode,
+    /// The run pane's job, when one is open.
+    run: Option<RunJob>,
     /// One-shot status-bar notice (`(is_error, line)`) — a turn outcome
     /// or a cancelation; any next key clears it.
     notice: Option<(bool, String)>,
@@ -1069,6 +1133,9 @@ impl CodeState {
             mode: CodeMode::Tree,
             view_path: None,
             prompt: String::new(),
+            prompt_kind: PromptKind::Edit,
+            prompt_origin: CodeMode::View,
+            run: None,
             notice: None,
         }
     }
@@ -1084,6 +1151,9 @@ impl CodeState {
         self.view_path = None;
         self.mode = CodeMode::Tree;
         self.prompt.clear();
+        self.prompt_kind = PromptKind::Edit;
+        self.prompt_origin = CodeMode::View;
+        self.run = None;
         self.notice = None;
     }
 
@@ -1120,12 +1190,32 @@ impl CodeState {
             CodeMode::Prompt => match k {
                 Key::Enter => {
                     // The submit boundary: the loop reads this mode flip
-                    // and spawns the turn (an empty instruction cancels).
-                    self.mode = CodeMode::Turn;
+                    // and spawns the turn or the run (an empty input
+                    // cancels).
+                    match self.prompt_kind {
+                        PromptKind::Edit => self.mode = CodeMode::Turn,
+                        PromptKind::Shell => {
+                            let text = std::mem::take(&mut self.prompt);
+                            if text.trim().is_empty() {
+                                // An empty command cancels — back to
+                                // where the prompt opened.
+                                self.mode = self.prompt_origin;
+                            } else {
+                                self.run = Some(RunJob {
+                                    origin: self.prompt_origin,
+                                    command: Some(text),
+                                    running: true,
+                                    outcome: None,
+                                    scroll: 0,
+                                });
+                                self.mode = CodeMode::Run;
+                            }
+                        }
+                    }
                     true
                 }
                 Key::Esc | Key::Quit => {
-                    self.mode = CodeMode::View;
+                    self.mode = self.prompt_origin;
                     self.prompt.clear();
                     true
                 }
@@ -1139,9 +1229,10 @@ impl CodeState {
                 }
                 _ => false,
             },
-            // The turn owns the reader: only y/n/Esc are routed by the
-            // loop; everything else is ignored here.
+            // The turn and the run pane own the reader: only their keys
+            // route through the loop; everything else is ignored here.
             CodeMode::Turn => false,
+            CodeMode::Run => false,
             CodeMode::View => match k {
                 Key::Esc | Key::Quit => {
                     self.view = None;
@@ -1151,7 +1242,13 @@ impl CodeState {
                 }
                 Key::Edit => {
                     self.mode = CodeMode::Prompt;
+                    self.prompt_kind = PromptKind::Edit;
+                    self.prompt_origin = CodeMode::View;
                     self.prompt.clear();
+                    true
+                }
+                Key::Build | Key::Shell => {
+                    self.open_run(k);
                     true
                 }
                 Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown => {
@@ -1232,10 +1329,71 @@ impl CodeState {
                     }
                     true
                 }
+                Key::Build | Key::Shell => {
+                    self.open_run(k);
+                    true
+                }
                 _ => false,
             },
         }
     }
+
+    /// Opens run work from the current mode: the build pane
+    /// immediately (`Key::Build`), or the shell prompt that will carry
+    /// one command (`Key::Shell`). The origin is where esc returns.
+    fn open_run(&mut self, kind: Key) {
+        let origin = self.mode;
+        if kind == Key::Build {
+            self.run = Some(RunJob {
+                origin,
+                command: None,
+                running: true,
+                outcome: None,
+                scroll: 0,
+            });
+            self.mode = CodeMode::Run;
+        } else {
+            self.mode = CodeMode::Prompt;
+            self.prompt_kind = PromptKind::Shell;
+            self.prompt_origin = origin;
+            self.prompt.clear();
+        }
+    }
+}
+
+/// The pane's label — `[run]` for a shell command, `[build]` for the
+/// detected build.
+#[cfg(unix)]
+fn run_label(command: &Option<String>) -> &'static str {
+    if command.is_some() {
+        "[run]"
+    } else {
+        "[build]"
+    }
+}
+
+/// The job's final status line, from the streaming result — block
+/// reasons, spawn errors and exit codes exactly as the tools reported
+/// them, plus the elapsed seconds.
+#[cfg(unix)]
+fn run_job_status(label: &str, result: &ToolResult, elapsed: Duration) -> (bool, String) {
+    let secs = elapsed.as_secs();
+    if result.output.get("blocked") == Some(&json!(true)) {
+        let reason = result.output["block_reason"].as_str().unwrap_or("policy");
+        return (false, format!("{label} blocked — {reason}"));
+    }
+    if let Some(e) = result.output["error"].as_str() {
+        return (false, format!("{label} {e}"));
+    }
+    let code = result.output["exit_code"].as_i64().unwrap_or(-1);
+    let extra = match result.output["error_count"].as_u64() {
+        Some(n) if n > 0 => format!(" — {n} error(s)"),
+        _ => String::new(),
+    };
+    (
+        result.success,
+        format!("{label} exit {code}{extra} — {secs}s"),
+    )
 }
 
 /// Renders one frame. Every row is clipped to its pane and erased to the
@@ -1250,6 +1408,7 @@ fn draw(
     h: usize,
     pending: Option<(&ApprovalRequest, Instant)>,
     log: &VecDeque<String>,
+    run_log: &[String],
 ) -> String {
     let mut out = String::new();
     out.push_str("\x1b[?25l\x1b[H");
@@ -1275,9 +1434,7 @@ fn draw(
         match pending {
             Some((req, deadline)) => {
                 let mut lines = approval_diff(req);
-                let remaining = deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_secs();
+                let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
                 lines.push(format!("── {remaining}s left — deny on timeout"));
                 lines
             }
@@ -1309,7 +1466,9 @@ fn draw(
             let painted = paint.apply(Ink::Dim, &indent)
                 + &paint.apply(Ink::Dim, glyph)
                 + &paint.apply(if f.is_dir { Ink::Accent } else { Ink::Fg }, &name)
-                + &f.mark.map(|m| format!(" {}", mark_text(m, paint))).unwrap_or_default();
+                + &f.mark
+                    .map(|m| format!(" {}", mark_text(m, paint)))
+                    .unwrap_or_default();
             let mut row = clip_painted(&painted, tree_w);
             if row_idx == state.sel {
                 row = paint.rev(&row);
@@ -1334,11 +1493,20 @@ fn draw(
                     };
                     paint.apply(ink, &clip(line, pane_w))
                 }),
-                CodeMode::Prompt => match r {
-                    0 => paint.apply(Ink::Dim, "editing — one instruction, ↵ submits"),
-                    1 => paint.apply(
+                CodeMode::Prompt => match (state.prompt_kind, r) {
+                    (PromptKind::Edit, 0) => {
+                        paint.apply(Ink::Dim, "editing — one instruction, ↵ submits")
+                    }
+                    (PromptKind::Edit, 1) => paint.apply(
                         Ink::Dim,
                         "the turn runs behind the same gate chain as `amparo run`",
+                    ),
+                    (PromptKind::Shell, 0) => {
+                        paint.apply(Ink::Dim, "run — one shell command, ↵ runs")
+                    }
+                    (PromptKind::Shell, 1) => paint.apply(
+                        Ink::Dim,
+                        "commands run in the opened directory, blocklist intact",
                     ),
                     _ => String::new(),
                 },
@@ -1349,6 +1517,38 @@ fn draw(
                             Some(content) => {
                                 let num = paint.apply(Ink::Dim, &format!("{:>4} ", idx + 1));
                                 format!("{num}{}", clip(content, pane_w.saturating_sub(5)))
+                            }
+                            None => String::new(),
+                        }
+                    }
+                    None => String::new(),
+                },
+                CodeMode::Run => match &state.run {
+                    Some(job) => {
+                        let idx = if job.running {
+                            // A running pane pins to the tail.
+                            run_log.len().saturating_sub(body_h) + r
+                        } else {
+                            job.scroll + r
+                        };
+                        match run_log.get(idx) {
+                            Some(line) => {
+                                let ink = if idx == 0 {
+                                    // The command echo.
+                                    Ink::Bold
+                                } else if !job.running && idx + 1 == run_log.len() {
+                                    // The final status line, by outcome.
+                                    match job.outcome {
+                                        Some((true, _)) => Ink::Ok,
+                                        _ => Ink::Bad,
+                                    }
+                                } else if line.starts_with("  ") {
+                                    // A stderr line, marked by its indent.
+                                    Ink::Dim
+                                } else {
+                                    Ink::Fg
+                                };
+                                paint.apply(ink, &clip(line, pane_w))
                             }
                             None => String::new(),
                         }
@@ -1382,26 +1582,30 @@ fn draw(
     // Status bar, inverse across the full width. A one-shot notice
     // replaces the legend entirely.
     let legend = match state.mode {
-        CodeMode::Prompt => {
-            let rel = state
-                .view_path
-                .as_ref()
-                .map(|p| {
-                    p.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.display().to_string())
-                })
-                .unwrap_or_else(|| "file".to_string());
-            format!(
-                "edit {rel}: {}█ · ↵ submit · esc cancel",
-                clip(&state.prompt, w.saturating_sub(30).max(8))
-            )
-        }
+        CodeMode::Prompt => match state.prompt_kind {
+            PromptKind::Edit => {
+                let rel = state
+                    .view_path
+                    .as_ref()
+                    .map(|p| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string())
+                    })
+                    .unwrap_or_else(|| "file".to_string());
+                format!(
+                    "edit {rel}: {}█ · ↵ submit · esc cancel",
+                    clip(&state.prompt, w.saturating_sub(30).max(8))
+                )
+            }
+            PromptKind::Shell => format!(
+                "run: {}█ · ↵ run · esc cancel",
+                clip(&state.prompt, w.saturating_sub(28).max(8))
+            ),
+        },
         CodeMode::Turn => match pending {
             Some((_, deadline)) => {
-                let remaining = deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_secs();
+                let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
                 format!("y apply · n deny ({remaining}s)")
             }
             None => "edit running — y/n answer approvals · esc cancel".to_string(),
@@ -1419,7 +1623,21 @@ fn draw(
                 .unwrap_or(("", 1, 1));
             format!("viewing {rel} — line {line}/{total} · ↑↓ scroll · e edit · esc back · q quit{trunc}")
         }
-        CodeMode::Tree => "↑↓ move · ↵ open · r rescan · q quit".to_string(),
+        CodeMode::Run => match &state.run {
+            Some(job) => {
+                let what = match &job.command {
+                    Some(c) => format!("run {}", clip(c, 40)),
+                    None => "build (auto-detected)".to_string(),
+                };
+                if job.running {
+                    format!("{what} — running · esc aborts")
+                } else {
+                    format!("{what} — ↑↓ scroll · esc back")
+                }
+            }
+            None => "run pane".to_string(),
+        },
+        CodeMode::Tree => "↑↓ move · ↵ open · b build · ! run · r rescan · q quit".to_string(),
     };
     let legend = match &state.notice {
         Some((is_error, line)) => paint.apply(
@@ -1481,6 +1699,11 @@ fn run_interactive(
     let mut edit_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut last_remaining: Option<u64> = None;
     let mut utf8_buf: Vec<u8> = Vec::new();
+    // The run pane's log and its streaming task — the task owns the
+    // child; the log is cleared when a job spawns.
+    let run_log: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let mut run_task: Option<tokio::task::JoinHandle<(bool, String)>> = None;
+    let mut last_run_len: Option<usize> = None;
 
     let result = (|| -> Result<(), String> {
         loop {
@@ -1526,14 +1749,33 @@ fn run_interactive(
                 last_remaining = None;
                 dirty = true;
             }
+            // The run finished (or died) since the last frame — fold
+            // its outcome into the pane. The task itself pushes the
+            // final status line into the log.
+            if run_task.as_ref().map(|t| t.is_finished()).unwrap_or(false) {
+                let task = run_task.take().expect("checked");
+                let (success, status) = match handle.block_on(task) {
+                    Ok(r) => r,
+                    Err(_) => (false, "aborted".to_string()),
+                };
+                if let Some(job) = state.run.as_mut() {
+                    job.running = false;
+                    job.outcome = Some((success, status));
+                    // A finished pane opens pinned to the tail.
+                    let body_h = last_size.1.saturating_sub(2).max(1);
+                    let log_len = run_log.lock().unwrap().len();
+                    job.scroll = log_len.saturating_sub(body_h);
+                }
+                last_run_len = None;
+                dirty = true;
+            }
             if dirty {
                 let (w, h) = last_size;
                 let frame = {
                     let pending_guard = pending.lock().unwrap();
-                    let pending_view = pending_guard
-                        .as_ref()
-                        .map(|p| (&p.request, p.deadline));
+                    let pending_view = pending_guard.as_ref().map(|p| (&p.request, p.deadline));
                     let log_guard = log.lock().unwrap();
+                    let run_log_guard = run_log.lock().unwrap();
                     draw(
                         &state,
                         &root,
@@ -1543,6 +1785,7 @@ fn run_interactive(
                         h,
                         pending_view,
                         &log_guard,
+                        &run_log_guard,
                     )
                 };
                 out.write_all(frame.as_bytes()).map_err(|e| e.to_string())?;
@@ -1566,6 +1809,14 @@ fn run_interactive(
                             last_remaining = remaining;
                             dirty = true;
                         }
+                    } else if state.mode == CodeMode::Run {
+                        // The run pane streams — re-render when the log
+                        // grew.
+                        let len = run_log.lock().unwrap().len();
+                        if last_run_len != Some(len) {
+                            last_run_len = Some(len);
+                            dirty = true;
+                        }
                     }
                 }
                 Key::Quit => {
@@ -1580,6 +1831,10 @@ fn run_interactive(
                         state.notice = Some((false, "edit canceled".to_string()));
                         last_remaining = None;
                         dirty = true;
+                    } else if state.mode == CodeMode::Run {
+                        if run_pane_escape(&mut state, &mut run_task, &run_log, &mut last_run_len) {
+                            dirty = true;
+                        }
                     } else if state.mode == CodeMode::Tree {
                         break; // q quits from the tree, backs out elsewhere
                     } else if state.handle_key(key, &root, last_size.1) {
@@ -1597,6 +1852,10 @@ fn run_interactive(
                         state.notice = Some((false, "edit canceled".to_string()));
                         last_remaining = None;
                         dirty = true;
+                    } else if state.mode == CodeMode::Run {
+                        if run_pane_escape(&mut state, &mut run_task, &run_log, &mut last_run_len) {
+                            dirty = true;
+                        }
                     } else if state.handle_key(key, &root, last_size.1) {
                         state.follow(last_size.1.saturating_sub(2).max(1));
                         dirty = true;
@@ -1646,10 +1905,42 @@ fn run_interactive(
                         dirty = true;
                     }
                 }
-                k => {
-                    if state.mode != CodeMode::Turn
+                k @ (Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown) => {
+                    if state.mode == CodeMode::Run {
+                        // The finished pane scrolls its log like the
+                        // view pane scrolls a file — a running pane
+                        // pins to the tail and ignores these.
+                        if let Some(job) = &mut state.run {
+                            if !job.running {
+                                let log_len = run_log.lock().unwrap().len();
+                                let body_h = last_size.1.saturating_sub(2).max(1);
+                                match k {
+                                    Key::Up => job.scroll = job.scroll.saturating_sub(1),
+                                    Key::Down => {
+                                        job.scroll =
+                                            (job.scroll + 1).min(log_len.saturating_sub(body_h));
+                                    }
+                                    Key::Home => job.scroll = 0,
+                                    Key::End => job.scroll = log_len.saturating_sub(body_h),
+                                    Key::PageUp => job.scroll = job.scroll.saturating_sub(body_h),
+                                    Key::PageDown => {
+                                        job.scroll = (job.scroll + body_h)
+                                            .min(log_len.saturating_sub(body_h));
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                dirty = true;
+                            }
+                        }
+                    } else if state.mode != CodeMode::Turn
                         && state.handle_key(k, &root, last_size.1)
                     {
+                        state.follow(last_size.1.saturating_sub(2).max(1));
+                        dirty = true;
+                    }
+                }
+                k => {
+                    if state.mode != CodeMode::Turn && state.handle_key(k, &root, last_size.1) {
                         state.follow(last_size.1.saturating_sub(2).max(1));
                         dirty = true;
                     }
@@ -1686,6 +1977,20 @@ fn run_interactive(
                 last_remaining = None;
                 dirty = true;
             }
+            // Tree/View → Run is the run boundary: spawn the streaming
+            // task, which owns the child from here.
+            if state.mode == CodeMode::Run
+                && run_task.is_none()
+                && state.run.as_ref().map(|j| j.running).unwrap_or(false)
+            {
+                run_log.lock().unwrap().clear();
+                let policy = PathPolicy::from_root(root.clone());
+                let command = state.run.as_ref().and_then(|j| j.command.clone());
+                let log = Arc::clone(&run_log);
+                run_task = Some(handle.spawn(run_streaming_task(command, policy, log)));
+                last_run_len = Some(0);
+                dirty = true;
+            }
         }
         Ok(())
     })();
@@ -1696,6 +2001,77 @@ fn run_interactive(
         .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
     result
+}
+
+/// Esc/q while the run pane is open: a running command aborts (the
+/// child dies with the dropped task — kill_on_drop — and the partial
+/// log stays in the pane), a finished pane closes back to its origin.
+/// Returns true when the frame changed.
+#[cfg(unix)]
+fn run_pane_escape(
+    state: &mut CodeState,
+    run_task: &mut Option<tokio::task::JoinHandle<(bool, String)>>,
+    run_log: &StdMutex<Vec<String>>,
+    last_run_len: &mut Option<usize>,
+) -> bool {
+    let mut dirty = false;
+    if let Some(job) = &mut state.run {
+        if job.running {
+            // Cancels the running command: kill the child and leave
+            // the partial log in the pane.
+            if let Some(task) = run_task.take() {
+                task.abort();
+            }
+            job.running = false;
+            let label = run_label(&job.command);
+            job.outcome = Some((false, format!("{label} aborted")));
+            run_log.lock().unwrap().push(format!("{label} aborted"));
+            state.notice = Some((false, format!("{label} aborted")));
+            *last_run_len = None;
+            dirty = true;
+        } else {
+            // Esc closes the finished pane back to where it opened.
+            state.mode = job.origin;
+            state.run = None;
+            dirty = true;
+        }
+    }
+    dirty
+}
+
+/// One run-pane job: streams the shell command or the detected build
+/// through the tools crate's streaming seams — the same blocklist,
+/// confinement and timeouts as the collecting tools (the keystroke
+/// that opened the pane is the approval, like the TUI's `!` escape).
+/// Every line lands in the shared log; the final status line is pushed
+/// too and returned for the fold.
+#[cfg(unix)]
+async fn run_streaming_task(
+    command: Option<String>,
+    policy: PathPolicy,
+    log: Arc<StdMutex<Vec<String>>>,
+) -> (bool, String) {
+    let started = Instant::now();
+    let label = run_label(&command);
+    let on_line = |is_stderr: bool, line: &str| {
+        let mut log = log.lock().unwrap();
+        // Stderr lines carry an indent so the pane can dim them.
+        log.push(if is_stderr {
+            format!("  {line}")
+        } else {
+            line.to_string()
+        });
+        while log.len() > RUN_LOG_LINES {
+            log.remove(0);
+        }
+    };
+    let result = match &command {
+        Some(cmd) => amparo_tools::shell::run_command_streaming(&policy, cmd, 30, on_line).await,
+        None => amparo_tools::build::run_build_streaming(&policy, None, 300, on_line).await,
+    };
+    let (success, status) = run_job_status(label, &result, started.elapsed());
+    log.lock().unwrap().push(status.clone());
+    (success, status)
 }
 
 /// One agent turn for the edit prompt: the same gate chain as
@@ -1716,10 +2092,7 @@ async fn run_edit_turn(
     let gate: Arc<dyn ApprovalGate> = Arc::new(CodeApprovalGate::new(Arc::clone(&pending)));
     let surface = Surface {
         events: Arc::new(EditSink),
-        approval: Some((
-            gate,
-            "you, at this terminal — 60s fail-closed".to_string(),
-        )),
+        approval: Some((gate, "you, at this terminal — 60s fail-closed".to_string())),
         banner: edit_banner,
         line: edit_line,
         notice: edit_line,
@@ -1734,7 +2107,9 @@ async fn run_edit_turn(
         TaskStatus::Complete => Ok(format!("[report] complete — {} step(s)", report.steps_used)),
         TaskStatus::Failed => Err(format!(
             "edit failed — {}",
-            report.final_answer.unwrap_or_else(|| "no final answer".to_string())
+            report
+                .final_answer
+                .unwrap_or_else(|| "no final answer".to_string())
         )),
     }
 }
@@ -1823,9 +2198,17 @@ mod tests {
         marks.insert(root.join("dirty.rs"), 'M');
         let mut budget = MAX_TREE_NODES;
         let tree = build_tree(&root, &marks, &mut budget).expect("build");
-        let dirty = tree.children.iter().find(|c| c.name == "dirty.rs").expect("dirty");
+        let dirty = tree
+            .children
+            .iter()
+            .find(|c| c.name == "dirty.rs")
+            .expect("dirty");
         assert_eq!(dirty.mark, Some('M'));
-        let clean = tree.children.iter().find(|c| c.name == "clean.rs").expect("clean");
+        let clean = tree
+            .children
+            .iter()
+            .find(|c| c.name == "clean.rs")
+            .expect("clean");
         assert_eq!(clean.mark, None);
     }
 
@@ -1889,7 +2272,10 @@ mod tests {
     fn clip_painted_counts_columns_not_escapes() {
         let paint = Paint::with_colors(true);
         let painted = paint.apply(Ink::Dim, "abcdef");
-        assert_eq!(clip_painted(&painted, 3), format!("{}abc\x1b[0m", "\x1b[2;38;2;148;163;184m"));
+        assert_eq!(
+            clip_painted(&painted, 3),
+            format!("{}abc\x1b[0m", "\x1b[2;38;2;148;163;184m")
+        );
         assert_eq!(clip_painted("abc", 5), "abc");
     }
 
@@ -1968,6 +2354,9 @@ mod tests {
             mode: CodeMode::Tree,
             view_path: None,
             prompt: String::new(),
+            prompt_kind: PromptKind::Edit,
+            prompt_origin: CodeMode::View,
+            run: None,
             notice: None,
         };
         // Move the selection to main.rs (root, src, main.rs in preorder).
@@ -1989,7 +2378,17 @@ mod tests {
         let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
         let state = CodeState::new(&tree);
         let paint = Paint::with_colors(false);
-        let frame = draw(&state, &root, None, &paint, 80, 24, None, &VecDeque::new());
+        let frame = draw(
+            &state,
+            &root,
+            None,
+            &paint,
+            80,
+            24,
+            None,
+            &VecDeque::new(),
+            &[],
+        );
         assert_eq!(frame.lines().count(), 24, "{frame}");
         assert!(frame.starts_with("\x1b[?25l\x1b[H"), "{frame}");
     }
@@ -2012,9 +2411,27 @@ mod tests {
                 mark: None,
                 kids: 1..4,
             },
-            FlatNode { depth: 1, name: "a".into(), is_dir: false, mark: None, kids: 0..0 },
-            FlatNode { depth: 1, name: "b".into(), is_dir: false, mark: None, kids: 0..0 },
-            FlatNode { depth: 1, name: "c".into(), is_dir: false, mark: None, kids: 0..0 },
+            FlatNode {
+                depth: 1,
+                name: "a".into(),
+                is_dir: false,
+                mark: None,
+                kids: 0..0,
+            },
+            FlatNode {
+                depth: 1,
+                name: "b".into(),
+                is_dir: false,
+                mark: None,
+                kids: 0..0,
+            },
+            FlatNode {
+                depth: 1,
+                name: "c".into(),
+                is_dir: false,
+                mark: None,
+                kids: 0..0,
+            },
         ];
         state.visible = compute_visible(&state.flat, &state.collapsed);
         state.sel = 3;
@@ -2124,7 +2541,10 @@ mod tests {
         req.arguments = serde_json::json!({"command": "rm -rf /"});
         let lines = approval_diff(&req);
         assert_eq!(lines[0], "approval required — shell_command rm -rf /");
-        assert!(lines[1].starts_with("  why:      policy allows"), "{lines:?}");
+        assert!(
+            lines[1].starts_with("  why:      policy allows"),
+            "{lines:?}"
+        );
         assert_eq!(lines[2], "  blast:    not classified");
         assert_eq!(lines[3], "  rollback: none declared");
     }
@@ -2166,7 +2586,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         assert!(!task.await.expect("task"), "timeout denies");
-        assert!(slot.lock().unwrap().is_none(), "slot cleared after the timeout");
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "slot cleared after the timeout"
+        );
     }
 
     #[cfg(unix)]
@@ -2241,6 +2664,7 @@ mod tests {
             24,
             Some((&req, deadline)),
             &VecDeque::new(),
+            &[],
         );
         assert!(frame.contains("edit_file note.txt"), "{frame}");
         assert!(frame.contains("- hello"), "{frame}");
@@ -2263,8 +2687,326 @@ mod tests {
         log.push_back("[infer] mock provider".to_string());
         log.push_back("[report] complete — 2 step(s)".to_string());
         let paint = Paint::with_colors(false);
-        let frame = draw(&state, &root, None, &paint, 90, 24, None, &log);
+        let frame = draw(&state, &root, None, &paint, 90, 24, None, &log, &[]);
         assert!(frame.contains("[chain] policy"), "{frame}");
         assert!(frame.contains("[report] complete"), "{frame}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_decoder_routes_run_keys() {
+        assert_eq!(decode_key(b'b', &mut feed(b"")), Key::Build);
+        assert_eq!(decode_key(b'B', &mut feed(b"")), Key::Build);
+        assert_eq!(decode_key(b'!', &mut feed(b"")), Key::Shell);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_key_opens_the_run_pane_from_tree() {
+        let root = scratch("run-build");
+        touch(&root, "a.txt");
+        let mut budget = MAX_TREE_NODES;
+        let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
+        let mut state = CodeState::new(&tree);
+        assert!(state.handle_key(Key::Build, &root, 24));
+        assert_eq!(state.mode, CodeMode::Run);
+        let job = state.run.expect("job opened");
+        assert_eq!(job.origin, CodeMode::Tree);
+        assert_eq!(job.command, None, "b runs the auto-detected build");
+        assert!(job.running);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_prompt_submits_one_command_and_cancels() {
+        let root = scratch("run-shell");
+        touch(&root, "a.txt");
+        let mut budget = MAX_TREE_NODES;
+        let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
+        let mut state = CodeState::new(&tree);
+        state.sel = 1; // a.txt
+        assert!(state.handle_key(Key::Enter, &root, 24));
+        assert_eq!(state.mode, CodeMode::View);
+
+        // `!` opens the shell prompt from the view; esc cancels cleanly.
+        assert!(state.handle_key(Key::Shell, &root, 24));
+        assert_eq!(state.mode, CodeMode::Prompt);
+        assert_eq!(state.prompt_kind, PromptKind::Shell);
+        assert_eq!(state.prompt_origin, CodeMode::View);
+        assert!(state.handle_key(Key::Char('x'), &root, 24));
+        assert!(state.handle_key(Key::Esc, &root, 24));
+        assert_eq!(state.mode, CodeMode::View);
+        assert_eq!(state.prompt, "");
+        assert!(state.run.is_none());
+
+        // A typed command submits into a running job from the origin.
+        assert!(state.handle_key(Key::Shell, &root, 24));
+        for c in "echo hi".chars() {
+            assert!(state.handle_key(Key::Char(c), &root, 24));
+        }
+        assert!(state.handle_key(Key::Enter, &root, 24));
+        assert_eq!(state.mode, CodeMode::Run);
+        let job = state.run.expect("job opened");
+        assert_eq!(job.origin, CodeMode::View);
+        assert_eq!(job.command.as_deref(), Some("echo hi"));
+        assert!(job.running);
+
+        // An empty command cancels back to the origin instead.
+        state.mode = CodeMode::View;
+        state.run = None;
+        assert!(state.handle_key(Key::Shell, &root, 24));
+        assert!(state.handle_key(Key::Enter, &root, 24));
+        assert_eq!(state.mode, CodeMode::View);
+        assert!(state.run.is_none());
+    }
+
+    /// A ToolResult in the streaming seams' shape, for status-line tests.
+    #[cfg(unix)]
+    fn tool_result(success: bool, output: Value) -> ToolResult {
+        ToolResult {
+            tool_call_id: "t".to_string(),
+            tool_name: "run_command".to_string(),
+            success,
+            output,
+            display_summary: String::new(),
+            duration_ms: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_job_status_reports_the_tools_verdicts() {
+        let blocked = tool_result(
+            false,
+            json!({"command": "sudo rm -rf /", "blocked": true, "block_reason": "sudo denied"}),
+        );
+        let (ok, status) = run_job_status("[run]", &blocked, Duration::from_secs(3));
+        assert!(!ok);
+        assert_eq!(status, "[run] blocked — sudo denied");
+
+        let timed_out = tool_result(false, json!({"error": "timeout", "timeout_seconds": 1}));
+        let (ok, status) = run_job_status("[build]", &timed_out, Duration::from_secs(31));
+        assert!(!ok);
+        assert_eq!(status, "[build] timeout");
+
+        let built = tool_result(
+            true,
+            json!({"success": true, "exit_code": 0, "error_count": 2, "command": "cargo build"}),
+        );
+        let (ok, status) = run_job_status("[build]", &built, Duration::from_secs(3));
+        assert!(ok);
+        assert_eq!(status, "[build] exit 0 — 2 error(s) — 3s");
+
+        let failed = tool_result(false, json!({"exit_code": 1}));
+        let (ok, status) = run_job_status("[run]", &failed, Duration::from_secs(3));
+        assert!(!ok);
+        assert_eq!(status, "[run] exit 1 — 3s");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_pane_draws_the_log_and_tints_the_status() {
+        let root = scratch("draw-run");
+        touch(&root, "a.txt");
+        let mut budget = MAX_TREE_NODES;
+        let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
+        let mut state = CodeState::new(&tree);
+        state.mode = CodeMode::Run;
+        state.run = Some(RunJob {
+            origin: CodeMode::Tree,
+            command: Some("echo hi".to_string()),
+            running: false,
+            outcome: Some((true, "[run] exit 0 — 0s".to_string())),
+            scroll: 0,
+        });
+        let run_log = vec![
+            "$ echo hi".to_string(),
+            "hi".to_string(),
+            "  warn-line".to_string(),
+            "[run] exit 0 — 0s".to_string(),
+        ];
+        let paint = Paint::with_colors(true);
+        let frame = draw(
+            &state,
+            &root,
+            None,
+            &paint,
+            90,
+            24,
+            None,
+            &VecDeque::new(),
+            &run_log,
+        );
+        // The command echo is bold, stderr lines dim (their indent marks
+        // them), and the final status line carries the outcome tint.
+        assert!(
+            frame.contains("\x1b[1;38;2;226;232;240m$ echo hi\x1b[0m"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("\x1b[2;38;2;148;163;184m  warn-line\x1b[0m"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("\x1b[38;2;16;185;129m[run] exit 0 — 0s\x1b[0m"),
+            "{frame}"
+        );
+
+        // A failed outcome tints the status bad instead.
+        state.run.as_mut().unwrap().outcome = Some((false, "[run] exit 1 — 0s".to_string()));
+        let run_log = vec![
+            "$ echo hi".to_string(),
+            "hi".to_string(),
+            "[run] exit 1 — 0s".to_string(),
+        ];
+        let frame = draw(
+            &state,
+            &root,
+            None,
+            &paint,
+            90,
+            24,
+            None,
+            &VecDeque::new(),
+            &run_log,
+        );
+        assert!(
+            frame.contains("\x1b[38;2;239;68;68m[run] exit 1 — 0s\x1b[0m"),
+            "{frame}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_pane_pins_to_the_tail() {
+        let root = scratch("draw-run-pin");
+        touch(&root, "a.txt");
+        let mut budget = MAX_TREE_NODES;
+        let tree = build_tree(&root, &HashMap::new(), &mut budget).expect("build");
+        let mut state = CodeState::new(&tree);
+        state.mode = CodeMode::Run;
+        state.run = Some(RunJob {
+            origin: CodeMode::Tree,
+            command: Some("long".to_string()),
+            running: true,
+            outcome: None,
+            scroll: 0,
+        });
+        // More lines than the body (h=10 → 8 body rows): a running pane
+        // shows the tail, so the oldest line is off-screen.
+        let run_log: Vec<String> = (0..30).map(|i| format!("line-{i}")).collect();
+        let paint = Paint::with_colors(false);
+        let frame = draw(
+            &state,
+            &root,
+            None,
+            &paint,
+            90,
+            10,
+            None,
+            &VecDeque::new(),
+            &run_log,
+        );
+        assert!(frame.contains("line-29"), "{frame}");
+        assert!(frame.contains("line-22"), "{frame}");
+        assert!(!frame.contains("line-0"), "{frame}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_pane_escape_closes_a_finished_pane_back_to_its_origin() {
+        let mut state = CodeState::new(&Node {
+            name: "root".into(),
+            is_dir: true,
+            mark: None,
+            children: Vec::new(),
+            truncated: false,
+        });
+        state.mode = CodeMode::Run;
+        state.run = Some(RunJob {
+            origin: CodeMode::View,
+            command: Some("echo hi".to_string()),
+            running: false,
+            outcome: Some((true, "[run] exit 0 — 0s".to_string())),
+            scroll: 0,
+        });
+        let run_log = StdMutex::new(vec!["[run] exit 0 — 0s".to_string()]);
+        let mut last_run_len = Some(1);
+        let mut run_task = None;
+        assert!(run_pane_escape(
+            &mut state,
+            &mut run_task,
+            &run_log,
+            &mut last_run_len
+        ));
+        assert_eq!(state.mode, CodeMode::View);
+        assert!(state.run.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_pane_escape_aborts_a_running_job() {
+        let mut state = CodeState::new(&Node {
+            name: "root".into(),
+            is_dir: true,
+            mark: None,
+            children: Vec::new(),
+            truncated: false,
+        });
+        state.mode = CodeMode::Run;
+        state.run = Some(RunJob {
+            origin: CodeMode::Tree,
+            command: Some("sleep 30".to_string()),
+            running: true,
+            outcome: None,
+            scroll: 0,
+        });
+        let run_log = StdMutex::new(vec!["$ sleep 30".to_string()]);
+        let mut last_run_len = Some(1);
+        let mut run_task: Option<tokio::task::JoinHandle<(bool, String)>> =
+            Some(tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }));
+        assert!(run_pane_escape(
+            &mut state,
+            &mut run_task,
+            &run_log,
+            &mut last_run_len
+        ));
+        let job = state
+            .run
+            .as_ref()
+            .expect("the aborted pane stays open for its log");
+        assert!(!job.running);
+        assert_eq!(job.outcome, Some((false, "[run] aborted".to_string())));
+        assert_eq!(state.notice, Some((false, "[run] aborted".to_string())));
+        assert_eq!(
+            *run_log.lock().unwrap(),
+            vec!["$ sleep 30", "[run] aborted"]
+        );
+        assert_eq!(last_run_len, None);
+        assert_eq!(state.mode, CodeMode::Run);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_streaming_task_streams_a_shell_command() {
+        let root = scratch("stream-task");
+        let policy = PathPolicy::from_root(root.clone());
+        let log: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (success, status) = run_streaming_task(
+            Some("echo task-marker".to_string()),
+            policy,
+            Arc::clone(&log),
+        )
+        .await;
+        assert!(success, "{status}");
+        let log = log.lock().unwrap();
+        assert_eq!(log[0], "$ echo task-marker");
+        assert!(log.contains(&"task-marker".to_string()));
+        assert_eq!(*log.last().unwrap(), status, "the status line ends the log");
+        assert!(status.starts_with("[run] exit 0 —"), "{status}");
     }
 }
