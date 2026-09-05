@@ -2123,9 +2123,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            // Serve the two real checks; an abandoned connection (the
+            // client opened and dropped it) reads empty and is not one
+            // of them — skip it and wait for the request that arrived.
+            while bodies.lock().unwrap().len() < 2 {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let body = read_http_body(&mut sock).await.unwrap_or_default();
+                if body.is_empty() {
+                    continue;
+                }
                 bodies.lock().unwrap().push(body);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
@@ -2207,16 +2213,24 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let _body = read_http_body(&mut sock).await.unwrap_or_default();
-            let body = r#"{"verdict":"deny","reason":"audit test","enforced":false}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
+            // The one real check is served; an abandoned connection (the
+            // client opened and dropped it) reads empty — skip it and
+            // wait for the request that actually arrived.
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                if read_http_body(&mut sock).await.unwrap_or_default().is_empty() {
+                    continue;
+                }
+                let body = r#"{"verdict":"deny","reason":"audit test","enforced":false}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                break;
+            }
         });
 
         let transport = MockTransport::new();

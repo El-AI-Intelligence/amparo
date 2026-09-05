@@ -235,6 +235,13 @@ mod tests {
                                 break;
                             }
                         }
+                        // A connection that delivered nothing (the client
+                        // opened and abandoned it) is not a request — a
+                        // real server routes nothing for it, and
+                        // dispatching would flake the per-request asserts.
+                        if buf.is_empty() {
+                            return;
+                        }
                         let split = buf
                             .windows(4)
                             .position(|w| w == b"\r\n\r\n")
