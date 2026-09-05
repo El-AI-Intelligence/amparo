@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "BYO-LLM inference layer for Amparo: OpenAI-compatible and Anthropic providers behind one trait"
+readme = "README.md"
+keywords = ['llm', 'inference', 'anthropic', 'openai', 'ai']
+categories = ['web-programming', 'api-bindings', 'asynchronous']
 
 [dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "time", "sync", "macros"] }

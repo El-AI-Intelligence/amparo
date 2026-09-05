@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Amparo's agent loop: native tool_calls, policy-gated execution, approval gates, self-verification"
+readme = "README.md"
+keywords = ['agent', 'llm', 'tool-calling', 'policy', 'ai']
+categories = ['development-tools']
 
 [dependencies]
 amparo-inference = { path = "../amparo-inference" }

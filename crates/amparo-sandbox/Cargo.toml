@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Amparo's fuel-metered WASM execution sandbox: bounded, import-free code evaluation"
+readme = "README.md"
+keywords = ['wasm', 'sandbox', 'webassembly', 'eval']
+categories = ['wasm', 'development-tools']
 
 [dependencies]
 amparo-tools = { path = "../amparo-tools" }

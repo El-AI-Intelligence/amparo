@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "The policy seam between a tool call and its execution — deny-by-default, wire-protocol client"
+readme = "README.md"
+keywords = ['policy', 'safety', 'governance', 'llm']
+categories = ['development-tools']
 
 [dependencies]
 serde = { workspace = true }

@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "The amparo CLI: drive the agent loop end-to-end, serve tools over MCP — one binary, deny-by-default"
+readme = "README.md"
+keywords = ['cli', 'agent', 'llm', 'mcp', 'ai']
+categories = ['command-line-interface', 'development-tools']
 
 [[bin]]
 name = "amparo"

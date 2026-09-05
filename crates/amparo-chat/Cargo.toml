@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Amparo's chat adapter layer: a platform-neutral transport seam, a per-chat driver and inline-button approval — Telegram, Discord and Slack behind one trait"
+readme = "README.md"
+keywords = ['telegram', 'discord', 'slack', 'chatbot', 'agent']
+categories = ['asynchronous', 'network-programming', 'api-bindings']
 
 [dependencies]
 amparo-agent = { path = "../amparo-agent" }

@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Amparo's lab notebook: PII-stripped, tenant-tagged run records written through the EventSink seam into the Memory trait"
+readme = "README.md"
+keywords = ['notebook', 'observability', 'logging', 'agent']
+categories = ['development-tools']
 
 [dependencies]
 amparo-agent = { path = "../amparo-agent" }

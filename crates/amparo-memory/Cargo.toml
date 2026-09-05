@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Context-window assembly for Amparo agent inference calls"
+readme = "README.md"
+keywords = ['memory', 'context', 'llm', 'agent']
+categories = ['development-tools']
 
 [dependencies]
 serde = { workspace = true }

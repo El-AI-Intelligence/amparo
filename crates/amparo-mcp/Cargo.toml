@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Amparo's MCP surface: serve amparo tools over Model Context Protocol, mount external MCP tools into the registry — both behind the policy gate"
+readme = "README.md"
+keywords = ['mcp', 'model-context', 'llm', 'tools']
+categories = ['api-bindings', 'development-tools']
 
 [[bin]]
 name = "amparo-mcp-serve"

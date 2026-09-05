@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Per-request privacy policy engine and PII redaction for Amparo"
+readme = "README.md"
+keywords = ['privacy', 'pii', 'redaction', 'llm']
+categories = ['text-processing']
 
 [dependencies]
 serde = { workspace = true }
