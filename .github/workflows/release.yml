@@ -74,7 +74,12 @@ jobs:
             cp "$bin/amparo" "dist/amparo-${{ matrix.target }}"
             cp "$bin/amparo-mcp-serve" "dist/amparo-mcp-serve-${{ matrix.target }}"
           fi
-          (cd dist && sha256sum * > SHA256SUMS.${{ matrix.target }})
+          # macOS has no sha256sum — shasum is its checksum tool.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            (cd dist && shasum -a 256 * > SHA256SUMS.${{ matrix.target }})
+          else
+            (cd dist && sha256sum * > SHA256SUMS.${{ matrix.target }})
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: amparo-${{ matrix.target }}
