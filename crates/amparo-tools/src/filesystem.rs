@@ -639,7 +639,7 @@ impl ToolExecutor for EditFileTool {
 
         match tokio::fs::write(&abs_path, &new_content).await {
             Ok(_) => {
-                let lines_changed =
+                let line_delta =
                     new_text.lines().count() as i64 - old_text.lines().count() as i64;
                 make_result(
                     call,
@@ -647,7 +647,7 @@ impl ToolExecutor for EditFileTool {
                     serde_json::json!({
                         "path": path,
                         "replacements": match_count,
-                        "lines_changed": lines_changed,
+                        "line_delta": line_delta,
                         "size_before": content.len(),
                         "size_after": new_content.len(),
                         "backup": backup_path,

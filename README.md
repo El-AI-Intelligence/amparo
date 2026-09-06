@@ -136,8 +136,8 @@ on a GUI.
   Anthropic, translated to one contract. Fail-closed by construction: no
   silent localhost default, per-request + stream idle timeouts, a
   `max_tokens` clamp, optional model allowlist.
-- **`amparo-agent`** — the loop and the gate chain, extracted from
-  Axiom-OS's working ReAct mechanics and rebuilt on native tool calls.
+- **`amparo-agent`** — the loop and the gate chain, extracted from the
+  ELLM lineage's working ReAct mechanics and rebuilt on native tool calls.
 - **`amparo-mcp`** — MCP first-class in both directions: `McpServer`
   (stdio JSON-RPC, every call through the same gate chain) and
   `McpClient` (spawns a server process, mounts its tools as
@@ -307,14 +307,13 @@ single-operator setups, fail-closed: absent or empty means nobody.
 
 ## Provenance
 
-The agent loop was extracted from
-[Axiom-OS](https://github.com/PixelPhantomAI/Axiom-OS) (MIT), which contains a
-working ReAct loop with tool retry, self-verification, and conversation
-trimming. What did *not* come across: the desktop compositor, screen ingestion,
-the companion loop, and the ELLM proxy coupling — see [NOTICE](NOTICE). What
-Amparo adds on top of the extracted mechanics is the runtime gate chain that
-sits between "the model asked" and "it ran" — the gap Axiom left open — shipped
-as a headless, installable, versioned binary.
+Amparo's agent core comes out of the ELLM lineage: a working ReAct loop with
+tool retry, self-verification, and conversation trimming was extracted and
+rebuilt behind a runtime gate chain — the layer that sits between "the model
+asked" and "it ran" — shipped as a headless, installable, versioned binary.
+What did *not* come across: the desktop compositor, screen ingestion, the
+companion loop, and the ELLM proxy coupling. The extraction's legal
+attribution lives in [NOTICE](NOTICE).
 
 Amparo is Apache-2.0 rather than MIT for the explicit patent grant, which
 matters more than usual for software that executes arbitrary code.
