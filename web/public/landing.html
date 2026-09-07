@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Amparo — an open agent that acts under policy</title>
+  <meta name="description" content="Amparo is an open agent that acts under policy: bring your own LLM, deny-by-default gates, human-only approval, and a ledger that records every consequential act.">
+  <link rel="stylesheet" href="/landing.css">
+</head>
+<body>
+  <header>
+    <div class="hdr">
+      <div class="brand-group">
+        <a class="brand" href="/">Amparo<span class="cursor" aria-hidden="true">█</span></a>
+        <a class="brand-company" href="https://elai-intelligence.com" aria-label="EL AI Intelligence">
+          <img class="wm-dark" src="/img/elai-wordmark-white.png" alt="EL AI Intelligence">
+          <img class="wm-light" src="/img/elai-wordmark.png" alt="EL AI Intelligence">
+        </a>
+      </div>
+      <nav>
+        <a href="#story">story</a>
+        <a href="#features">features</a>
+        <a href="#cases">use cases</a>
+        <a href="#compare">compare</a>
+        <a href="#install">install</a>
+        <a class="cta" href="/app">operator surface</a>
+      </nav>
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div>
+          <p class="eyebrow">[an open agent that acts under policy — v0.10.0]</p>
+          <h1>Capability is the market.<br>Accountability is the product.</h1>
+          <p class="lede">Amparo is an open agent that acts under policy. Your model, your policy server, deny-by-default gates, human-only approval — and a ledger that answers for every consequential act.</p>
+          <div class="cta-row">
+            <a class="btn primary" href="#install">install amparo</a>
+            <a class="btn" href="/app">operator surface →</a>
+          </div>
+        </div>
+        <div class="terminal" aria-label="amparo run example">
+          <div class="t-line"><span class="p">$</span> amparo run "migrate the staging database"</div>
+          <div class="t-line"><span class="tag-gate">[gate]</span> registry: run_command — known</div>
+          <div class="t-line"><span class="tag-gate">[gate]</span> ceiling: ok — within user limits</div>
+          <div class="t-line"><span class="tag-policy">[policy]</span> /check → ask <span class="dim">(destructive migration)</span></div>
+          <div class="t-line"><span class="tag-approval">[approval]</span> waiting on a human — 60 s fail-closed</div>
+          <div class="t-line"><span class="tag-approval">[approval]</span> approved by e@operator — 12 s</div>
+          <div class="t-line"><span class="tag-exec">[exec]</span> allowed — enforced</div>
+          <div class="t-line"><span class="tag-ledger">[ledger]</span> recorded — counts, never values</div>
+        </div>
+      </div>
+      <div class="proof-row">
+        <div class="proof-item"><b>4</b> stages before any action</div>
+        <div class="proof-item"><b>60 s</b> fail-closed approval</div>
+        <div class="proof-item"><b>0</b> model approvers</div>
+        <div class="proof-item"><b>1</b> append-only ledger</div>
+        <div class="proof-item proof-label">structural, not supervised</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="story">
+    <div class="wrap">
+      <p class="eyebrow">[story]</p>
+      <h2>Built from an audit, aimed at the axis nobody claimed.</h2>
+      <div class="beats">
+        <div class="beat">
+          <b>01</b>
+          <div>
+            <h3>It started with an audit</h3>
+            <p>A clean-sheet review of a full open agent OS found five criticals: an unauthenticated execution seam, red lines that failed open, a model approving its own actions. Guardrails bolted onto an agent loop fail. The gate chain had to be the architecture.</p>
+          </div>
+        </div>
+        <div class="beat">
+          <b>02</b>
+          <div>
+            <h3>The market split left an axis empty</h3>
+            <p>2026's agent market splits into camps — provider SDKs racing on capability, frameworks on reach, MCP at ~97M downloads a month — while policy is everywhere advisory, shaped by vendors, and unenforceable. Accountability stayed second-class.</p>
+          </div>
+        </div>
+        <div class="beat">
+          <b>03</b>
+          <div>
+            <h3>The bet</h3>
+            <p>Invert the product. Capability is borrowed — your model, your tools, any MCP mount. Accountability is built — deny-by-default, human-only approval, an append-only ledger. The result is the agent you can let act unattended, because the record answers for it.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="features" class="band-alt">
+    <div class="wrap">
+      <p class="eyebrow">[features]</p>
+      <h2>Structural, not supervised.</h2>
+      <p class="sub">Every framework sells guardrails as a feature. Here they are the architecture.</p>
+      <dl class="features">
+        <div class="feature"><dt>[gate] governance is the architecture</dt><dd>Every call walks registry → trust ceiling → policy engine → human approval. No member exits the chain — spawning a sub-agent is itself a gated call.</dd></div>
+        <div class="feature"><dt>[policy] policy is external and yours</dt><dd>An open wire spec to whatever policy engine you run. Engine errors escalate — never execute. Swap the policy server without touching the agent.</dd></div>
+        <div class="feature"><dt>[approver] a model is never the approver</dt><dd>Approval is always human, with reasons, blast radius, the delegation chain, and rollback hints in the copy.</dd></div>
+        <div class="feature"><dt>[ledger] provenance and privacy are products</dt><dd>What acted, on what, with whose approval — with PII stripped, counts never values, command text never stored, denials recorded immediately.</dd></div>
+        <div class="feature"><dt>[growth] self-improvement, gated</dt><dd>Skills are proposed, metered, and adopted through the same gate as everything else — then checked for drift and retired.</dd></div>
+        <div class="feature"><dt>[posture] a binary, not a platform</dt><dd>Rust, Apache-2.0, one binary. MCP-native in both directions — serves tools, mounts others'.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section id="cases">
+    <div class="wrap">
+      <p class="eyebrow">[use cases]</p>
+      <h2>When the cost of an unapproved action is higher than pressing a button.</h2>
+      <div class="cases">
+        <div class="case"><b>01</b><div><h3>The operator who wants to sleep</h3><p>Unattended work — approval reaches your phone; sixty seconds of silence means denial.</p></div></div>
+        <div class="case"><b>02</b><div><h3>One agent, ten clients</h3><p>Workspaces per tenant, ceilings, session tags — the policy server sees every tenant.</p></div></div>
+        <div class="case"><b>03</b><div><h3>Fintech ops with an auditor coming</h3><p>Every external action lands in the ledger, with its approver and outcome.</p></div></div>
+        <div class="case"><b>04</b><div><h3>The safe adoption path</h3><p>Audit mode first — verdicts advisory, every check logged. Flip to enforce when ready.</p></div></div>
+        <div class="case"><b>05</b><div><h3>Outbound messages, gated by a human</h3><p>Every send names its destination and waits for a human.</p></div></div>
+        <div class="case"><b>06</b><div><h3>Multi-agent work under a hard cap</h3><p>Sub-agents share a budget that fails closed when exhausted.</p></div></div>
+        <div class="case"><b>07</b><div><h3>Editing production, safely</h3><p>Backup before change — the call aborts if the backup can't be made.</p></div></div>
+        <div class="case"><b>08</b><div><h3>Untrusted computation</h3><p>A WASM sandbox with metered fuel — untrusted code can compute, never touch the host.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="compare" class="band-alt">
+    <div class="wrap">
+      <p class="eyebrow">[compare]</p>
+      <h2>One axis, held.</h2>
+      <p class="sub">Amparo doesn't compete on how much an agent can do. It competes on what an agent can do <em>with your permission and your record</em>. Its true counterpart is Hermes — built for autonomy without interruption. Same rejection of policy baked in by vendors; the opposite answer to the same question.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th></th>
+              <th class="us">Amparo</th>
+              <th>Hermes Agent</th>
+              <th>Claude Agent SDK</th>
+              <th>LangGraph</th>
+              <th>OpenAI Agents SDK</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Model support</td><td class="us">BYO — OpenAI-compatible + Anthropic</td><td>Hermes 4 default; 400+ routed</td><td>Claude only</td><td>Model-agnostic</td><td>OpenAI-centric</td></tr>
+            <tr><td>Action governance</td><td class="us">Gate chain, deny-by-default</td><td>Redirect + self-recovery</td><td>Permission modes, hooks</td><td>Graph approval gates</td><td>Input/output guardrails</td></tr>
+            <tr><td>Human approval</td><td class="us">Every consequential call, 60 s fail-closed</td><td>On request</td><td>Configurable prompts</td><td>Conditional edges</td><td>None built-in</td></tr>
+            <tr><td>Memory</td><td class="us">Trait + built-in store; Engram recommended</td><td>Built-in, persistent</td><td>Session resume</td><td>Checkpointed state</td><td>Session state</td></tr>
+            <tr><td>Interop</td><td class="us">MCP server + client</td><td>MCP + A2A</td><td>200+ MCP servers</td><td>MCP ecosystem</td><td>MCP; handoffs</td></tr>
+            <tr><td>License</td><td class="us">Apache-2.0</td><td>MIT</td><td>MIT</td><td>MIT</td><td>MIT</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="split">
+        <div class="half wins">
+          <h3>wins here</h3>
+          <ul>
+            <li><b>Unattended work</b> — the agent stops <em>for</em> you, never around you: approval reaches your phone.</li>
+            <li><b>Multi-tenant and regulated contexts</b> — ceilings per tenant, session tags, a ledger an auditor can read.</li>
+            <li><b>Policy that must bind</b> — external, enforceable, swappable; engine errors escalate, never execute.</li>
+            <li><b>The adoption curve</b> — audit mode lets you watch verdicts before they bind.</li>
+          </ul>
+        </div>
+        <div class="half loses">
+          <h3>not the right tool here</h3>
+          <ul>
+            <li><b>Raw capability breadth</b> — it rides your model and your MCP tools; it adds no secret capability of its own.</li>
+            <li><b>Frictionless autonomy</b> — every consequential call waits for a human. That is the product.</li>
+            <li><b>Platform features</b> — no hosted cloud, no vendor tool marketplace.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="wrap">
+      <p class="eyebrow">[install]</p>
+      <h2>Bring it onto your device.</h2>
+      <p class="sub">One command per platform. Checksums verified — no sudo, no secrets, no telemetry.</p>
+      <div class="tabs">
+        <input type="radio" name="plat" id="tab-linux" checked>
+        <input type="radio" name="plat" id="tab-macos">
+        <input type="radio" name="plat" id="tab-windows">
+        <input type="radio" name="plat" id="tab-phone">
+        <div class="tab-labels">
+          <label for="tab-linux">linux</label>
+          <label for="tab-macos">macos</label>
+          <label for="tab-windows">windows</label>
+          <label for="tab-phone">phone</label>
+        </div>
+        <div class="pane" data-pane="linux">
+          <div class="terminal install-term">
+            <div class="t-line"><span class="p">$</span> curl -fsSL https://downloads.ellmstack.dev/amparo/install.sh | bash</div>
+            <div class="t-line"><span class="tag-ledger">[install]</span> ~/.local/bin/amparo — done</div>
+          </div>
+          <p class="note">x86_64 and arm64 · checksums verified</p>
+        </div>
+        <div class="pane" data-pane="macos">
+          <div class="terminal install-term">
+            <div class="t-line"><span class="p">$</span> curl -fsSL https://downloads.ellmstack.dev/amparo/install.sh | bash</div>
+            <div class="t-line"><span class="tag-ledger">[install]</span> ~/.local/bin/amparo — ad hoc signed</div>
+          </div>
+          <p class="note">apple silicon and intel · quarantine cleared + ad hoc signed at install</p>
+        </div>
+        <div class="pane" data-pane="windows">
+          <div class="terminal install-term">
+            <div class="t-line"><span class="p">&gt;</span> irm https://downloads.ellmstack.dev/amparo/install.ps1 | iex</div>
+            <div class="t-line"><span class="tag-ledger">[install]</span> %LOCALAPPDATA%\amparo\bin\amparo.exe — on PATH</div>
+          </div>
+          <p class="note">powershell · x86_64 · no admin required</p>
+        </div>
+        <div class="pane" data-pane="phone">
+          <p class="sub">Phones don't run the agent — they drive it. Run Amparo on a server or your laptop, then operate it from anywhere:</p>
+          <ul class="phone-list">
+            <li><b>operator surface</b> — <a href="/app">amparo.ellmstack.dev/app</a> · add to home screen from your phone's browser</li>
+            <li><b>chat adapters</b> — tasks and approvals arrive in Telegram, Discord, or Slack via <code>amparo chat</code></li>
+          </ul>
+        </div>
+      </div>
+      <p class="sub">Then point it at your model and your policy server:</p>
+      <div class="terminal install-term">
+        <div class="t-line"><span class="p">$</span> AMPARO_INFERENCE_URL=https://your-model/v1 \</div>
+        <div class="t-line">  AMPARO_POLICY_URL=https://your-policy-engine \</div>
+        <div class="t-line">  amparo run "your first task"</div>
+      </div>
+      <p class="note">apache-2.0 · bring your own LLM · no account</p>
+    </div>
+  </section>
+
+  <footer>
+    <div class="ftr">
+      <div class="brand-group">
+        <span class="brand">Amparo<span class="cursor" aria-hidden="true">█</span></span>
+        <a class="brand-company" href="https://elai-intelligence.com" aria-label="EL AI Intelligence">
+          <img class="wm-dark" src="/img/elai-wordmark-white.png" alt="EL AI Intelligence">
+          <img class="wm-light" src="/img/elai-wordmark.png" alt="EL AI Intelligence">
+        </a>
+      </div>
+      <p class="meta">an open agent that acts under policy · v0.12.0 · apache-2.0</p>
+      <p class="meta"><a href="/changelog">changelog</a> · <a href="/feed.xml">rss</a> · <a href="/version.json">version.json</a></p>
+    </div>
+  </footer>
+</body>
+</html>

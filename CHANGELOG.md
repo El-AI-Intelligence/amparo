@@ -8,6 +8,15 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+### Added
+
+- Update notifications: `amparo update check` compares the running binary
+  against `amparo.ellmstack.dev/version.json`; the site now serves a
+  public changelog page (`/changelog`), a machine-readable version
+  endpoint (`/version.json`), and an RSS feed (`/feed.xml`), all
+  generated at deploy time; the TUI boot banner and the web operator
+  surface show a dismissible notice when a newer build is published.
+
 ### Fixed
 
 - Colored build output no longer hides errors: `parse_build_errors`

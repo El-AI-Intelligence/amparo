@@ -187,7 +187,7 @@ product vhosts (console, guardrail, engram, downloads).
   auto-HTTPS (Let's Encrypt) terminates TLS. The record is created by
   the operator (Cloudflare).
 - **Binary**: build the Amparo repo from source on the box (Rust
-  toolchain already present), pinned at tag **`v0.10.0`** — the release
+  toolchain already present), pinned at tag **`v0.12.0`** — the release
   the approval seam ships in.
 
 ## 7. Pinning and versioning
@@ -221,6 +221,15 @@ from `?token=` to a **one-shot `?ticket=`** issued over the authed API
 `POST /approvals` registration rejects invalid (`400`), duplicate
 (`409`) and over-capacity (`429`) `call_id`s, with the pending queue
 capped at 64; POSTs are rate-limited per source address (`429`).
+
+**v4 → v5**: update notifications. The backend gains a public
+`GET /version` (no token) — the shipped binary's version, probed once
+at boot; Caddy serves the site's generated `/version.json`, `/changelog`
+and `/feed.xml` from `/srv/amparo/site` before the reverse_proxy (see
+`web/deploy/`). The operator UI shows a dismissible banner when the
+site's version is newer than the binary's; the CLI gets
+`amparo update check` and the TUI boot banner an `[update]` line. No
+approval-JSON, flag-removal, or workspace-layout changes.
 
 ## 8. Deliberately excluded
 

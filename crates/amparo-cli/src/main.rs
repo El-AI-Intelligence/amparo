@@ -45,6 +45,9 @@
 //!   key, console URL), optional Engram memory URL — saved locally (mode
 //!   0600) and read back at boot to fill environment gaps (env always
 //!   wins).
+//! - `amparo update check [--url URL]` compares the running binary
+//!   against the published site (`amparo.ellmstack.dev/version.json`);
+//!   exit 0 = check completed, 1 = check failed, 2 = usage.
 //! - `amparo version` prints the version.
 //!
 //! stdout carries the final answer only (a scripting contract); progress,
@@ -73,6 +76,7 @@ mod stderr_subscriber;
 // instead of faking a Windows reader.
 #[cfg_attr(not(unix), allow(dead_code, unused_variables))]
 mod tui;
+mod update;
 mod wizard;
 
 use amparo_mcp::serve::{self, ParseResult};
@@ -92,6 +96,7 @@ USAGE:
   amparo tui [FLAGS]
   amparo code [DIR]
   amparo wizard
+  amparo update check [--url URL]
   amparo version
 
 SUBCOMMANDS:
@@ -118,6 +123,8 @@ SUBCOMMANDS:
              Guardrail policy (check URL, key, console URL), optional
              Engram memory URL — saved locally (0600), read back at boot
              to fill environment gaps
+  update     compare the running binary against the published site
+             (exit 0 = check completed, 1 = check failed, 2 = usage)
   version    print the version
 
 Run `amparo run --help`, `amparo mcp-serve --help`, `amparo chat --help`,
@@ -149,6 +156,7 @@ async fn main() {
         "tui" => tui::dispatch(args).await,
         "code" => code::dispatch(args).await,
         "wizard" => wizard::dispatch(args).await,
+        "update" => update::dispatch(args).await,
         "version" | "-V" | "--version" => println!("amparo {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" => println!("{USAGE}"),
         other => {

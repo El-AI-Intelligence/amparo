@@ -1331,11 +1331,30 @@ fn render_prompt(inner: &mut UiInner, paint: &Paint, controls: bool) {
 fn tui_banner(info: &BannerInfo) {
     match UI.get() {
         Some(ui) => {
-            let lines = banner_lines(info, &ui.paint());
+            let mut lines = banner_lines(info, &ui.paint());
+            // #179: when the boot update check found a newer build, the
+            // notice rides the banner in the same [tag] grammar as the
+            // [chain]/[infer]/[memory] lines.
+            if let Some(note) = crate::update::cached_note() {
+                lines.push(String::new());
+                lines.push(update_notice_line(note));
+            }
             ui.show_banner(&lines);
         }
         None => run::boot_banner(info),
     }
+}
+
+/// The `[update]` banner line: the site has a newer build than this
+/// binary. Plain text (paint applies no ink) so it degrades cleanly
+/// under `NO_COLOR`/`TERM=dumb` like the rest of the banner.
+fn update_notice_line(note: &crate::update::UpdateNote) -> String {
+    format!(
+        "[update] amparo {} is available — curl -fsSL {} | bash ({})",
+        note.latest,
+        crate::update::INSTALL_SCRIPT_URL,
+        crate::update::CHANGELOG_URL
+    )
 }
 
 /// The `Surface` line/notice hooks.
@@ -2445,6 +2464,17 @@ async fn run_tui(flags: RunFlags) -> Result<(), String> {
     let ui = Arc::new(Ui::new(paint, controls, width));
     let _ = UI.set(Arc::clone(&ui));
 
+    // Update check (#179): spawned first so it overlaps workspace setup,
+    // the first-run wizard, and run wiring; the bounded tail before
+    // boot_wire below hands the result to the boot banner without ever
+    // stalling the prompt. Piped mode skips it — stdout there is a
+    // scripting contract.
+    let update_task = if controls {
+        Some(tokio::spawn(crate::update::check_and_cache()))
+    } else {
+        None
+    };
+
     run::apply_workspace(&flags);
 
     // First-run wizard (#167): an interactive boot with no LLM configured
@@ -2482,6 +2512,15 @@ async fn run_tui(flags: RunFlags) -> Result<(), String> {
     }
 
     let live: Arc<Mutex<Option<Live>>> = Arc::new(Mutex::new(None));
+
+    // The boot banner renders inside boot_wire; give the update check a
+    // 500ms tail (it already had setup + wizard time) and let the banner
+    // omit the [update] line when the response didn't land — the explicit
+    // `amparo update check` is the reliable path.
+    if let Some(task) = update_task {
+        let _ = tokio::time::timeout(Duration::from_millis(500), task).await;
+    }
+
     boot_wire(&ui, &flags, &live, &keys).await?;
 
     let ticker_ui = Arc::clone(&ui);
