@@ -187,7 +187,7 @@ product vhosts (console, guardrail, engram, downloads).
   auto-HTTPS (Let's Encrypt) terminates TLS. The record is created by
   the operator (Cloudflare).
 - **Binary**: build the Amparo repo from source on the box (Rust
-  toolchain already present), pinned at tag **`v0.12.0`** — the release
+  toolchain already present), pinned at tag **`v0.13.0`** — the release
   the approval seam ships in.
 
 ## 7. Pinning and versioning

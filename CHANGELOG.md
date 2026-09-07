@@ -8,6 +8,8 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-09-06
+
 ### Added
 
 - Update notifications: `amparo update check` compares the running binary
@@ -16,6 +18,11 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
   endpoint (`/version.json`), and an RSS feed (`/feed.xml`), all
   generated at deploy time; the TUI boot banner and the web operator
   surface show a dismissible notice when a newer build is published.
+
+### Changed
+
+- `edit_file`'s output key `lines_changed` is renamed to `line_delta` —
+  it always carried a delta, never a count, and now says so.
 
 ### Fixed
 
