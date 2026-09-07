@@ -761,6 +761,9 @@ enum EditOp {
     Char(char),
     Backspace,
     Set(String),
+    // Multi-byte fragments only exist on unix: the console reader
+    // delivers complete UTF-16 chars, so nothing appends.
+    #[cfg(unix)]
     Append(String),
     Clear,
 }
@@ -1001,6 +1004,7 @@ impl Ui {
                 inner.state.input.pop();
             }
             EditOp::Set(s) => inner.state.input = s,
+            #[cfg(unix)]
             EditOp::Append(s) => inner.state.input.push_str(&s),
             EditOp::Clear => inner.state.input.clear(),
         }
@@ -1922,11 +1926,13 @@ async fn run_task_with_cancel(
                     let _ = (&mut handle).await;
                     return TaskOutcome::Exit;
                 }
+                #[cfg(unix)]
                 Some(ReaderMsg::Focus(true)) => {
                     if let Some(l) = ui.focus_gained() {
                         ui.line(&l);
                     }
                 }
+                #[cfg(unix)]
                 Some(ReaderMsg::Focus(false)) => {
                     ui.focus_lost();
                 }
@@ -2376,11 +2382,13 @@ async fn run_interactive(
                 }
             }
             ReaderMsg::Cancel | ReaderMsg::Quit => break,
+            #[cfg(unix)]
             ReaderMsg::Focus(true) => {
                 if let Some(l) = ui.focus_gained() {
                     ui.line(&l);
                 }
             }
+            #[cfg(unix)]
             ReaderMsg::Focus(false) => {
                 ui.focus_lost();
             }
@@ -2738,6 +2746,9 @@ enum ReaderMsg {
     Line(String),
     Cancel,
     Quit,
+    // Focus events don't exist on the console API — unix terminals
+    // only (and optional even there).
+    #[cfg(unix)]
     Focus(bool),
     Pick(PickKey),
 }
@@ -3710,7 +3721,6 @@ mod tests {
             ReaderMsg::Line(_) => "Line",
             ReaderMsg::Cancel => "Cancel",
             ReaderMsg::Quit => "Quit",
-            ReaderMsg::Focus(_) => "Focus",
             ReaderMsg::Pick(_) => "Pick",
         }
     }
@@ -3850,7 +3860,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn win_history_caps_at_100() {
-        let ui = test_ui(Mode::Normal);
         let mut history = WinHistory::default();
         for i in 0..101 {
             history.commit(format!("line {i}"));

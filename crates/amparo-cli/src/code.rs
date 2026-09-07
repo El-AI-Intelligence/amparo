@@ -938,7 +938,7 @@ impl CodeApprovalGate {
     }
 
     /// The time-based test seam — a short window stands in for the 60s.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self

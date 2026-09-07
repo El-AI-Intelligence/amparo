@@ -50,7 +50,7 @@ impl InteractiveApprovalGate {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = timeout;
         self
