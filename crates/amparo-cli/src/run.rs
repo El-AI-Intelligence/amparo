@@ -653,7 +653,7 @@ pub(crate) async fn wire_with(
     let mut config = InferenceConfig::from_env().map_err(|e| {
         format!(
             "{e}\nset AMPARO_INFERENCE_URL and AMPARO_INFERENCE_MODEL — see the README \
-             Quickstart for the full environment surface"
+             Quickstart for the full environment surface\nrun `amparo` to start the setup wizard"
         )
     })?;
     if let Some(secs) = flags.timeout_secs {

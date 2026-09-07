@@ -50,16 +50,14 @@
 //!   exit 0 = check completed, 1 = check failed, 2 = usage.
 //! - `amparo version` prints the version.
 //!
+//! Bare `amparo` on a terminal opens the one-time setup wizard (first
+//! run) then the interactive TUI; piped, it prints the usage and exits 2.
+//!
 //! stdout carries the final answer only (a scripting contract); progress,
 //! gate decisions, the report and errors go to stderr. `amparo tui` is the
 //! exception: it renders its whole surface on stdout.
 
 mod approve;
-// The coding surface's interactive reader is Unix-only by design — on
-// Windows the surface runs piped (the report), so the machinery
-// compiles but is never constructed. Allow the dead code there instead
-// of faking a Windows reader.
-#[cfg_attr(not(unix), allow(dead_code, unused_variables))]
 mod code;
 mod doctor;
 mod events;
@@ -70,14 +68,11 @@ mod run;
 mod schedule;
 mod skill;
 mod stderr_subscriber;
-// The interactive reader (raw mode, keypress approvals, picker) is
-// Unix-only by design — on Windows the surface runs piped, so the
-// machinery compiles but is never constructed. Allow the dead code there
-// instead of faking a Windows reader.
-#[cfg_attr(not(unix), allow(dead_code, unused_variables))]
 mod tui;
 mod update;
 mod wizard;
+
+use std::io::IsTerminal;
 
 use amparo_mcp::serve::{self, ParseResult};
 
@@ -141,6 +136,17 @@ async fn main() {
     let _ = tracing::subscriber::set_global_default(stderr_subscriber::StderrWarnSubscriber);
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
+        // Bare `amparo` on a terminal: the one-time setup wizard (when
+        // unconfigured), then the interactive TUI. Piped stdin keeps the
+        // usage contract — USAGE plus exit 2, byte-identical.
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            if let Err(m) = wizard::ensure_configured() {
+                eprintln!("amparo: {m}");
+                std::process::exit(1);
+            }
+            tui::dispatch(std::iter::empty()).await;
+            return;
+        }
         println!("{USAGE}");
         std::process::exit(2);
     };

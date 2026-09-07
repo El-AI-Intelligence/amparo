@@ -202,7 +202,9 @@ nothing breaks, nothing is silently waived.
 `amparo tui` is the one-prompt terminal surface: the banner, gutter rows
 and approval cards render live, every decision through the same gate
 chain. Piped, it degrades to one task per stdin line with zero escapes —
-the scripting shape the e2e suite drives. Slash commands at the prompt:
+the scripting shape the e2e suite drives. Full-screen on Windows too —
+Windows Terminal and the legacy console host (quick-edit mode cleared
+for the session). Slash commands at the prompt:
 
 - `/memory add <text>` — store a memory in the resolved backend
   (the Engram vault when wired; skips are surfaced honestly)
@@ -224,7 +226,7 @@ boot to fill environment gaps (env always wins). Steps 3 and 4 print
 delegation guidance: the sibling CLI found on PATH
 ("`guardrail link` pairs this machine") or its install one-liner.
 
-`amparo code [DIR]` is the coding terminal: on a unix terminal it opens
+`amparo code [DIR]` is the coding terminal: on a terminal it opens
 an alternate-screen file tree with the workspace's git marks — move and
 open files, and with a file open `e` submits one instruction as a
 one-shot agent turn behind the same gate chain as `amparo run`, with the

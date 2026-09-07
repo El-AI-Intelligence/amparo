@@ -37,8 +37,9 @@
 //!   the report pretends to nothing else.
 //! - *NO_COLOR*: the same surface without color (selection inverse stays —
 //!   an attribute, not a color).
-//! - *Windows*: no raw mode — the piped report prints, with a stderr hint
-//!   when the operator asked for interactive.
+//! - *Windows*: full parity — raw mode is `SetConsoleMode`, keys arrive
+//!   as whole UTF-16 records (no byte accumulation), and the surface is
+//!   interactive like everywhere else.
 //!
 //! **Known simplifications, kept deliberate**: the walk is shallow-metadata
 //! (symlinks never follow — no cycles); files cap at 1 MiB when opened and
@@ -47,43 +48,27 @@
 //! backspace only (no cursor motion). Scientific voice, `[tag]` lines,
 //! `—` in copy, no emoji.
 
-use std::collections::HashMap;
-#[cfg(unix)]
-use std::collections::HashSet;
-#[cfg(unix)]
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(unix)]
 use std::sync::{Mutex as StdMutex, OnceLock};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
 use amparo_agent::{
     format_event, AgentEvent, ApprovalGate, ApprovalRequest, EventSink, TaskStatus,
 };
 use amparo_tools::git::GitStatusTool;
-#[cfg(unix)]
-use amparo_tools::ToolResult;
-#[cfg(unix)]
-use amparo_tools::ToolTrustTier;
-use amparo_tools::{PathPolicy, ToolCall, ToolExecutor};
-#[cfg(unix)]
+use amparo_tools::{PathPolicy, ToolCall, ToolExecutor, ToolResult, ToolTrustTier};
 use async_trait::async_trait;
 use serde_json::json;
-#[cfg(unix)]
 use serde_json::Value;
-#[cfg(unix)]
 use tokio::sync::oneshot;
 
-// Every new import above is `cfg(unix)` except the ones the piped report
-// needs: the module-level `allow(dead_code, unused_variables)` on Windows
-// does not cover unused imports.
 #[cfg(unix)]
 use crate::raw::{enter_raw_mode, poll_byte, read_byte, term_size};
-#[cfg(unix)]
+#[cfg(windows)]
+use crate::raw::{enter_raw_mode, poll_key, read_key, term_size, ConsoleKey};
 use crate::run::{self, RunFlags, Surface};
 
 const CODE_USAGE: &str = "\
@@ -95,7 +80,7 @@ USAGE:
 ARGS:
   DIR   the tree root (default: the workspace root)
 
-On a unix terminal this opens an alternate-screen file tree with the
+On a terminal this opens an alternate-screen file tree with the
 workspace's git marks: ↑↓ move, ↵ open a file or toggle a directory,
 b run the detected build, ! run one shell command, r rescan, q quit.
 With a file open, e edits: type an instruction, ↵ submits it as one
@@ -118,17 +103,14 @@ const IGNORED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
 
 /// How long an edit approval waits for a key before it denies itself —
 /// the same fail-closed deadline as the TUI's gate.
-#[cfg(unix)]
 const EDIT_APPROVAL_SECS: u64 = 60;
 
 /// The edit turn's event log keeps at most this many lines — the pane
 /// holds a screen's worth; the cap bounds the memory, not the story.
-#[cfg(unix)]
 const EDIT_LOG_LINES: usize = 200;
 
 /// The run pane's log keeps at most this many lines — a pane's worth of
 /// tail is enough to read back; the cap bounds the memory, not the story.
-#[cfg(unix)]
 const RUN_LOG_LINES: usize = 500;
 
 /// One node of the tree — a directory with children, or a file.
@@ -375,7 +357,7 @@ fn parse_code_flags(args: impl Iterator<Item = String>) -> ParseCodeResult {
 }
 
 /// The `amparo code` entry point — parse, then report (piped) or open
-/// the alternate-screen tree (unix terminal). Exit codes match the
+/// the alternate-screen tree (terminal). Exit codes match the
 /// surface contract: 0 help/report/clean quit, 2 usage, 1 failure.
 pub(crate) async fn dispatch(args: impl Iterator<Item = String>) {
     match parse_code_flags(args) {
@@ -403,7 +385,6 @@ pub(crate) async fn dispatch(args: impl Iterator<Item = String>) {
                     .map(|t| t != "dumb")
                     .unwrap_or(true);
 
-            #[cfg(unix)]
             if controls {
                 // The loop blocks on the raw-mode reader — run it off the
                 // runtime so the executor stays free.
@@ -429,7 +410,6 @@ pub(crate) async fn dispatch(args: impl Iterator<Item = String>) {
             }
 
             print!("{}", render_report(&root, &tree, branch.as_deref()));
-            #[cfg(unix)]
             if interactive_asked && !controls {
                 // The operator asked for the surface but the terminal
                 // cannot hold it — say why, on stderr, like the TUI does.
@@ -551,7 +531,6 @@ fn mark_text(mark: char, paint: &Paint) -> String {
 }
 
 /// Counts display columns in a painted string — SGR escapes count zero.
-#[cfg(unix)]
 fn painted_columns(s: &str) -> usize {
     let mut seen = 0;
     let mut in_esc = false;
@@ -575,7 +554,6 @@ fn painted_columns(s: &str) -> usize {
 
 /// One node in the preorder flat array — depth, label, and the index
 /// range of its subtree (files hold an empty range).
-#[cfg(unix)]
 struct FlatNode {
     depth: usize,
     name: String,
@@ -584,7 +562,6 @@ struct FlatNode {
     kids: std::ops::Range<usize>,
 }
 
-#[cfg(unix)]
 fn flatten(tree: &Node, depth: usize, out: &mut Vec<FlatNode>) {
     let start = out.len();
     out.push(FlatNode {
@@ -601,7 +578,6 @@ fn flatten(tree: &Node, depth: usize, out: &mut Vec<FlatNode>) {
 }
 
 /// The visible rows — flat indices, with collapsed subtrees skipped.
-#[cfg(unix)]
 fn compute_visible(flat: &[FlatNode], collapsed: &HashSet<usize>) -> Vec<usize> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -617,7 +593,6 @@ fn compute_visible(flat: &[FlatNode], collapsed: &HashSet<usize>) -> Vec<usize> 
 }
 
 /// The reading pane's state — an opened file, bounded and honest.
-#[cfg(unix)]
 struct ViewState {
     /// Display path for the status bar (relative to the tree root).
     rel: String,
@@ -629,7 +604,6 @@ struct ViewState {
 /// Opens a file for the reading pane: capped at [`MAX_FILE_BYTES`],
 /// binary files reduced to a summary row, unreadable files announced
 /// rather than silently ignored.
-#[cfg(unix)]
 fn open_file(path: &Path, root: &Path) -> ViewState {
     use std::io::Read;
     let rel = path
@@ -672,7 +646,6 @@ fn open_file(path: &Path, root: &Path) -> ViewState {
 }
 
 /// One decoded key, or a tick when the 0.1s read window passed empty.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Key {
     Tick,
@@ -700,7 +673,9 @@ enum Key {
     Backspace,
     /// One printable ASCII char — prompt input.
     Char(char),
-    /// A byte outside ASCII — feeds the UTF-8 accumulator.
+    /// A byte outside ASCII — feeds the UTF-8 accumulator (unix raw
+    /// mode delivers bytes; Windows keys arrive whole).
+    #[cfg(unix)]
     Byte(u8),
     Ignore,
 }
@@ -825,17 +800,86 @@ fn push_utf8(buf: &mut Vec<u8>, b: u8) -> Option<String> {
     }
 }
 
+// ──────────────────────────────────────────────── windows key twins ──
+
+/// Windows counterpart of [`decode_key`]: one [`ConsoleKey`] record
+/// already carries the complete key, so this maps it straight onto the
+/// surface's keys — the structural letters exactly as decode_key, the
+/// arrows as their own keys.
+#[cfg(windows)]
+fn console_to_key(k: ConsoleKey) -> Key {
+    match k {
+        ConsoleKey::Enter => Key::Enter,
+        ConsoleKey::Esc => Key::Esc,
+        ConsoleKey::Up => Key::Up,
+        ConsoleKey::Down => Key::Down,
+        ConsoleKey::Home => Key::Home,
+        ConsoleKey::End => Key::End,
+        ConsoleKey::PageUp => Key::PageUp,
+        ConsoleKey::PageDown => Key::PageDown,
+        ConsoleKey::Backspace => Key::Backspace,
+        ConsoleKey::CtrlC => Key::Quit, // parity: 0x03 arrives as Ctrl-C on unix
+        ConsoleKey::Char('q') | ConsoleKey::Char('Q') => Key::Quit,
+        ConsoleKey::Char('r') | ConsoleKey::Char('R') => Key::Rescan,
+        ConsoleKey::Char('j') | ConsoleKey::Char('J') => Key::Down,
+        ConsoleKey::Char('k') | ConsoleKey::Char('K') => Key::Up,
+        ConsoleKey::Char('e') | ConsoleKey::Char('E') => Key::Edit,
+        ConsoleKey::Char('b') | ConsoleKey::Char('B') => Key::Build,
+        ConsoleKey::Char('!') => Key::Shell,
+        ConsoleKey::Char('y') | ConsoleKey::Char('Y') => Key::Yes,
+        ConsoleKey::Char('n') | ConsoleKey::Char('N') => Key::No,
+        ConsoleKey::Char(c) => Key::Char(c),
+        ConsoleKey::Left | ConsoleKey::Right | ConsoleKey::CtrlD | ConsoleKey::Ignore => {
+            Key::Ignore
+        }
+    }
+}
+
+/// The unix reader's polled counterpart: the 250 ms window lets the
+/// approval countdown re-render between presses (Key::Tick drives it).
+#[cfg(windows)]
+fn next_key(_stdin: &mut std::io::Stdin) -> Key {
+    match poll_key(250) {
+        Some(k) => console_to_key(k),
+        None => Key::Tick,
+    }
+}
+
+/// The prompt-side decoder — [`next_prompt_key`] without the terminal,
+/// for tests (the [`decode_key`] seam's shape). Esc stays structural —
+/// decode_prompt_key routes a lone ESC through decode_key, and Esc
+/// cancels the prompt — so it must here too; arrows arrive as Ignore.
+#[cfg(windows)]
+fn console_to_prompt_key(k: ConsoleKey) -> Key {
+    match k {
+        ConsoleKey::Enter => Key::Enter,
+        ConsoleKey::Esc => Key::Esc,
+        ConsoleKey::CtrlC => Key::Quit,
+        ConsoleKey::Backspace => Key::Backspace,
+        ConsoleKey::Char(c) => Key::Char(c),
+        _ => Key::Ignore,
+    }
+}
+
+/// Blocking is right for typed input; Windows keys arrive whole, so
+/// there is no Esc chord window to close.
+#[cfg(windows)]
+fn next_prompt_key(_stdin: &mut std::io::Stdin) -> Key {
+    match read_key() {
+        Some(k) => console_to_prompt_key(k),
+        None => Key::Tick,
+    }
+}
+
 // ─────────────────────────────────────────────────────────── edit turn ──
 
 /// The edit turn's event log — a process-global slot (the [`Surface`]
 /// callbacks are fn pointers, so they cannot capture; the TUI's `Ui`
 /// slot uses the same idiom) holding the `[tag]` lines of the running
 /// turn, drawn in the right pane while nothing pends approval.
-#[cfg(unix)]
 static EDIT_LOG: OnceLock<Arc<StdMutex<VecDeque<String>>>> = OnceLock::new();
 
 /// Appends one line to [`EDIT_LOG`], capping it at [`EDIT_LOG_LINES`].
-#[cfg(unix)]
 fn push_log(line: &str) {
     let log = EDIT_LOG.get_or_init(|| Arc::new(StdMutex::new(VecDeque::new())));
     let mut log = log.lock().unwrap();
@@ -847,7 +891,6 @@ fn push_log(line: &str) {
 
 /// The banner callback for the edit turn — the same chain facts as every
 /// surface, one log line each.
-#[cfg(unix)]
 fn edit_banner(info: &crate::run::BannerInfo) {
     push_log(&format!("[chain] {}", info.chain));
     push_log(&format!("[infer] {}", info.infer));
@@ -856,17 +899,14 @@ fn edit_banner(info: &crate::run::BannerInfo) {
 
 /// The `[tag]` line callback for the edit turn — status lines and the
 /// policy-audit notice land in the log like every other event.
-#[cfg(unix)]
 fn edit_line(line: &str) {
     push_log(line);
 }
 
 /// The edit turn's event sink — every loop event arrives in the log as
 /// its canonical `[tag]` line.
-#[cfg(unix)]
 struct EditSink;
 
-#[cfg(unix)]
 impl EventSink for EditSink {
     fn emit(&self, event: &AgentEvent) {
         push_log(&format_event(event));
@@ -875,7 +915,6 @@ impl EventSink for EditSink {
 
 /// One approval parked for the reader loop's `y`/`n` — the shared slot
 /// between the gate's async side and the blocking reader.
-#[cfg(unix)]
 struct PendingApproval {
     request: ApprovalRequest,
     deadline: Instant,
@@ -885,13 +924,11 @@ struct PendingApproval {
 /// The surface's approval gate (M13 W2): each request parks in the
 /// shared slot and waits up to [`EDIT_APPROVAL_SECS`] for the reader
 /// loop's single-key answer — timeout denies, like every other gate.
-#[cfg(unix)]
 struct CodeApprovalGate {
     slot: Arc<StdMutex<Option<PendingApproval>>>,
     timeout: Duration,
 }
 
-#[cfg(unix)]
 impl CodeApprovalGate {
     fn new(slot: Arc<StdMutex<Option<PendingApproval>>>) -> Self {
         Self {
@@ -908,7 +945,6 @@ impl CodeApprovalGate {
     }
 }
 
-#[cfg(unix)]
 #[async_trait]
 impl ApprovalGate for CodeApprovalGate {
     async fn request(&self, request: &ApprovalRequest) -> bool {
@@ -941,7 +977,6 @@ impl ApprovalGate for CodeApprovalGate {
 /// Routes one reader-loop press into the parked approval — the first
 /// press wins, and a deny is permanent for that call (deny-wins).
 /// Returns true when a decision was actually delivered.
-#[cfg(unix)]
 fn decide_pending(slot: &StdMutex<Option<PendingApproval>>, approved: bool) -> bool {
     let mut guard = slot.lock().unwrap();
     match guard.take() {
@@ -957,7 +992,6 @@ fn decide_pending(slot: &StdMutex<Option<PendingApproval>>, approved: bool) -> b
 
 /// The whole seconds left on the parked approval — `None` when nothing
 /// pends. Drives the status-bar countdown re-render.
-#[cfg(unix)]
 fn pending_remaining(slot: &StdMutex<Option<PendingApproval>>) -> Option<u64> {
     slot.lock().unwrap().as_ref().map(|p| {
         p.deadline
@@ -967,7 +1001,6 @@ fn pending_remaining(slot: &StdMutex<Option<PendingApproval>>) -> Option<u64> {
 }
 
 /// Reads one string argument — `(unset)` when the model omitted it.
-#[cfg(unix)]
 fn arg(req: &ApprovalRequest, name: &str) -> String {
     req.arguments
         .get(name)
@@ -978,7 +1011,6 @@ fn arg(req: &ApprovalRequest, name: &str) -> String {
 
 /// Renders the arguments for a card header — a single-string argument
 /// shows the value alone (the TUI's convention).
-#[cfg(unix)]
 fn display_arg(arguments: &Value) -> String {
     match arguments {
         Value::Object(map) if map.len() == 1 => {
@@ -996,7 +1028,6 @@ fn display_arg(arguments: &Value) -> String {
 /// as `- old` / `+ new` lines, `patch_file` as the patch verbatim, and
 /// anything else as the approval card (the TUI's card copy). Pure — the
 /// unit-test seam.
-#[cfg(unix)]
 fn approval_diff(req: &ApprovalRequest) -> Vec<String> {
     match req.tool_name.as_str() {
         "edit_file" => {
@@ -1046,7 +1077,6 @@ fn approval_diff(req: &ApprovalRequest) -> Vec<String> {
 
 /// What the surface is doing right now — the mode drives both the key
 /// routing and the right pane.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum CodeMode {
     Tree,
@@ -1062,7 +1092,6 @@ enum CodeMode {
 
 /// What a prompt is for — the edit instruction and the run command
 /// share the one-line input path but submit to different panes.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum PromptKind {
     /// One instruction for the open file's agent turn.
@@ -1074,7 +1103,6 @@ enum PromptKind {
 /// One run-pane job — a shell command (`Some`) or the detected build
 /// (`None`), opened from `origin` and returning there when the pane
 /// closes.
-#[cfg(unix)]
 struct RunJob {
     /// Where esc returns when the pane closes.
     origin: CodeMode,
@@ -1090,7 +1118,6 @@ struct RunJob {
 }
 
 /// The surface state between frames.
-#[cfg(unix)]
 struct CodeState {
     flat: Vec<FlatNode>,
     collapsed: HashSet<usize>,
@@ -1120,7 +1147,6 @@ struct CodeState {
     notice: Option<(bool, String)>,
 }
 
-#[cfg(unix)]
 impl CodeState {
     fn new(tree: &Node) -> Self {
         let mut flat = Vec::new();
@@ -1367,7 +1393,6 @@ impl CodeState {
 
 /// The pane's label — `[run]` for a shell command, `[build]` for the
 /// detected build.
-#[cfg(unix)]
 fn run_label(command: &Option<String>) -> &'static str {
     if command.is_some() {
         "[run]"
@@ -1379,7 +1404,6 @@ fn run_label(command: &Option<String>) -> &'static str {
 /// The job's final status line, from the streaming result — block
 /// reasons, spawn errors and exit codes exactly as the tools reported
 /// them, plus the elapsed seconds.
-#[cfg(unix)]
 fn run_job_status(label: &str, result: &ToolResult, elapsed: Duration) -> (bool, String) {
     let secs = elapsed.as_secs();
     if result.output.get("blocked") == Some(&json!(true)) {
@@ -1402,7 +1426,6 @@ fn run_job_status(label: &str, result: &ToolResult, elapsed: Duration) -> (bool,
 
 /// Renders one frame. Every row is clipped to its pane and erased to the
 /// end of the line, so a resize leaves no stale cells.
-#[cfg(unix)]
 fn draw(
     state: &CodeState,
     root: &Path,
@@ -1665,7 +1688,6 @@ fn draw(
 }
 
 /// The interactive loop: alternate screen, raw mode, keys until `q`.
-#[cfg(unix)]
 fn run_interactive(
     root: PathBuf,
     workspace: PathBuf,
@@ -1702,6 +1724,9 @@ fn run_interactive(
     let mut last_size = term_size().unwrap_or((80, 24));
     let mut edit_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut last_remaining: Option<u64> = None;
+    // Windows keys arrive whole (UTF-16 decoded) — the byte accumulator
+    // is unix-only, where raw mode delivers bytes.
+    #[cfg(unix)]
     let mut utf8_buf: Vec<u8> = Vec::new();
     // The run pane's log and its streaming task — the task owns the
     // child; the log is cleared when a job spawns.
@@ -1876,6 +1901,7 @@ fn run_interactive(
                         dirty = true;
                     }
                 }
+                #[cfg(unix)]
                 Key::Byte(b) => {
                     // Multi-byte input accumulates here; complete
                     // sequences feed the prompt as their characters.
@@ -1952,6 +1978,7 @@ fn run_interactive(
             }
             // A mode change out of the prompt drops its partial UTF-8
             // sequence, so stale bytes never leak into the next prompt.
+            #[cfg(unix)]
             if state.mode != CodeMode::Prompt {
                 utf8_buf.clear();
             }
@@ -2011,7 +2038,6 @@ fn run_interactive(
 /// child dies with the dropped task — kill_on_drop — and the partial
 /// log stays in the pane), a finished pane closes back to its origin.
 /// Returns true when the frame changed.
-#[cfg(unix)]
 fn run_pane_escape(
     state: &mut CodeState,
     run_task: &mut Option<tokio::task::JoinHandle<(bool, String)>>,
@@ -2049,7 +2075,6 @@ fn run_pane_escape(
 /// that opened the pane is the approval, like the TUI's `!` escape).
 /// Every line lands in the shared log; the final status line is pushed
 /// too and returned for the fold.
-#[cfg(unix)]
 async fn run_streaming_task(
     command: Option<String>,
     policy: PathPolicy,
@@ -2082,7 +2107,6 @@ async fn run_streaming_task(
 /// `amparo run` — the profile, fail-closed inference, the policy engine,
 /// and this surface's approval gate — its events drawn into the log and
 /// the right pane. Returns the outcome line for the status bar.
-#[cfg(unix)]
 async fn run_edit_turn(
     prompt: String,
     task_id: String,
@@ -3012,5 +3036,62 @@ mod tests {
         assert!(log.contains(&"task-marker".to_string()));
         assert_eq!(*log.last().unwrap(), status, "the status line ends the log");
         assert!(status.starts_with("[run] exit 0 —"), "{status}");
+    }
+
+    // ─────────────────────────────────────── windows routing (CI-only) ──
+
+    /// Windows keys route to the same surface keys as the unix decoder:
+    /// the structural letters, the arrows and Ctrl-C.
+    #[cfg(windows)]
+    #[test]
+    fn console_to_key_matches_the_unix_decoder() {
+        use crate::raw::ConsoleKey;
+        let pairs = [
+            (ConsoleKey::Enter, Key::Enter),
+            (ConsoleKey::Esc, Key::Esc),
+            (ConsoleKey::Up, Key::Up),
+            (ConsoleKey::Down, Key::Down),
+            (ConsoleKey::Home, Key::Home),
+            (ConsoleKey::End, Key::End),
+            (ConsoleKey::PageUp, Key::PageUp),
+            (ConsoleKey::PageDown, Key::PageDown),
+            (ConsoleKey::Backspace, Key::Backspace),
+            (ConsoleKey::CtrlC, Key::Quit),
+            (ConsoleKey::Char('q'), Key::Quit),
+            (ConsoleKey::Char('Q'), Key::Quit),
+            (ConsoleKey::Char('r'), Key::Rescan),
+            (ConsoleKey::Char('j'), Key::Down),
+            (ConsoleKey::Char('K'), Key::Up),
+            (ConsoleKey::Char('e'), Key::Edit),
+            (ConsoleKey::Char('b'), Key::Build),
+            (ConsoleKey::Char('!'), Key::Shell),
+            (ConsoleKey::Char('y'), Key::Yes),
+            (ConsoleKey::Char('N'), Key::No),
+            (ConsoleKey::Char('x'), Key::Char('x')),
+            (ConsoleKey::Left, Key::Ignore),
+            (ConsoleKey::Right, Key::Ignore),
+            (ConsoleKey::CtrlD, Key::Ignore),
+            (ConsoleKey::Ignore, Key::Ignore),
+        ];
+        for (k, want) in pairs {
+            assert_eq!(console_to_key(k), want, "{k:?}");
+        }
+    }
+
+    /// The prompt decoder keeps the prompt's bare controls: letters type,
+    /// Enter submits, Backspace deletes, Ctrl-C and Esc cancel, arrows
+    /// are ignored — parity with decode_prompt_key.
+    #[cfg(windows)]
+    #[test]
+    fn console_to_prompt_key_keeps_the_bare_controls() {
+        use crate::raw::ConsoleKey;
+        assert_eq!(console_to_prompt_key(ConsoleKey::Enter), Key::Enter);
+        assert_eq!(console_to_prompt_key(ConsoleKey::Esc), Key::Esc);
+        assert_eq!(console_to_prompt_key(ConsoleKey::CtrlC), Key::Quit);
+        assert_eq!(console_to_prompt_key(ConsoleKey::Backspace), Key::Backspace);
+        assert_eq!(console_to_prompt_key(ConsoleKey::Char('r')), Key::Char('r'));
+        assert_eq!(console_to_prompt_key(ConsoleKey::Char('é')), Key::Char('é'));
+        assert_eq!(console_to_prompt_key(ConsoleKey::Up), Key::Ignore);
+        assert_eq!(console_to_prompt_key(ConsoleKey::Ignore), Key::Ignore);
     }
 }

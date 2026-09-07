@@ -677,6 +677,18 @@ fn unknown_subcommand_exits_2() {
 }
 
 #[tokio::test]
+async fn bare_amparo_piped_prints_usage_and_exits_2() {
+    // stdin is closed (not a tty), so the piped contract applies on every
+    // OS: the full usage on stdout, exit 2, byte-identical to --help. The
+    // tty branch (wizard, then TUI) needs a real terminal — manual drill.
+    let out = run_with(&[]).await;
+    let help = run_with(&["--help"]).await;
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert_eq!(help.status.code(), Some(0), "stderr: {}", stderr(&help));
+    assert_eq!(stdout(&out), stdout(&help));
+}
+
+#[tokio::test]
 async fn run_without_env_fails_closed() {
     let _guard = LOCK.lock().await;
     let env = set_env(&[], &["AMPARO_INFERENCE_URL", "AMPARO_INFERENCE_MODEL"]);

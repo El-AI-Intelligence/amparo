@@ -39,6 +39,12 @@ tracing = "0.1"
 # detection) — already in the workspace lockfile as a transitive dep.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Windows console input (KEY_EVENT records, UTF-16) and raw console mode
+# for `amparo tui` — already in the workspace lockfile as a transitive
+# dep of wasmtime; MSRV 1.60 <= 1.85.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse"] }
+
 [dev-dependencies]
 # Test-only: build the eval_wasm fixture module at test runtime (both are
 # already workspace deps through amparo-sandbox).

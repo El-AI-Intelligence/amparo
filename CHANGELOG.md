@@ -8,6 +8,20 @@ See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
 ## [Unreleased]
 
+### Added
+
+- Windows interactive parity: `amparo tui` and `amparo code` run full-screen
+  on Windows — Windows Terminal and the legacy console host — over the
+  native console API: raw keystrokes as UTF-16 records, VT processing on
+  stdout, quick-edit mode cleared for the session and restored on exit.
+- Bare `amparo` on a terminal opens the one-time setup wizard (first run),
+  then the interactive TUI; piped stdin keeps the usage print and exit 2.
+
+### Changed
+
+- The unconfigured `amparo run` error now points at `amparo` — the setup
+  wizard is one command away.
+
 ## [0.13.0] — 2026-09-06
 
 ### Added

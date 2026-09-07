@@ -50,8 +50,10 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, watch};
 
 #[cfg(unix)]
-use crate::raw::{enter_raw_mode, read_byte, RawGuard};
-use crate::raw::term_width;
+use crate::raw::read_byte;
+#[cfg(windows)]
+use crate::raw::{read_key, ConsoleKey};
+use crate::raw::{enter_raw_mode, term_width, RawGuard};
 use crate::run::{self, BannerInfo, RunFlags, Surface, WiredRun};
 
 /// How long an approval waits for a key before it denies itself.
@@ -2134,10 +2136,8 @@ async fn shell_escape(ui: &Arc<Ui>, raw: &RawSlot, cmd: &str) {
         ui.line("[shell] usage: ! <command> — runs in your shell, outside the gate chain");
         return;
     }
-    #[cfg(unix)]
     raw.drop_for_child();
     let status = shell_command(cmd).status().await;
-    #[cfg(unix)]
     raw.reenter();
     match status {
         Ok(s) if s.success() => {}
@@ -2451,10 +2451,9 @@ async fn run_piped(
 async fn run_tui(flags: RunFlags) -> Result<(), String> {
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false);
-    #[cfg(unix)]
+    // `TERM` is a unix convention — unset on Windows, so the `dumb`
+    // probe is `false` there and a real console is interactive.
     let controls = tty && !dumb;
-    #[cfg(not(unix))]
-    let controls = false;
     let paint = Paint::detect(controls);
     let width = if controls {
         term_width().unwrap_or(80)
@@ -2485,10 +2484,6 @@ async fn run_tui(flags: RunFlags) -> Result<(), String> {
     }
 
     let (main_tx, main_rx) = mpsc::unbounded_channel::<ReaderMsg>();
-    #[cfg(not(unix))]
-    let keys: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<char>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    #[cfg(unix)]
     let keys: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<char>>>> = {
         let (key_tx, key_rx) = mpsc::unbounded_channel::<char>();
         if controls {
@@ -2497,14 +2492,11 @@ async fn run_tui(flags: RunFlags) -> Result<(), String> {
         }
         Arc::new(tokio::sync::Mutex::new(Some(key_rx)))
     };
-    #[cfg(not(unix))]
-    let _main_tx = main_tx; // no reader thread here — stdin stays cooked
 
     // Raw mode for the life of the run: the guard restores the terminal
     // on drop. The `!` escape borrows the slot — a child gets a cooked
     // terminal, then raw mode re-enters.
     let raw = RawSlot::new();
-    #[cfg(unix)]
     if controls {
         ui.enable_modes();
         ui.set_title("amparo · idle");
@@ -2667,37 +2659,32 @@ pub(crate) async fn dispatch(args: impl Iterator<Item = String>) {
 // shared with the `code` surface.
 
 /// The raw-mode slot the `!` escape borrows: the child runs on a cooked
-/// terminal, and raw mode re-enters afterwards. Empty in piped mode and
-/// on non-unix platforms (no raw mode there at all).
+/// terminal, and raw mode re-enters afterwards. Empty in piped mode (no
+/// guard ever entered).
 struct RawSlot {
-    #[cfg(unix)]
     guard: Mutex<Option<RawGuard>>,
 }
 
 impl RawSlot {
     fn new() -> Self {
         Self {
-            #[cfg(unix)]
             guard: Mutex::new(None),
         }
     }
 
     /// Hands the fresh guard from [`enter_raw_mode`] to the slot (run
     /// start).
-    #[cfg(unix)]
     fn set(&self, guard: Option<RawGuard>) {
         *self.guard.lock().unwrap() = guard;
     }
 
     /// Drops the guard for the child — the terminal returns to cooked
     /// mode (the drop restores the original settings).
-    #[cfg(unix)]
     fn drop_for_child(&self) {
         self.guard.lock().unwrap().take();
     }
 
     /// Re-enters raw mode after the child.
-    #[cfg(unix)]
     fn reenter(&self) {
         *self.guard.lock().unwrap() = enter_raw_mode();
     }
@@ -2992,6 +2979,189 @@ fn reader_thread(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// The Windows reader's input history — the same shape the unix reader
+/// keeps inline (cap 100, a stash for the in-flight line, a position
+/// cursor).
+#[cfg(windows)]
+#[derive(Default)]
+struct WinHistory {
+    entries: std::collections::VecDeque<String>,
+    pos: Option<usize>,
+    stash: Option<String>,
+}
+
+#[cfg(windows)]
+impl WinHistory {
+    /// Records a submitted line (cap 100) and resets the cursor.
+    fn commit(&mut self, line: String) {
+        if self.entries.len() == 100 {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(line);
+        self.reset();
+    }
+
+    /// The cursor returns to the live line (Enter on an empty line, or
+    /// any edit).
+    fn reset(&mut self) {
+        self.pos = None;
+        self.stash = None;
+    }
+
+    /// History up — mirrors the unix `CSI A` arm: the live line is
+    /// stashed on first entry into history.
+    fn up(&mut self, ui: &Arc<Ui>) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let next = self.pos.map(|p| p + 1).unwrap_or(0);
+        if next < self.entries.len() {
+            if self.pos.is_none() {
+                self.stash = Some(ui.input());
+            }
+            self.pos = Some(next);
+            let line = self.entries[self.entries.len() - 1 - next].clone();
+            ui.edit(EditOp::Set(line));
+        }
+    }
+
+    /// History down — mirrors the unix `CSI B` arm.
+    fn down(&mut self, ui: &Arc<Ui>) {
+        match self.pos {
+            Some(0) => {
+                self.pos = None;
+                ui.edit(EditOp::Set(self.stash.take().unwrap_or_default()));
+            }
+            Some(p) => {
+                let np = p - 1;
+                self.pos = Some(np);
+                let line = self.entries[self.entries.len() - 1 - np].clone();
+                ui.edit(EditOp::Set(line));
+            }
+            None => {}
+        }
+    }
+}
+
+/// Routes one translated console key to the same surface messages the
+/// unix byte reader emits. Factored out of the reader thread so the
+/// routing decisions are unit-testable (CI has no console): the unix
+/// reader's per-mode arms are the parity spec.
+#[cfg(windows)]
+fn route_console_key(
+    ui: &Arc<Ui>,
+    main: &mpsc::UnboundedSender<ReaderMsg>,
+    keys: &mpsc::UnboundedSender<char>,
+    history: &mut WinHistory,
+    k: ConsoleKey,
+) {
+    use ConsoleKey::*;
+    // Lone-ESC parity: on unix an ESC not followed by `[` resolves as
+    // Esc before the byte after it is processed; on Windows Esc is its
+    // own key event, so the resolution happens immediately.
+    if k == Esc {
+        if ui.mode() == Mode::Picker {
+            let _ = main.send(ReaderMsg::Pick(PickKey::Esc));
+        } else {
+            ui.edit(EditOp::Clear);
+        }
+        return;
+    }
+    match ui.mode() {
+        Mode::Approval => match k {
+            // The gate accepts only y/Y/n/N — stray keys are rejected
+            // there, exactly as stray bytes are on unix.
+            CtrlC => {
+                let _ = keys.send('n');
+            }
+            Char(c) => {
+                let _ = keys.send(c);
+            }
+            _ => {}
+        },
+        Mode::Picker => match k {
+            Up => {
+                let _ = main.send(ReaderMsg::Pick(PickKey::Up));
+            }
+            Down => {
+                let _ = main.send(ReaderMsg::Pick(PickKey::Down));
+            }
+            Enter => {
+                let _ = main.send(ReaderMsg::Pick(PickKey::Enter));
+            }
+            CtrlC | CtrlD => {
+                let _ = main.send(ReaderMsg::Pick(PickKey::Esc));
+            }
+            Char(c) if c.is_ascii() && !c.is_ascii_control() => {
+                let _ = main.send(ReaderMsg::Pick(PickKey::Char(c)));
+            }
+            _ => {}
+        },
+        Mode::Normal => {
+            if !ui.prompt_live() {
+                // A task is running: everything holds except cancel.
+                if k == CtrlC {
+                    let _ = main.send(ReaderMsg::Cancel);
+                }
+                return;
+            }
+            match k {
+                CtrlC => {
+                    if ui.task_active() {
+                        let _ = main.send(ReaderMsg::Cancel);
+                    } else {
+                        let _ = main.send(ReaderMsg::Quit);
+                    }
+                }
+                CtrlD => {
+                    if ui.input().is_empty() {
+                        let _ = main.send(ReaderMsg::Quit);
+                    }
+                }
+                Enter => {
+                    let line = ui.submit_line();
+                    if !line.trim().is_empty() {
+                        history.commit(line.clone());
+                    } else {
+                        history.reset();
+                    }
+                    let _ = main.send(ReaderMsg::Line(line));
+                }
+                Backspace => {
+                    ui.edit(EditOp::Backspace);
+                    history.pos = None;
+                }
+                Up => history.up(ui),
+                Down => history.down(ui),
+                Char(c) => ui.edit(EditOp::Char(c)),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The raw-mode console reader: routes by surface mode — approval keys
+/// to the gate, picker keys to the picker, everything else into the
+/// input line with history. `read_key` delivers complete UTF-16-decoded
+/// keypresses, so no escape-sequence or UTF-8 state machine is needed;
+/// a `None` (redirected console, CI) just sleeps so the loop never hot
+/// spins.
+#[cfg(windows)]
+fn reader_thread(
+    ui: Arc<Ui>,
+    main: mpsc::UnboundedSender<ReaderMsg>,
+    keys: mpsc::UnboundedSender<char>,
+) {
+    let mut history = WinHistory::default();
+    loop {
+        match read_key() {
+            Some(k) => route_console_key(&ui, &main, &keys, &mut history, k),
+            None => std::thread::sleep(Duration::from_millis(20)),
         }
     }
 }
@@ -3500,5 +3670,183 @@ mod tests {
             ParseTuiResult::Help => "Help",
             ParseTuiResult::Error(_) => "Error",
         }
+    }
+
+    // Windows key routing — compiled and run only on the Windows CI job
+    // (these exercise the pure router against a controls=false Ui, which
+    // never writes terminal bytes).
+
+    #[cfg(windows)]
+    fn test_ui(mode: Mode) -> Arc<Ui> {
+        let ui = Arc::new(Ui::new(plain(), false, 80));
+        ui.set_mode(mode);
+        ui
+    }
+
+    #[cfg(windows)]
+    fn route(
+        ui: &Arc<Ui>,
+        main: &mpsc::UnboundedSender<ReaderMsg>,
+        keys: &mpsc::UnboundedSender<char>,
+        history: &mut WinHistory,
+        k: ConsoleKey,
+    ) {
+        route_console_key(ui, main, keys, history, k);
+    }
+
+    #[cfg(windows)]
+    fn try_recv_char(rx: &mpsc::UnboundedReceiver<char>) -> Option<char> {
+        rx.try_recv().ok()
+    }
+
+    #[cfg(windows)]
+    fn try_recv_msg(rx: &mpsc::UnboundedReceiver<ReaderMsg>) -> Option<ReaderMsg> {
+        rx.try_recv().ok()
+    }
+
+    #[cfg(windows)]
+    fn reader_msg_variant(m: &ReaderMsg) -> &'static str {
+        match m {
+            ReaderMsg::Line(_) => "Line",
+            ReaderMsg::Cancel => "Cancel",
+            ReaderMsg::Quit => "Quit",
+            ReaderMsg::Focus(_) => "Focus",
+            ReaderMsg::Pick(_) => "Pick",
+        }
+    }
+
+    #[cfg(windows)]
+    fn pick_key_variant(k: &PickKey) -> &'static str {
+        match k {
+            PickKey::Up => "Up",
+            PickKey::Down => "Down",
+            PickKey::Enter => "Enter",
+            PickKey::Esc => "Esc",
+            PickKey::Char(_) => "Char",
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_route_approval_sends_gate_keys() {
+        let ui = test_ui(Mode::Approval);
+        let (main_tx, main_rx) = mpsc::unbounded_channel();
+        let (key_tx, key_rx) = mpsc::unbounded_channel();
+        let mut history = WinHistory::default();
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlC);
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('y'));
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Enter);
+        assert_eq!(try_recv_char(&key_rx), Some('n'));
+        assert_eq!(try_recv_char(&key_rx), Some('y'));
+        assert_eq!(try_recv_char(&key_rx), None); // Enter is not a gate key
+        assert!(main_rx.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_route_picker_sends_pick_keys() {
+        let ui = test_ui(Mode::Picker);
+        let (main_tx, main_rx) = mpsc::unbounded_channel();
+        let (key_tx, _key_rx) = mpsc::unbounded_channel();
+        let mut history = WinHistory::default();
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Up);
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Down);
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Enter);
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Esc);
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlD);
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('s'));
+        let got: Vec<String> = (0..6)
+            .map(|_| {
+                try_recv_msg(&main_rx)
+                    .map(|m| match m {
+                        ReaderMsg::Pick(k) => pick_key_variant(&k).to_string(),
+                        other => reader_msg_variant(&other).to_string(),
+                    })
+                    .unwrap_or_else(|| "none".to_string())
+            })
+            .collect();
+        assert_eq!(got, ["Up", "Down", "Enter", "Esc", "Esc", "Char"]);
+        assert_eq!(try_recv_msg(&main_rx).is_none(), true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_route_normal_submits_and_remembers_history() {
+        let ui = test_ui(Mode::Normal);
+        ui.prompt_ready();
+        let (main_tx, main_rx) = mpsc::unbounded_channel();
+        let (key_tx, _key_rx) = mpsc::unbounded_channel();
+        let mut history = WinHistory::default();
+        for c in ['h', 'i'] {
+            route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char(c));
+        }
+        assert_eq!(ui.input(), "hi");
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Enter);
+        match try_recv_msg(&main_rx) {
+            Some(ReaderMsg::Line(l)) => assert_eq!(l, "hi"),
+            other => panic!("expected Line(\"hi\"), got {other:?}"),
+        }
+        // History up restores the submitted line onto the live prompt.
+        ui.prompt_ready();
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Up);
+        assert_eq!(ui.input(), "hi");
+        // History down returns the stash.
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Down);
+        assert_eq!(ui.input(), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_route_normal_quit_and_cancel_paths() {
+        let ui = test_ui(Mode::Normal);
+        ui.prompt_ready();
+        let (main_tx, main_rx) = mpsc::unbounded_channel();
+        let (key_tx, _key_rx) = mpsc::unbounded_channel();
+        let mut history = WinHistory::default();
+        // Idle Ctrl-C quits.
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlC);
+        assert_eq!(reader_msg_variant(&try_recv_msg(&main_rx).unwrap()), "Quit");
+        // Ctrl-D on an empty line quits; on a non-empty line it's ignored.
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlD);
+        assert_eq!(reader_msg_variant(&try_recv_msg(&main_rx).unwrap()), "Quit");
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('x'));
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlD);
+        assert_eq!(try_recv_msg(&main_rx).is_none(), true);
+        // While a task runs, only Ctrl-C cancels.
+        ui.task_begin();
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('z'));
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Enter);
+        assert_eq!(try_recv_msg(&main_rx).is_none(), true);
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlC);
+        assert_eq!(reader_msg_variant(&try_recv_msg(&main_rx).unwrap()), "Cancel");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_route_edit_keys() {
+        let ui = test_ui(Mode::Normal);
+        ui.prompt_ready();
+        let (main_tx, _main_rx) = mpsc::unbounded_channel();
+        let (key_tx, _key_rx) = mpsc::unbounded_channel();
+        let mut history = WinHistory::default();
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('a'));
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('b'));
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Backspace);
+        assert_eq!(ui.input(), "a");
+        route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Esc);
+        assert_eq!(ui.input(), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_history_caps_at_100() {
+        let ui = test_ui(Mode::Normal);
+        let mut history = WinHistory::default();
+        for i in 0..101 {
+            history.commit(format!("line {i}"));
+        }
+        assert_eq!(history.entries.len(), 100);
+        assert_eq!(history.entries.front().unwrap(), "line 1");
+        assert_eq!(history.entries.back().unwrap(), "line 100");
     }
 }

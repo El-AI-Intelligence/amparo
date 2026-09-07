@@ -87,6 +87,14 @@ prompt (the sign-up wizard workstream — docs to follow).
 - History: in-memory per session + persisted via the session store; arrow-key
   history via raw mode, best-effort across terminal emulators (documented
   honestly).
+- Windows console: `amparo tui`/`amparo code` run full-screen on Windows
+  Terminal and the legacy console host — VT processing enabled on stdout,
+  quick-edit mode cleared for the session (restored on exit, so a stray
+  click can't freeze the surface), keystrokes read as UTF-16 console
+  records. Focus and bracketed-paste events don't exist on the console API:
+  focus never fires (optional today) and a paste arrives as key bursts —
+  both handled as on unix. No `chcp`: the codepage is cosmetic (input is
+  UTF-16 records) and is never changed.
 - Secrets: key values are never rendered in boot output or `[tui]` lines; tool
   arguments render as the user would see them in their own shell (local
   surface, local disclosure — but the ledger never stores them; unchanged).
