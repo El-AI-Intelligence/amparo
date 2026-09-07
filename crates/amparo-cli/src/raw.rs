@@ -447,11 +447,11 @@ mod tests {
 
     #[test]
     fn other_ctrl_chords_are_ignored() {
-        // Ctrl-Q arrives as VK_Q with its control character 0x11 — the
-        // unix decoder ignores those bytes, so they must not type into
-        // a prompt here.
-        assert_eq!(key(VK_Q, 0x11, LEFT_CTRL_PRESSED), ConsoleKey::Ignore);
-        assert_eq!(key(VK_A, 0x01, RIGHT_CTRL_PRESSED), ConsoleKey::Ignore);
+        // Ctrl-Q arrives as VK_Q (0x51) with its control character 0x11 —
+        // the unix decoder ignores those bytes, so they must not type
+        // into a prompt here.
+        assert_eq!(key(0x51, 0x11, LEFT_CTRL_PRESSED), ConsoleKey::Ignore);
+        assert_eq!(key(0x41, 0x01, RIGHT_CTRL_PRESSED), ConsoleKey::Ignore);
         // Ctrl+Backspace keeps its semantic meaning.
         assert_eq!(key(VK_BACK, 0x7F, LEFT_CTRL_PRESSED), ConsoleKey::Backspace);
     }

@@ -3695,12 +3695,12 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn try_recv_char(rx: &mpsc::UnboundedReceiver<char>) -> Option<char> {
+    fn try_recv_char(rx: &mut mpsc::UnboundedReceiver<char>) -> Option<char> {
         rx.try_recv().ok()
     }
 
     #[cfg(windows)]
-    fn try_recv_msg(rx: &mpsc::UnboundedReceiver<ReaderMsg>) -> Option<ReaderMsg> {
+    fn try_recv_msg(rx: &mut mpsc::UnboundedReceiver<ReaderMsg>) -> Option<ReaderMsg> {
         rx.try_recv().ok()
     }
 
@@ -3731,14 +3731,14 @@ mod tests {
     fn win_route_approval_sends_gate_keys() {
         let ui = test_ui(Mode::Approval);
         let (main_tx, main_rx) = mpsc::unbounded_channel();
-        let (key_tx, key_rx) = mpsc::unbounded_channel();
+        let (key_tx, mut key_rx) = mpsc::unbounded_channel();
         let mut history = WinHistory::default();
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlC);
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('y'));
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Enter);
-        assert_eq!(try_recv_char(&key_rx), Some('n'));
-        assert_eq!(try_recv_char(&key_rx), Some('y'));
-        assert_eq!(try_recv_char(&key_rx), None); // Enter is not a gate key
+        assert_eq!(try_recv_char(&mut key_rx), Some('n'));
+        assert_eq!(try_recv_char(&mut key_rx), Some('y'));
+        assert_eq!(try_recv_char(&mut key_rx), None); // Enter is not a gate key
         assert!(main_rx.is_empty());
     }
 
@@ -3746,7 +3746,7 @@ mod tests {
     #[test]
     fn win_route_picker_sends_pick_keys() {
         let ui = test_ui(Mode::Picker);
-        let (main_tx, main_rx) = mpsc::unbounded_channel();
+        let (main_tx, mut main_rx) = mpsc::unbounded_channel();
         let (key_tx, _key_rx) = mpsc::unbounded_channel();
         let mut history = WinHistory::default();
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Up);
@@ -3757,7 +3757,7 @@ mod tests {
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('s'));
         let got: Vec<String> = (0..6)
             .map(|_| {
-                try_recv_msg(&main_rx)
+                try_recv_msg(&mut main_rx)
                     .map(|m| match m {
                         ReaderMsg::Pick(k) => pick_key_variant(&k).to_string(),
                         other => reader_msg_variant(&other).to_string(),
@@ -3766,7 +3766,7 @@ mod tests {
             })
             .collect();
         assert_eq!(got, ["Up", "Down", "Enter", "Esc", "Esc", "Char"]);
-        assert_eq!(try_recv_msg(&main_rx).is_none(), true);
+        assert_eq!(try_recv_msg(&mut main_rx).is_none(), true);
     }
 
     #[cfg(windows)]
@@ -3774,7 +3774,7 @@ mod tests {
     fn win_route_normal_submits_and_remembers_history() {
         let ui = test_ui(Mode::Normal);
         ui.prompt_ready();
-        let (main_tx, main_rx) = mpsc::unbounded_channel();
+        let (main_tx, mut main_rx) = mpsc::unbounded_channel();
         let (key_tx, _key_rx) = mpsc::unbounded_channel();
         let mut history = WinHistory::default();
         for c in ['h', 'i'] {
@@ -3782,9 +3782,9 @@ mod tests {
         }
         assert_eq!(ui.input(), "hi");
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Enter);
-        match try_recv_msg(&main_rx) {
+        match try_recv_msg(&mut main_rx) {
             Some(ReaderMsg::Line(l)) => assert_eq!(l, "hi"),
-            other => panic!("expected Line(\"hi\"), got {other:?}"),
+            other => panic!("expected Line(\"hi\"), got {}", reader_msg_variant(&other)),
         }
         // History up restores the submitted line onto the live prompt.
         ui.prompt_ready();
@@ -3800,25 +3800,34 @@ mod tests {
     fn win_route_normal_quit_and_cancel_paths() {
         let ui = test_ui(Mode::Normal);
         ui.prompt_ready();
-        let (main_tx, main_rx) = mpsc::unbounded_channel();
+        let (main_tx, mut main_rx) = mpsc::unbounded_channel();
         let (key_tx, _key_rx) = mpsc::unbounded_channel();
         let mut history = WinHistory::default();
         // Idle Ctrl-C quits.
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlC);
-        assert_eq!(reader_msg_variant(&try_recv_msg(&main_rx).unwrap()), "Quit");
+        assert_eq!(
+            reader_msg_variant(&try_recv_msg(&mut main_rx).unwrap()),
+            "Quit"
+        );
         // Ctrl-D on an empty line quits; on a non-empty line it's ignored.
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlD);
-        assert_eq!(reader_msg_variant(&try_recv_msg(&main_rx).unwrap()), "Quit");
+        assert_eq!(
+            reader_msg_variant(&try_recv_msg(&mut main_rx).unwrap()),
+            "Quit"
+        );
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('x'));
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlD);
-        assert_eq!(try_recv_msg(&main_rx).is_none(), true);
+        assert_eq!(try_recv_msg(&mut main_rx).is_none(), true);
         // While a task runs, only Ctrl-C cancels.
         ui.task_begin();
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Char('z'));
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Enter);
-        assert_eq!(try_recv_msg(&main_rx).is_none(), true);
+        assert_eq!(try_recv_msg(&mut main_rx).is_none(), true);
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::CtrlC);
-        assert_eq!(reader_msg_variant(&try_recv_msg(&main_rx).unwrap()), "Cancel");
+        assert_eq!(
+            reader_msg_variant(&try_recv_msg(&mut main_rx).unwrap()),
+            "Cancel"
+        );
     }
 
     #[cfg(windows)]
