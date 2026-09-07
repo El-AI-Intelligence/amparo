@@ -3784,7 +3784,8 @@ mod tests {
         route(&ui, &main_tx, &key_tx, &mut history, ConsoleKey::Enter);
         match try_recv_msg(&mut main_rx) {
             Some(ReaderMsg::Line(l)) => assert_eq!(l, "hi"),
-            other => panic!("expected Line(\"hi\"), got {}", reader_msg_variant(&other)),
+            Some(other) => panic!("expected Line(\"hi\"), got {}", reader_msg_variant(&other)),
+            None => panic!("expected Line(\"hi\"), got nothing"),
         }
         // History up restores the submitted line onto the live prompt.
         ui.prompt_ready();
