@@ -16,12 +16,12 @@ name = "amparo-mcp-serve"
 path = "src/main.rs"
 
 [dependencies]
-amparo-agent = { path = "../amparo-agent" }
-amparo-inference = { path = "../amparo-inference" }
-amparo-policy = { path = "../amparo-policy" }
-amparo-privacy = { path = "../amparo-privacy" }
-amparo-sandbox = { path = "../amparo-sandbox" }
-amparo-tools = { path = "../amparo-tools" }
+amparo-agent = { workspace = true }
+amparo-inference = { workspace = true }
+amparo-policy = { workspace = true }
+amparo-privacy = { workspace = true }
+amparo-sandbox = { workspace = true }
+amparo-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

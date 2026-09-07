@@ -11,6 +11,19 @@ authors = ["EL AI Intelligence <Elai-intelligence@pm.me>"]
 repository = "https://github.com/El-AI-Intelligence/amparo"
 
 [workspace.dependencies]
+# Internal crates — version pinned so `cargo publish` can rewrite path deps
+# to registry deps; bump alongside [workspace.package].version.
+amparo-agent = { version = "0.13.0", path = "crates/amparo-agent" }
+amparo-chat = { version = "0.13.0", path = "crates/amparo-chat" }
+amparo-cli = { version = "0.13.0", path = "crates/amparo-cli" }
+amparo-inference = { version = "0.13.0", path = "crates/amparo-inference" }
+amparo-mcp = { version = "0.13.0", path = "crates/amparo-mcp" }
+amparo-memory = { version = "0.13.0", path = "crates/amparo-memory" }
+amparo-notebook = { version = "0.13.0", path = "crates/amparo-notebook" }
+amparo-policy = { version = "0.13.0", path = "crates/amparo-policy" }
+amparo-privacy = { version = "0.13.0", path = "crates/amparo-privacy" }
+amparo-sandbox = { version = "0.13.0", path = "crates/amparo-sandbox" }
+amparo-tools = { version = "0.13.0", path = "crates/amparo-tools" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

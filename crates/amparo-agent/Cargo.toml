@@ -12,10 +12,10 @@ keywords = ['agent', 'llm', 'tool-calling', 'policy', 'ai']
 categories = ['development-tools']
 
 [dependencies]
-amparo-inference = { path = "../amparo-inference" }
-amparo-privacy = { path = "../amparo-privacy" }
-amparo-policy = { path = "../amparo-policy" }
-amparo-tools = { path = "../amparo-tools" }
+amparo-inference = { workspace = true }
+amparo-privacy = { workspace = true }
+amparo-policy = { workspace = true }
+amparo-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

@@ -12,7 +12,7 @@ keywords = ['shell', 'filesystem', 'git', 'agent', 'tools']
 categories = ['development-tools', 'filesystem']
 
 [dependencies]
-amparo-privacy = { path = "../amparo-privacy" }
+amparo-privacy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
