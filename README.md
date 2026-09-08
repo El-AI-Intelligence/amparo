@@ -8,8 +8,10 @@ An open agent that acts under policy. Bring your own LLM.
 Amparo runs a real tool-use loop — shell, files, git, web, tests, build,
 memory — where **every tool call passes a policy check before it executes**,
 and where the model driving the loop is yours to choose. Current version:
-**v0.14.0** (Windows interactive parity — the TUI and code surface
-now run full-screen on Windows, too; see [Roadmap](#roadmap)).
+**v0.15.0** (any model that speaks OpenAI — a provider catalog covers
+Kimi, DeepSeek, Qwen, GLM, Groq, Gemini, Ollama and more, and the setup
+wizard picks, validates and probes the endpoint; see
+[Roadmap](#roadmap)).
 
 **The one rule: no member exits the gate chain.** The gate chain is
 
@@ -50,7 +52,9 @@ amparo run "list the files and tell me what's there" --allow-all
 
 Two environment variables are required; everything else is optional —
 `AMPARO_INFERENCE_KEY` (empty for keyless local providers),
-`AMPARO_INFERENCE_PROVIDER` (`openai` default or `anthropic`),
+`AMPARO_INFERENCE_PROVIDER` (a provider-catalog id — `openai` by
+default, `anthropic` for the native API, `kimi`, `deepseek`, `ollama`
+and the rest),
 `AMPARO_WORKSPACE` (the directory tools are confined to),
 `AMPARO_POLICY_KEY` (with `--policy-url`), and the `AMPARO_CHAT_*` tokens
 for the chat adapters. Without `--policy-url` or `--allow-all`, every tool
@@ -220,9 +224,13 @@ for the session). Slash commands at the prompt:
   path: `! guardrail link` pairs this machine with an org key)
 
 `amparo wizard` writes the first-run profile in four steps — workspace,
-LLM endpoint, optional Guardrail policy (engine URL, key, console URL),
+provider, optional Guardrail policy (engine URL, key, console URL),
 optional Engram memory URL — saved locally (mode 0600) and read back at
-boot to fill environment gaps (env always wins). Steps 3 and 4 print
+boot to fill environment gaps (env always wins). Step 2 is a picker
+over the provider catalog (a number or a name — `kimi` works) with the
+endpoint and model prefilled and validated, and a live probe after save
+confirms the model answers; a re-run picks up the saved profile as the
+defaults, so a broken setup repairs in one pass. Steps 3 and 4 print
 delegation guidance: the sibling CLI found on PATH
 ("`guardrail link` pairs this machine") or its install one-liner.
 
@@ -246,7 +254,7 @@ the hub.
 | `AMPARO_INFERENCE_URL` | **Required.** Provider base URL, e.g. `http://localhost:11434/v1` or `https://api.anthropic.com` |
 | `AMPARO_INFERENCE_MODEL` | **Required.** Model ID, e.g. `qwen2.5:14b` |
 | `AMPARO_INFERENCE_KEY` | API key (empty for keyless local providers) |
-| `AMPARO_INFERENCE_PROVIDER` | `openai` (default) or `anthropic` |
+| `AMPARO_INFERENCE_PROVIDER` | Provider-catalog id: `openai` (default), `anthropic`, `moonshot` (`kimi`), `deepseek`, `qwen`, `glm`, `mistral`, `groq`, `openrouter`, `gemini`, `ollama`, `lmstudio`, `custom` |
 | `AMPARO_INFERENCE_TIMEOUT_SECS` | Request timeout (default 120, clamped 1–3600) |
 | `AMPARO_INFERENCE_MAX_TOKENS` | Optional per-request `max_tokens` cap |
 | `AMPARO_INFERENCE_MODEL_ALLOWLIST` | Optional comma-separated model allowlist |

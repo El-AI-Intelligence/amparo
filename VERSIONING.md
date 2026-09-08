@@ -1,7 +1,7 @@
 # Versioning and API stability
 
 Amparo is a workspace of Rust crates that share one version
-(`[workspace.package] version = 0.14.0`). This file is the contract for how
+(`[workspace.package] version = 0.15.0`). This file is the contract for how
 that version moves and what "stable" means at each stage.
 
 ## Semver
@@ -81,6 +81,13 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
   legacy console host) over the native console API, and bare `amparo` on
   a terminal opens the one-time setup wizard, then the TUI; the
   unconfigured `amparo run` error points at `amparo`.
+- **0.15.0 (2026-09-08)** — any model that speaks OpenAI: a provider
+  catalog (`moonshot`/`kimi`, `deepseek`, `qwen`, `glm`, `groq`,
+  `gemini`, `ollama`, `lmstudio` and more as `AMPARO_INFERENCE_PROVIDER`
+  ids), body-pure compat requests that strict endpoints no longer
+  reject, reasoning-content echo for reasoning models, and a friendlier
+  wizard — provider picker, prefilled and validated endpoint, and a
+  live probe after save.
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 

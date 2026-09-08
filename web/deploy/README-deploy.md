@@ -14,7 +14,7 @@ the spawned `amparo` process, not here.
   `/approvals*` is blocked at Caddy: that path is the loopback-only gate seam
   (the shipped `--approval-endpoint`'s endpoint).
 - **amparo binary** — `/srv/amparo/bin/amparo`, built on the box from the
-  source tree at tag **v0.14.0** (`/srv/amparo/src`).
+  source tree at tag **v0.15.0** (`/srv/amparo/src`).
 
 ## Layout
 
@@ -22,7 +22,7 @@ the spawned `amparo` process, not here.
 |---|---|
 | `/srv/amparo/app/` | the app (`server.mjs`, `public/`) |
 | `/srv/amparo/bin/amparo` | the shipped binary the app spawns |
-| `/srv/amparo/src/` | source tree pinned at v0.14.0 (build here) |
+| `/srv/amparo/src/` | source tree pinned at v0.15.0 (build here) |
 | `/srv/amparo/workspaces/<operator>/` | per-operator state root (`.amparo/`) |
 | `/etc/amparo-web/amparo-web.env` | config + token (0640 root:amparo) |
 | `/etc/caddy/amparo.Caddyfile` | vhost |

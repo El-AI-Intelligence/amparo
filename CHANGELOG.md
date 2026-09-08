@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
+## [Unreleased]
+
+### Added
+
+- A provider catalog: `AMPARO_INFERENCE_PROVIDER` now accepts a catalog
+  id or alias — `anthropic`, `openai`, `moonshot` (`kimi`), `deepseek`,
+  `qwen`, `glm`, `mistral`, `groq`, `openrouter`, `gemini` (its
+  OpenAI-compatible endpoint), `ollama`, `lmstudio`, or `custom` — each
+  carrying its default endpoint and model; an unknown id errors with the
+  catalog list instead of a bare parse failure.
+- The setup wizard's provider step is now a picker: a numbered friendly
+  list (a number or a name, Enter keeps the default), the endpoint and
+  model prefilled from the catalog and validated as entered, and a live
+  probe after save ("reply with the single word: ok", short timeout)
+  that confirms the model answers — failures print the reason and never
+  block, and re-running the wizard picks up the saved profile as the
+  defaults.
+- OpenAI-compatible endpoints get URL normalization: trailing slashes
+  and a stray `/chat/completions` are stripped, a bare host gains `/v1`,
+  and a URL without a scheme and host is rejected with a clear error.
+
+### Changed
+
+- Requests to OpenAI-compatible endpoints are body-pure: Amparo-only
+  fields (`think`, `format`, `web_search`) no longer leak into the
+  payload — strict endpoints (Moonshot, DeepSeek-class) stop rejecting
+  requests with HTTP 400 — and JSON-schema requests map to the standard
+  `response_format` field. The native Ollama path keeps `think`.
+- Reasoning models keep their chain of thought: `reasoning_content`
+  round-trips into the next request for providers the catalog marks as
+  reasoning (Kimi, DeepSeek, Qwen, GLM), so multi-turn tool calling
+  keeps working; other providers never see the field.
+- The `[infer]` status line (boot banner and wizard summary) names the
+  catalog label and model — e.g. `Moonshot AI (Kimi) · kimi-k3`.
+
 ## [0.14.0] — 2026-09-08
 
 ### Added

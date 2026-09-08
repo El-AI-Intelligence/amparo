@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/amparo-inference", "crates/amparo-memory", "crates/amparo-privacy", "crates/amparo-policy", "crates/amparo-tools", "crates/amparo-agent", "crates/amparo-mcp", "crates/amparo-cli", "crates/amparo-chat", "crates/amparo-notebook", "crates/amparo-sandbox"]
 
 [workspace.package]
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -13,17 +13,17 @@ repository = "https://github.com/El-AI-Intelligence/amparo"
 [workspace.dependencies]
 # Internal crates — version pinned so `cargo publish` can rewrite path deps
 # to registry deps; bump alongside [workspace.package].version.
-amparo-agent = { version = "0.14.0", path = "crates/amparo-agent" }
-amparo-chat = { version = "0.14.0", path = "crates/amparo-chat" }
-amparo-cli = { version = "0.14.0", path = "crates/amparo-cli" }
-amparo-inference = { version = "0.14.0", path = "crates/amparo-inference" }
-amparo-mcp = { version = "0.14.0", path = "crates/amparo-mcp" }
-amparo-memory = { version = "0.14.0", path = "crates/amparo-memory" }
-amparo-notebook = { version = "0.14.0", path = "crates/amparo-notebook" }
-amparo-policy = { version = "0.14.0", path = "crates/amparo-policy" }
-amparo-privacy = { version = "0.14.0", path = "crates/amparo-privacy" }
-amparo-sandbox = { version = "0.14.0", path = "crates/amparo-sandbox" }
-amparo-tools = { version = "0.14.0", path = "crates/amparo-tools" }
+amparo-agent = { version = "0.15.0", path = "crates/amparo-agent" }
+amparo-chat = { version = "0.15.0", path = "crates/amparo-chat" }
+amparo-cli = { version = "0.15.0", path = "crates/amparo-cli" }
+amparo-inference = { version = "0.15.0", path = "crates/amparo-inference" }
+amparo-mcp = { version = "0.15.0", path = "crates/amparo-mcp" }
+amparo-memory = { version = "0.15.0", path = "crates/amparo-memory" }
+amparo-notebook = { version = "0.15.0", path = "crates/amparo-notebook" }
+amparo-policy = { version = "0.15.0", path = "crates/amparo-policy" }
+amparo-privacy = { version = "0.15.0", path = "crates/amparo-privacy" }
+amparo-sandbox = { version = "0.15.0", path = "crates/amparo-sandbox" }
+amparo-tools = { version = "0.15.0", path = "crates/amparo-tools" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
