@@ -8,8 +8,8 @@ An open agent that acts under policy. Bring your own LLM.
 Amparo runs a real tool-use loop — shell, files, git, web, tests, build,
 memory — where **every tool call passes a policy check before it executes**,
 and where the model driving the loop is yours to choose. Current version:
-**v0.13.0** (all fourteen roadmap milestones landed — see
-[Roadmap](#roadmap)).
+**v0.14.0** (Windows interactive parity — the TUI and code surface
+now run full-screen on Windows, too; see [Roadmap](#roadmap)).
 
 **The one rule: no member exits the gate chain.** The gate chain is
 

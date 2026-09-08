@@ -1,7 +1,7 @@
 # Versioning and API stability
 
 Amparo is a workspace of Rust crates that share one version
-(`[workspace.package] version = 0.13.0`). This file is the contract for how
+(`[workspace.package] version = 0.14.0`). This file is the contract for how
 that version moves and what "stable" means at each stage.
 
 ## Semver
@@ -76,6 +76,11 @@ fixes, but 0.x consumers pin an exact version if they need a guarantee.
   feed generated at deploy time, an update line in the TUI boot banner
   and a dismissible notice on the web surface; `edit_file`'s
   `lines_changed` key renamed to `line_delta`.
+- **0.14.0 (2026-09-08)** — Windows interactive parity: `amparo tui`
+  and `amparo code` run full-screen on Windows (Windows Terminal and the
+  legacy console host) over the native console API, and bare `amparo` on
+  a terminal opens the one-time setup wizard, then the TUI; the
+  unconfigured `amparo run` error points at `amparo`.
 - When the first stable release happens it will be **1.0.0**, and from then
   on semver applies in full.
 

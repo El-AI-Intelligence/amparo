@@ -28,7 +28,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "amparo-agent"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "amparo-inference",
  "amparo-policy",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-chat"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "amparo-agent",
  "amparo-inference",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-cli"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "amparo-agent",
  "amparo-chat",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-inference"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-mcp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "amparo-agent",
  "amparo-inference",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-memory"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "serde",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-notebook"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "amparo-agent",
  "amparo-policy",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-policy"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-privacy"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "regex",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-sandbox"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "amparo-tools",
  "async-trait",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "amparo-tools"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "amparo-privacy",
  "anyhow",
