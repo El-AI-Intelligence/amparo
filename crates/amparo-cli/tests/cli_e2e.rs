@@ -1077,7 +1077,7 @@ async fn run_prints_the_power_on_banner_to_stderr() {
         "the banner names the wired chain: {err}"
     );
     assert!(
-        err.contains("[infer] openai · mock-model · http://127.0.0.1:"),
+        err.contains("[infer] OpenAI (GPT) · mock-model · http://127.0.0.1:"),
         "the infer line names the mock provider: {err}"
     );
     assert!(err.contains("[memory] built-in store"), "{err}");
@@ -4998,9 +4998,9 @@ async fn wizard_writes_0600_profile_and_a_run_reads_it() {
     let path_env = set_env(&[("PATH", joined)], &[]);
 
     // Ten answers, one per prompt: workspace (empty = the env root),
-    // url, model, then Enter for provider, key, policy url/key, a
-    // console url, then Enter for memory url/key.
-    let answers = format!("\n{}\nmock-model\n\n\n\n\nhttps://console.example\n\n\n", mock.url());
+    // provider (empty = the picker default), url, model, then Enter for
+    // key, policy url/key, a console url, then Enter for memory url/key.
+    let answers = format!("\n\n{}\nmock-model\n\n\n\nhttps://console.example\n\n\n", mock.url());
     let out = run_with_stdin(&["wizard"], answers.as_bytes()).await;
 
     let text = stdout(&out);
@@ -5028,7 +5028,7 @@ async fn wizard_writes_0600_profile_and_a_run_reads_it() {
     // /v1 path is stripped by site_desc.
     let host = mock.url().trim_end_matches("/v1").to_string();
     assert!(
-        text.contains(&format!("[infer] openai · mock-model · {host}")),
+        text.contains(&format!("[infer] OpenAI (GPT) · mock-model · {host}")),
         "{text}"
     );
     assert!(text.contains("[memory] built-in store"), "{text}");
@@ -5053,7 +5053,8 @@ async fn wizard_writes_0600_profile_and_a_run_reads_it() {
         serde_json::from_str(&std::fs::read_to_string(&profile_path).unwrap()).unwrap();
     assert_eq!(profile["inference_url"], mock.url());
     assert_eq!(profile["inference_model"], "mock-model");
-    assert!(profile["inference_provider"].is_null());
+    // The picker answer is captured as the catalog id (empty = openai).
+    assert_eq!(profile["inference_provider"], "openai");
     assert!(profile["policy_url"].is_null());
     assert_eq!(profile["console_url"], "https://console.example");
     assert!(profile["memory_url"].is_null());
@@ -5114,7 +5115,7 @@ async fn wizard_prints_install_hints_when_sibling_clis_are_missing() {
 
     // Ten empty answers — every step skipped, the delegation lines still
     // print before the first prompt of each step.
-    let out = run_with_stdin(&["wizard"], b"\n\n\n\n\n\n\n\n\n\n").await;
+    let out = run_with_stdin(&["wizard"], b"\n\nhttp://127.0.0.1:11434/v1\n\n\n\n\n\n\n\n").await;
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(

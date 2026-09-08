@@ -1,6 +1,6 @@
 //! `amparo wizard` — the first-run profile wizard (#167).
 //!
-//! Local-first: four ruled steps — workspace → LLM endpoint → optional
+//! Local-first: four ruled steps — workspace → provider → optional
 //! Guardrail policy (wire check URL, key, console URL) → optional Engram
 //! Vault memory URL — captured line by line (Enter skips; piped stdin
 //! answers one line per prompt, in order) and written to
@@ -10,6 +10,16 @@
 //! (`guardrail link`, `engram pair`), a missing one gets its install
 //! one-liner.
 //!
+//! The provider step is a picker over [`catalog::CATALOG`] — a number or
+//! any catalog id/alias (`kimi`, `claude`, `ollama`, …) resolves to a
+//! spec whose endpoint and model prefill the following prompts. The URL
+//! is validated before it is accepted (scheme + host, normalized — a
+//! junk URL re-prompts instead of saving), and once the profile is
+//! written a short live probe runs through the resolved provider
+//! (best-effort: a failure prints the reason and how to recover, never
+//! blocks). The probe is skipped on piped stdin, keeping the scripted
+//! path fast and offline.
+//!
 //! Every later wire reads the profile to fill environment gaps: the
 //! environment wins, the profile fills what is unset. `amparo tui` boots
 //! into the wizard when no LLM is configured anywhere (env or profile);
@@ -18,9 +28,13 @@
 //! from the answers: the same five lines the next boot greets with.
 
 use crate::run::site_desc;
+use amparo_inference::{
+    catalog, CloudConfig, InferenceConfig, InferenceProvider, InferenceRequest,
+};
 use amparo_tools::PathPolicy;
-use std::io::BufRead;
+use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The first-run profile: the wizard's captured answers, one optional
 /// field per prompt. `None` means "skipped" — the environment's value
@@ -256,17 +270,19 @@ pub(crate) fn console_desc(profile: &Profile) -> Option<String> {
     })
 }
 
-/// The infer line in the banner's grammar, from the answers — the host
-/// in the ledger's `scheme://host[:port]` shape, never a key-carrying
-/// URL.
+/// The infer line in the banner's grammar, from the answers — the
+/// catalog label (resolved from the stored provider id), the model, and
+/// the host in the ledger's `scheme://host[:port]` shape, never a
+/// key-carrying URL.
 pub(crate) fn infer_desc(profile: &Profile) -> String {
     match (&profile.inference_url, &profile.inference_model) {
-        (Some(url), Some(model)) => format!(
-            "{} · {} · {}",
-            profile.inference_provider.as_deref().unwrap_or("openai"),
-            model,
-            site_desc(url)
-        ),
+        (Some(url), Some(model)) => {
+            let provider = profile.inference_provider.as_deref().unwrap_or("openai");
+            let label = catalog::lookup(provider)
+                .map(|spec| spec.label)
+                .unwrap_or(provider);
+            format!("{label} · {model} · {}", site_desc(url))
+        }
         _ => "not configured — set AMPARO_INFERENCE_URL and AMPARO_INFERENCE_MODEL".to_string(),
     }
 }
@@ -316,6 +332,188 @@ fn env_or(
         .or_else(|| existing.as_ref().and_then(from_profile))
 }
 
+/// The provider picker: a numbered friendly list over the catalog.
+/// A line may be a 1-based number or any catalog id/alias
+/// (case-insensitive — `kimi`, `claude`, `ollama`, …); Enter keeps the
+/// default. Loops until a line resolves.
+fn pick_provider(
+    reader: &mut dyn BufRead,
+    default: &catalog::ProviderSpec,
+) -> Result<&'static catalog::ProviderSpec, String> {
+    for (index, spec) in catalog::CATALOG.iter().enumerate() {
+        println!("  {:>2}  {}", index + 1, spec.label);
+    }
+    loop {
+        let answer = ask(
+            reader,
+            &format!("  pick a number or a name [{}] › ", default.label),
+        )?;
+        let answer = if answer.is_empty() {
+            default.id.to_string()
+        } else {
+            answer
+        };
+        if let Ok(number) = answer.trim().parse::<usize>() {
+            if let Some(spec) = catalog::CATALOG.get(number.wrapping_sub(1)) {
+                return Ok(spec);
+            }
+        }
+        if let Some(spec) = catalog::lookup(&answer) {
+            return Ok(spec);
+        }
+        println!(
+            "[wizard] hmm, '{}' isn't in the list — a number (1–{}) or a name like 'kimi' works",
+            answer.trim(),
+            catalog::CATALOG.len()
+        );
+    }
+}
+
+/// The URL prompt: prefilled, editable, and validated before it is
+/// accepted. Enter keeps a valid default; a non-empty answer (or a
+/// default that no longer normalizes) must be `http://`/`https://` with
+/// a host — anything else re-prompts with a hint instead of saving junk.
+fn ask_url(reader: &mut dyn BufRead, default: Option<String>) -> Result<String, String> {
+    // A saved value that fails validation is repaired here, not echoed
+    // back as a tempting Enter.
+    if let Some(saved) = &default {
+        if catalog::normalize_base_url(saved).is_err() {
+            println!("[wizard] the saved URL '{saved}' doesn't look valid — please type it again");
+        }
+    }
+    let default = default.filter(|saved| catalog::normalize_base_url(saved).is_ok());
+    loop {
+        let hint = default.as_deref().unwrap_or("required");
+        let answer = ask(reader, &format!("  url [{hint}] › "))?;
+        if answer.is_empty() {
+            if let Some(saved) = &default {
+                // Pre-checked above — the expect cannot fire.
+                return Ok(catalog::normalize_base_url(saved).expect("pre-checked URL"));
+            }
+            println!("[wizard] a URL is needed — e.g. https://api.moonshot.cn/v1");
+            continue;
+        }
+        match catalog::normalize_base_url(&answer) {
+            Ok(url) => return Ok(url),
+            Err(err) => println!("[wizard] that doesn't look right — {err}"),
+        }
+    }
+}
+
+/// The model prompt: prefilled, editable; Enter keeps the default, and
+/// a provider without one (OpenRouter, Ollama, LM Studio, custom)
+/// requires a typed model id.
+fn ask_model(reader: &mut dyn BufRead, default: Option<String>) -> Result<String, String> {
+    loop {
+        let hint = default.as_deref().unwrap_or("required");
+        let answer = ask(reader, &format!("  model [{hint}] › "))?;
+        if answer.is_empty() {
+            if let Some(saved) = &default {
+                return Ok(saved.clone());
+            }
+            println!("[wizard] this provider needs a model id — e.g. llama3.1:8b");
+            continue;
+        }
+        return Ok(answer);
+    }
+}
+
+/// The live probe's prompt — short and cheap; any answer is success.
+const PROBE_PROMPT: &str = "reply with the single word: ok";
+
+/// The live probe's timeout, in seconds — long enough for a cold local
+/// model, short enough to never stall the wizard.
+const PROBE_TIMEOUT_SECS: u64 = 20;
+
+/// One live `complete()` through the resolved provider. Returns the
+/// answer text; a provider error or a timeout carries the reason. Pure
+/// over `&dyn InferenceProvider` — unit-tested with fakes.
+async fn probe_provider(
+    provider: &dyn InferenceProvider,
+    model: &str,
+) -> Result<String, String> {
+    let request = InferenceRequest {
+        prompt: PROBE_PROMPT.to_string(),
+        max_tokens: Some(16),
+        temperature: Some(0.0),
+        model: Some(model.to_string()),
+        ..Default::default()
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(PROBE_TIMEOUT_SECS),
+        provider.complete(request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Ok(response.text),
+        Ok(Err(err)) => Err(format!("the provider said: {err}")),
+        Err(_) => Err(format!(
+            "no answer within {PROBE_TIMEOUT_SECS}s — check the URL, model and key"
+        )),
+    }
+}
+
+/// The probe's answer, made safe for one display line.
+fn probe_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(60)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The live probe, run after the profile is saved: build the provider
+/// from the captured answers and send one short `complete()`. Best-effort
+/// — a failure prints the reason and how to recover, and never blocks
+/// the wizard. Skipped entirely on piped stdin (the scripted path must
+/// stay fast and offline), so the check lives behind the terminal gate
+/// at the call site.
+fn probe_summary(profile: &Profile) {
+    let (Some(url), Some(model)) = (&profile.inference_url, &profile.inference_model) else {
+        return;
+    };
+    let Some(spec) = catalog::lookup(profile.inference_provider.as_deref().unwrap_or("openai"))
+    else {
+        return;
+    };
+    let config = InferenceConfig {
+        base_url: url.clone(),
+        api_key: profile.inference_key.clone().unwrap_or_default(),
+        model: model.clone(),
+        provider: spec.wire,
+        provider_id: Some(spec.id.to_string()),
+        timeout_secs: PROBE_TIMEOUT_SECS,
+        max_tokens_limit: None,
+        allowlist: None,
+        cloud: CloudConfig::from_env(),
+    };
+    let provider = match config.build() {
+        Ok(provider) => provider,
+        Err(err) => {
+            println!("[probe] skipped — {err}");
+            return;
+        }
+    };
+    // A throwaway current-thread runtime: the wizard's `run` is sync
+    // (called from both the async dispatch and the bare-`amparo` boot
+    // path), so the probe blocks its own thread, never an ambient one.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            println!("[probe] skipped — cannot start the check: {err}");
+            return;
+        }
+    };
+    match runtime.block_on(probe_provider(provider.as_ref(), model)) {
+        Ok(text) => println!("[probe] ok — {model} answered: {}", probe_text(&text)),
+        Err(reason) => println!("[probe] couldn't reach the model — {reason} (re-run `amparo wizard` to adjust)"),
+    }
+}
+
 /// The wizard itself: four ruled steps, one line per prompt, then the
 /// profile (0600), the `[chain]` summary and the boot-banner preview.
 /// Returns the chosen workspace root and the captured profile.
@@ -326,9 +524,9 @@ pub(crate) fn run(
     // Re-runs use the existing profile's values as defaults.
     let existing = load(default_root);
     println!("Greetings! My name is Amparo, built by EL AI Intelligence.");
-    println!("[wake] first run — four steps and you're awake: workspace, LLM, policy, memory.");
+    println!("[wake] first run — four steps and you're awake: workspace, provider, policy, memory.");
     println!("[wizard] policy and memory are recommended, never required — Enter skips any line.");
-    println!("[wizard] keys you type here are never echoed back.");
+    println!("[wizard] answers are stored locally (mode 0600) and never printed back.");
 
     println!();
     println!("▐ step 1/4 — workspace");
@@ -356,42 +554,34 @@ pub(crate) fn run(
         );
     }
 
-    let url_default = env_or(
-        &existing,
-        |p| p.inference_url.clone(),
-        "AMPARO_INFERENCE_URL",
-    );
-    let model_default = env_or(
-        &existing,
-        |p| p.inference_model.clone(),
-        "AMPARO_INFERENCE_MODEL",
-    );
     let provider_default = env_or(
         &existing,
         |p| p.inference_provider.clone(),
         "AMPARO_INFERENCE_PROVIDER",
     );
+    let default_spec = provider_default
+        .as_deref()
+        .and_then(catalog::lookup)
+        .unwrap_or_else(|| catalog::lookup("openai").expect("openai is always cataloged"));
     println!();
-    println!("▐ step 2/4 — LLM endpoint");
-    println!("  a BYO-LLM URL and model (openai or anthropic wire format)");
-    let url = ask(
-        reader,
-        &format!("  url [{}] › ", url_default.as_deref().unwrap_or("none")),
-    )?;
-    let model = ask(
-        reader,
-        &format!(
-            "  model [{}] › ",
-            model_default.as_deref().unwrap_or("none")
-        ),
-    )?;
-    let provider = ask(
-        reader,
-        &format!(
-            "  provider [default {}] › ",
-            provider_default.as_deref().unwrap_or("openai")
-        ),
-    )?;
+    println!("▐ step 2/4 — your AI provider");
+    println!("  pick who thinks for you — any of these, or another server");
+    println!("  that speaks an OpenAI-style API");
+    let spec = pick_provider(reader, default_spec)?;
+    println!(
+        "[wizard] {} — the endpoint and model below are prefilled, Enter keeps them",
+        spec.label
+    );
+
+    let url_default = env_or(&existing, |p| p.inference_url.clone(), "AMPARO_INFERENCE_URL")
+        .or_else(|| spec.base_url.map(str::to_string));
+    let url = ask_url(reader, url_default)?;
+
+    let model_default =
+        env_or(&existing, |p| p.inference_model.clone(), "AMPARO_INFERENCE_MODEL")
+            .or_else(|| spec.default_model.map(str::to_string));
+    let model = ask_model(reader, model_default)?;
+
     let key_hint = if existing
         .as_ref()
         .and_then(|p| p.inference_key.as_ref())
@@ -493,13 +683,15 @@ pub(crate) fn run(
         ),
     )?;
 
-    // Skipped answers keep their defaults; key answers keep the existing
-    // profile value (an environment key is never copied silently).
+    // The URL and model were validated (or required) at their prompts;
+    // the provider is the resolved catalog id. Skipped answers keep
+    // their defaults; key answers keep the existing profile value (an
+    // environment key is never copied silently).
     let profile = Profile {
-        inference_url: pick(url, url_default),
-        inference_model: pick(model, model_default),
+        inference_url: Some(url),
+        inference_model: Some(model),
         inference_key: pick(key, existing.as_ref().and_then(|p| p.inference_key.clone())),
-        inference_provider: pick(provider, provider_default),
+        inference_provider: Some(spec.id.to_string()),
         policy_url: pick(policy_url, policy_default),
         policy_key: pick(policy_key, policy_key_default),
         console_url: pick(console_url, console_default),
@@ -510,6 +702,9 @@ pub(crate) fn run(
     let path = save(&root, &profile)?;
     println!();
     println!("[wizard] profile written to {} (mode 0600)", path.display());
+    if std::io::stdin().is_terminal() {
+        probe_summary(&profile);
+    }
     println!("[chain] {}", chain_line(&profile));
     println!("[infer] {}", infer_desc(&profile));
     println!("[memory] {}", memory_desc(&profile));
@@ -552,12 +747,16 @@ amparo wizard — the first-run profile wizard
 USAGE:
   amparo wizard
 
-Four steps — workspace → LLM endpoint → optional Guardrail policy (wire
+Four steps — workspace → provider → optional Guardrail policy (wire
 check URL, key, console URL) → optional Engram Vault memory URL — written
 to {workspace}/.amparo/profile.json (mode 0600). Policy and memory are
-recommended, never required; Enter skips any line; keys are never echoed.
-Piped stdin answers one line per prompt, in order: workspace, url, model,
-provider, key, policy url, policy key, console url, memory url, memory key.
+recommended, never required; Enter skips any line. Step 2 picks from the
+provider catalog (a number or a name — `kimi`, `claude`, `ollama`, …)
+with the endpoint and model prefilled and validated; a short live probe
+runs after saving (skipped when stdin is piped). Answers are stored
+locally and never printed back.
+Piped stdin answers one line per prompt, in order: workspace, provider,
+url, model, key, policy url, policy key, console url, memory url, memory key.
 Steps 3 and 4 note the sibling CLI (`guardrail link`, `engram pair`) or
 its install one-liner.
 
@@ -590,6 +789,7 @@ pub(crate) async fn dispatch(args: impl Iterator<Item = String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amparo_inference::{ChatRequest, InferenceError, InferenceResponse, InferenceStream};
 
     fn full() -> Profile {
         Profile {
@@ -672,9 +872,9 @@ mod tests {
     fn scripted_stdin_captures_the_profile() {
         let root = std::env::temp_dir().join(format!("amparo-wizard-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        // Ten answers: workspace, url, model, provider, key, policy url,
+        // Ten answers: workspace, provider, url, model, key, policy url,
         // policy key, console url, memory url, memory key.
-        let mut stdin: &[u8] = b"/tmp/unused-workspace\nhttp://127.0.0.1:11434/v1\nqwen\n\n\nhttp://127.0.0.1:8080\n\nhttp://127.0.0.1:9101\n\n\n";
+        let mut stdin: &[u8] = b"/tmp/unused-workspace\nopenai\nhttp://127.0.0.1:11434/v1\nqwen\n\nhttp://127.0.0.1:8080\n\nhttp://127.0.0.1:9101\n\n\n";
         let (chosen, profile) = run(&mut stdin, &root).unwrap();
         // The wizard absolutizes the workspace answer. `/tmp/…` is
         // already absolute on Unix and stays verbatim; on Windows it is
@@ -692,6 +892,11 @@ mod tests {
             Some("http://127.0.0.1:11434/v1")
         );
         assert_eq!(profile.inference_model.as_deref(), Some("qwen"));
+        assert_eq!(
+            profile.inference_provider.as_deref(),
+            Some("openai"),
+            "the profile stores the catalog id"
+        );
         assert_eq!(profile.policy_url.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(
             profile.console_url.as_deref(),
@@ -792,5 +997,167 @@ mod tests {
         }
         assert!(!command_on_path("never-installed"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run the picker over the given lines; the default spec is openai.
+    fn picker(lines: &str) -> &'static catalog::ProviderSpec {
+        let mut reader: &[u8] = lines.as_bytes();
+        pick_provider(&mut reader, catalog::lookup("openai").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn picker_accepts_number_name_alias_and_default() {
+        assert_eq!(picker("3\n").id, "moonshot");
+        assert_eq!(picker("kimi\n").id, "moonshot", "aliases resolve");
+        assert_eq!(picker("MOONSHOT\n").id, "moonshot", "case-insensitive");
+        assert_eq!(picker("\n").id, "openai", "Enter keeps the default");
+        assert_eq!(picker("13\n").id, "custom", "the last number works");
+        assert_eq!(
+            picker("banana\n2\n").id,
+            "openai",
+            "an unknown answer re-prompts"
+        );
+        assert_eq!(picker("14\n7\n").id, "mistral", "out of range re-prompts");
+    }
+
+    #[test]
+    fn url_prompt_validates_and_repairs() {
+        // Enter keeps a valid default.
+        let mut reader: &[u8] = b"\n";
+        assert_eq!(
+            ask_url(&mut reader, Some("http://localhost:11434".into())).unwrap(),
+            "http://localhost:11434"
+        );
+        // A pasted /chat/completions suffix is normalized away.
+        let mut reader: &[u8] = b"https://api.moonshot.cn/v1/chat/completions\n";
+        assert_eq!(
+            ask_url(&mut reader, None).unwrap(),
+            "https://api.moonshot.cn/v1"
+        );
+        // Junk re-prompts, then a valid answer lands.
+        let mut reader: &[u8] = b"not a url\n  http://192.168.1.7:8080  \n";
+        assert_eq!(ask_url(&mut reader, None).unwrap(), "http://192.168.1.7:8080");
+        // No default: Enter re-prompts instead of saving nothing.
+        let mut reader: &[u8] = b"\nhttps://x.example\n";
+        assert_eq!(ask_url(&mut reader, None).unwrap(), "https://x.example");
+        // A saved junk value is not offered as the default.
+        let mut reader: &[u8] = b"\nhttps://x.example\n";
+        assert_eq!(
+            ask_url(&mut reader, Some("junk value".into())).unwrap(),
+            "https://x.example"
+        );
+    }
+
+    #[test]
+    fn model_prompt_keeps_default_or_requires_one() {
+        let mut reader: &[u8] = b"\n";
+        assert_eq!(
+            ask_model(&mut reader, Some("gpt-4o".into())).unwrap(),
+            "gpt-4o"
+        );
+        let mut reader: &[u8] = b"\nllama3.1:8b\n";
+        assert_eq!(ask_model(&mut reader, None).unwrap(), "llama3.1:8b");
+    }
+
+    #[test]
+    fn infer_desc_names_the_catalog_label() {
+        let mut profile = full();
+        profile.inference_provider = Some("moonshot".into());
+        profile.inference_model = Some("kimi-k3".into());
+        let line = infer_desc(&profile);
+        assert!(
+            line.starts_with("Moonshot AI (Kimi) · kimi-k3"),
+            "{line}"
+        );
+        // Unknown ids fall back to the raw string, never panic.
+        profile.inference_provider = Some("banana".into());
+        let line = infer_desc(&profile);
+        assert!(line.starts_with("banana · "), "{line}");
+    }
+
+    #[test]
+    fn probe_text_is_one_clean_line() {
+        assert_eq!(probe_text("ok"), "ok");
+        assert_eq!(probe_text("bad\nline"), "badline");
+        assert_eq!(probe_text("  ok  "), "ok");
+    }
+
+    struct ProbeOk;
+
+    #[async_trait::async_trait]
+    impl InferenceProvider for ProbeOk {
+        async fn complete(
+            &self,
+            request: InferenceRequest,
+        ) -> Result<InferenceResponse, InferenceError> {
+            assert!(
+                request.prompt.contains("ok"),
+                "the probe prompt must be cheap: {}",
+                request.prompt
+            );
+            Ok(InferenceResponse {
+                text: "ok".into(),
+                tokens: 1,
+                finish_reason: "stop".into(),
+            })
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f64>, InferenceError> {
+            Err(InferenceError::Config("no embeddings".into()))
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+            Ok(vec![])
+        }
+
+        fn default_model(&self) -> String {
+            "probe-model".into()
+        }
+
+        async fn complete_chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<InferenceStream, InferenceError> {
+            Err(InferenceError::Config("no stream".into()))
+        }
+    }
+
+    struct ProbeFail;
+
+    #[async_trait::async_trait]
+    impl InferenceProvider for ProbeFail {
+        async fn complete(
+            &self,
+            _request: InferenceRequest,
+        ) -> Result<InferenceResponse, InferenceError> {
+            Err(InferenceError::Config("boom".into()))
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f64>, InferenceError> {
+            Err(InferenceError::Config("no embeddings".into()))
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+            Ok(vec![])
+        }
+
+        fn default_model(&self) -> String {
+            "probe-model".into()
+        }
+
+        async fn complete_chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<InferenceStream, InferenceError> {
+            Err(InferenceError::Config("no stream".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_reports_the_answer_or_the_failure() {
+        let answer = probe_provider(&ProbeOk, "kimi-k3").await.unwrap();
+        assert_eq!(answer, "ok");
+        let err = probe_provider(&ProbeFail, "kimi-k3").await.unwrap_err();
+        assert!(err.contains("boom"), "{err}");
     }
 }

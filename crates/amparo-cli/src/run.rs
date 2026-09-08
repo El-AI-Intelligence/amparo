@@ -664,11 +664,23 @@ pub(crate) async fn wire_with(
     }
     // The boot banner's infer line names the resolved provider, model and
     // host — captured after the flags override, before the config moves
-    // on. The host is the ledger's `scheme://host[:port]` shape: a
+    // on. The provider is the catalog label (resolved from the config's
+    // provider id; the kind's lowercase name when the config was built
+    // by hand), the host is the ledger's `scheme://host[:port]` shape: a
     // key-carrying URL must never reach stderr.
+    let provider_label = config
+        .provider_id
+        .as_deref()
+        .and_then(amparo_inference::catalog::lookup)
+        .map(|spec| spec.label)
+        .unwrap_or_else(|| match config.provider {
+            amparo_inference::ProviderKind::OpenAI => "openai",
+            amparo_inference::ProviderKind::Anthropic => "anthropic",
+            amparo_inference::ProviderKind::OllamaNative => "ollama",
+        });
     let infer_desc = format!(
         "{} · {} · {}",
-        format!("{:?}", config.provider).to_lowercase(),
+        provider_label,
         config.model,
         site_desc(&config.base_url)
     );
