@@ -136,7 +136,7 @@ use windows_sys::Win32::{
     },
     System::Threading::WaitForSingleObject,
     UI::Input::KeyboardAndMouse::{
-        VK_BACK, VK_C, VK_D, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT,
+        VK_BACK, VK_C, VK_D, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT,
         VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
     },
 };
@@ -406,6 +406,9 @@ pub(crate) fn poll_key(millis: u64) -> Option<ConsoleKey> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    // Delete/Insert are test-only here: the translator deliberately
+    // routes them through the unicode check (see key_from_event).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_INSERT};
 
     fn key(vk: u16, unicode: u16, control: u32) -> ConsoleKey {
         key_from_event(vk, control, unicode)
