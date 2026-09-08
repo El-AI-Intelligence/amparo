@@ -780,8 +780,13 @@ struct UiState {
     status: Option<String>,
     thinking: Option<Instant>,
     thinking_shown: bool,
+    // Focus events don't exist on the Windows console API (ReaderMsg::Focus
+    // is unix-gated), so the whole focus/away subsystem is unix-only.
+    #[cfg(unix)]
     focus: bool,
+    #[cfg(unix)]
     focus_lost_at: Option<Instant>,
+    #[cfg(unix)]
     unfocused_lines: usize,
     banner_shown: bool,
     chain_audit_shown: bool,
@@ -828,8 +833,11 @@ impl Ui {
                     status: None,
                     thinking: None,
                     thinking_shown: false,
+                    #[cfg(unix)]
                     focus: true,
+                    #[cfg(unix)]
                     focus_lost_at: None,
+                    #[cfg(unix)]
                     unfocused_lines: 0,
                     banner_shown: false,
                     chain_audit_shown: false,
@@ -883,6 +891,7 @@ impl Ui {
                     let _ = out.write_all(b"\r\x1b[K");
                     st.thinking_shown = false;
                 }
+                #[cfg(unix)]
                 if !st.focus {
                     st.unfocused_lines += 1;
                 }
@@ -1193,6 +1202,7 @@ impl Ui {
 
     // ── focus ──
 
+    #[cfg(unix)]
     fn focus_lost(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.state.focus = false;
@@ -1201,6 +1211,7 @@ impl Ui {
 
     /// On refocus after more than 15 minutes away, a first-person
     /// briefing: what arrived while the terminal was dark.
+    #[cfg(unix)]
     fn focus_gained(&self) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
         let st = &mut inner.state;
