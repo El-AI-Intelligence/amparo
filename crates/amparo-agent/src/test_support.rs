@@ -84,6 +84,13 @@ pub(crate) fn content_delta(text: &str) -> String {
     serde_json::json!({"choices": [{"delta": {"content": text}}]}).to_string()
 }
 
+/// A reasoning delta — providers like Moonshot/Kimi stream their trace in
+/// `reasoning_content` alongside (or without) `content`.
+pub(crate) fn reasoning_delta(text: &str) -> String {
+    serde_json::json!({"choices": [{"delta": {"content": "", "reasoning_content": text}}]})
+        .to_string()
+}
+
 pub(crate) fn tool_call_frame(id: &str, name: &str, arguments: &str) -> String {
     serde_json::json!({"choices": [{"delta": {"tool_calls": [{
         "index": 0, "id": id, "type": "function",

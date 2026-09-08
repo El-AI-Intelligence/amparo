@@ -7,6 +7,8 @@
 
 mod anthropic;
 
+pub mod catalog;
+
 pub use anthropic::AnthropicProvider;
 
 use async_trait::async_trait;
@@ -97,13 +99,18 @@ pub struct InferenceRequest {
 // ─────────────────────────────────────────────────── InferenceConfig ─────────
 
 /// The kind of inference provider to use.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `Copy` is safe (fieldless enum) and lets the catalog's `ProviderSpec`
+// derive `Copy` so lookups hand back values without clones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
-    /// OpenAI-compatible API (Ollama, vLLM, OpenRouter, …)
+    /// OpenAI-compatible API (vLLM, OpenRouter, Moonshot, …)
     OpenAI,
     /// Anthropic Messages API (`https://api.anthropic.com`).
     Anthropic,
+    /// Ollama's native `/api/chat` — used for any host when the provider is
+    /// cataloged as `ollama`, not just the localhost sniff.
+    OllamaNative,
 }
 
 impl Default for ProviderKind {
@@ -162,12 +169,19 @@ impl CloudConfig {
     /// Build a cloud provider from this config.
     pub fn build_provider(&self) -> Option<Arc<dyn InferenceProvider>> {
         if self.is_available() {
+            // Normalize, but keep a badly-shaped URL working as before
+            // rather than silently disabling the fallback.
+            let url = catalog::normalize_base_url(&self.url)
+                .map(|u| catalog::append_v1_if_bare(&u))
+                .unwrap_or_else(|_| self.url.clone());
             Some(Arc::new(OpenAIProvider::new(
-                self.url.clone(),
+                url,
                 self.api_key.clone(),
                 self.model.clone(),
                 DEFAULT_TIMEOUT_SECS,
                 None,
+                ProviderKind::OpenAI,
+                false,
             )))
         } else {
             None
@@ -209,6 +223,11 @@ pub struct InferenceConfig {
     /// Provider kind, selecting the wire protocol (OpenAI-compatible or Anthropic).
     #[serde(default)]
     pub provider: ProviderKind,
+    /// Catalog id (or alias) the config was resolved from, e.g. `moonshot`.
+    /// Drives per-provider behavior flags (reasoning echo); `None` falls
+    /// back to the flags of the kind's catalog entry.
+    #[serde(default)]
+    pub provider_id: Option<String>,
     /// HTTP timeout for a single inference request, in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -235,7 +254,11 @@ impl InferenceConfig {
     ///   `https://api.anthropic.com`, …).
     /// - `AMPARO_INFERENCE_KEY` — API key (empty for keyless local providers).
     /// - `AMPARO_INFERENCE_MODEL` — **required**. Default model ID.
-    /// - `AMPARO_INFERENCE_PROVIDER` — `openai` (default) | `anthropic`.
+    /// - `AMPARO_INFERENCE_PROVIDER` — a provider catalog id or alias
+    ///   (default `openai`): `anthropic`, `openai`, `moonshot` (`kimi`),
+    ///   `deepseek`, `qwen`, `glm`, `mistral`, `groq`, `openrouter`,
+    ///   `gemini`, `ollama`, `lmstudio`, or `custom`. An unknown id fails
+    ///   with the full list instead of guessing a wire protocol.
     /// - `AMPARO_INFERENCE_TIMEOUT_SECS` — request timeout (default 120,
     ///   clamped to 1–3600).
     /// - `AMPARO_INFERENCE_MAX_TOKENS` — optional per-request `max_tokens` cap.
@@ -259,20 +282,17 @@ impl InferenceConfig {
                     .to_string(),
             )
         })?;
-        let provider = match std::env::var("AMPARO_INFERENCE_PROVIDER")
-            .unwrap_or_else(|_| "openai".to_string())
-            .to_lowercase()
-            .as_str()
-        {
-            "openai" => ProviderKind::OpenAI,
-            "anthropic" => ProviderKind::Anthropic,
-            other => {
-                return Err(InferenceError::Config(format!(
-                    "AMPARO_INFERENCE_PROVIDER must be 'openai' or 'anthropic', got '{}'",
-                    other
-                )))
-            }
-        };
+        let provider_raw = std::env::var("AMPARO_INFERENCE_PROVIDER")
+            .unwrap_or_else(|_| "openai".to_string());
+        let spec = catalog::lookup(&provider_raw).ok_or_else(|| {
+            InferenceError::Config(format!(
+                "unknown provider '{}' — known providers: {}",
+                provider_raw.trim(),
+                catalog::known_ids().join(", ")
+            ))
+        })?;
+        let provider = spec.wire;
+        let provider_id = Some(spec.id.to_string());
         let timeout_secs = std::env::var("AMPARO_INFERENCE_TIMEOUT_SECS")
             .ok()
             .map(|v| {
@@ -320,11 +340,25 @@ impl InferenceConfig {
             api_key: std::env::var("AMPARO_INFERENCE_KEY").unwrap_or_default(),
             model,
             provider,
+            provider_id,
             timeout_secs,
             max_tokens_limit,
             allowlist,
             cloud: CloudConfig::from_env(),
         })
+    }
+
+    /// Resolve the catalog spec driving this config's behavior flags:
+    /// the `provider_id` when set, else the kind's canonical entry.
+    fn resolved_spec(&self) -> Option<&'static catalog::ProviderSpec> {
+        if let Some(id) = &self.provider_id {
+            return catalog::lookup(id);
+        }
+        match &self.provider {
+            ProviderKind::OpenAI => catalog::lookup("openai"),
+            ProviderKind::Anthropic => catalog::lookup("anthropic"),
+            ProviderKind::OllamaNative => catalog::lookup("ollama"),
+        }
     }
 
     /// Instantiate a concrete provider from this config.
@@ -340,21 +374,55 @@ impl InferenceConfig {
                 )));
             }
         }
+        // Behavior flags come from the resolved catalog entry; an unknown
+        // provider id fails here (configuration time), not on the first
+        // request.
+        let spec = self.resolved_spec().ok_or_else(|| {
+            InferenceError::Config(format!(
+                "unknown provider id '{}' — known providers: {}",
+                self.provider_id.as_deref().unwrap_or_default(),
+                catalog::known_ids().join(", ")
+            ))
+        })?;
         match &self.provider {
-            ProviderKind::OpenAI => Ok(Arc::new(OpenAIProvider::new(
-                self.base_url.clone(),
-                self.api_key.clone(),
-                self.model.clone(),
-                self.timeout_secs,
-                self.max_tokens_limit,
-            ))),
-            ProviderKind::Anthropic => Ok(Arc::new(AnthropicProvider::new(
-                self.base_url.clone(),
-                self.api_key.clone(),
-                self.model.clone(),
-                self.timeout_secs,
-                self.max_tokens_limit,
-            ))),
+            ProviderKind::OpenAI => {
+                let base_url =
+                    catalog::append_v1_if_bare(&catalog::normalize_base_url(&self.base_url)?);
+                Ok(Arc::new(OpenAIProvider::new(
+                    base_url,
+                    self.api_key.clone(),
+                    self.model.clone(),
+                    self.timeout_secs,
+                    self.max_tokens_limit,
+                    ProviderKind::OpenAI,
+                    spec.reasoning,
+                )))
+            }
+            ProviderKind::Anthropic => {
+                // Validate the URL but leave shaping to AnthropicProvider
+                // (it accepts both `.../v1` and bare-host forms).
+                let base_url = catalog::normalize_base_url(&self.base_url)?;
+                Ok(Arc::new(AnthropicProvider::new(
+                    base_url,
+                    self.api_key.clone(),
+                    self.model.clone(),
+                    self.timeout_secs,
+                    self.max_tokens_limit,
+                )))
+            }
+            ProviderKind::OllamaNative => {
+                // Ollama's native /api/chat — the base host, no /v1.
+                let base_url = catalog::normalize_base_url(&self.base_url)?;
+                Ok(Arc::new(OpenAIProvider::new(
+                    base_url,
+                    self.api_key.clone(),
+                    self.model.clone(),
+                    self.timeout_secs,
+                    self.max_tokens_limit,
+                    ProviderKind::OllamaNative,
+                    spec.reasoning,
+                )))
+            }
         }
     }
 
@@ -580,28 +648,64 @@ pub struct ChatMessage {
     /// Which assistant tool call this message answers (tool messages only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Reasoning trace the provider returned for an assistant turn
+    /// (Moonshot/Kimi K3, DeepSeek, …). Echoed back verbatim on the next
+    /// request when the provider's catalog entry says `reasoning: true` —
+    /// those endpoints break multi-turn tool calling without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
     /// Build a `"user"` role message.
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into(), tool_calls: None, tool_call_id: None }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
     }
     /// Build an `"assistant"` role message.
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into(), tool_calls: None, tool_call_id: None }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
     }
     /// Build a `"system"` role message.
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into(), tool_calls: None, tool_call_id: None }
+        Self {
+            role: "system".into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
     }
     /// A tool result answering the assistant tool call with `call_id`.
     pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: content.into(), tool_calls: None, tool_call_id: Some(call_id.into()) }
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(call_id.into()),
+            reasoning_content: None,
+        }
     }
     /// An assistant message that only makes tool calls (no prose).
     pub fn assistant_tool_calls(calls: Vec<AssistantToolCall>) -> Self {
-        Self { role: "assistant".into(), content: String::new(), tool_calls: Some(calls), tool_call_id: None }
+        Self {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(calls),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
     }
 }
 
@@ -679,17 +783,25 @@ pub struct OpenAIProvider {
     timeout_secs: u64,
     /// Upper bound on `max_tokens`; requests are clamped to it.
     max_tokens_limit: Option<usize>,
+    /// Which wire to speak: OpenAI-compatible `/chat/completions`, or
+    /// Ollama's native `/api/chat` (any host, not just the localhost sniff).
+    wire: ProviderKind,
+    /// Echo `reasoning_content` on assistant turns (catalog `reasoning` flag).
+    reasoning: bool,
 }
 
 impl OpenAIProvider {
     /// Create an OpenAI-compatible provider. The embedding model is read from
     /// `AMPARO_INFERENCE_EMBEDDING_MODEL` (default `nomic-embed-text`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_url: String,
         api_key: String,
         model: String,
         timeout_secs: u64,
         max_tokens_limit: Option<usize>,
+        wire: ProviderKind,
+        reasoning: bool,
     ) -> Self {
         let embedding_model = std::env::var("AMPARO_INFERENCE_EMBEDDING_MODEL")
             .unwrap_or_else(|_| "nomic-embed-text".to_string());
@@ -705,6 +817,8 @@ impl OpenAIProvider {
             embedding_model,
             timeout_secs,
             max_tokens_limit,
+            wire,
+            reasoning,
         }
     }
 
@@ -938,7 +1052,10 @@ impl InferenceProvider for OpenAIProvider {
             .map(|t| !matches!(t.to_lowercase().as_str(), "off" | "false" | "no" | "0" | "disabled"))
             .unwrap_or(false);
 
-        let is_local_ollama = self.base_url.contains("localhost:11434")
+        // Legacy localhost sniff kept for pre-catalog configs; the catalog
+        // `ollama` entry forces native /api/chat for any host.
+        let is_local_ollama = self.wire == ProviderKind::OllamaNative
+            || self.base_url.contains("localhost:11434")
             || self.base_url.contains("127.0.0.1:11434");
 
         let data: serde_json::Value = if is_local_ollama {
@@ -988,8 +1105,7 @@ impl InferenceProvider for OpenAIProvider {
                     "model": model,
                     "messages": [{"role": "user", "content": request.prompt}],
                     "max_tokens": clamp_max_tokens(request.max_tokens, self.max_tokens_limit),
-                    "temperature": request.temperature.unwrap_or(0.7),
-                    "think": think_enabled
+                    "temperature": request.temperature.unwrap_or(0.7)
                 }));
             let response = self.send_with_timeout(req).await?;
             if !response.status().is_success() {
@@ -1023,7 +1139,7 @@ impl InferenceProvider for OpenAIProvider {
 
     async fn complete_chat_stream(
         &self,
-        request: ChatRequest,
+        mut request: ChatRequest,
     ) -> Result<InferenceStream> {
         let model = request.model.as_deref().unwrap_or(&self.model);
         let base_temp = request.temperature.unwrap_or(0.7);
@@ -1037,8 +1153,10 @@ impl InferenceProvider for OpenAIProvider {
         // ── Detect local Ollama and use native /api/chat ────────────────
         // Ollama's OpenAI-compatible /v1/chat/completions endpoint ignores
         // the `think` parameter.  Only the native /api/chat respects it.
-        // We detect Ollama by checking if the base_url points to port 11434.
-        let is_local_ollama = self.base_url.contains("localhost:11434")
+        // The catalog `ollama` entry forces native for any host; the
+        // localhost sniff keeps pre-catalog configs working.
+        let is_local_ollama = self.wire == ProviderKind::OllamaNative
+            || self.base_url.contains("localhost:11434")
             || self.base_url.contains("127.0.0.1:11434");
 
         if is_local_ollama {
@@ -1053,6 +1171,19 @@ impl InferenceProvider for OpenAIProvider {
         }
 
         // ── Standard OpenAI-compatible path ─────────────────────────────
+        // Strict endpoints (Moonshot/Kimi, DeepSeek, …) 400 on unknown
+        // fields, so the compat body carries only OpenAI-shaped keys:
+        // `think`, `format`, and `web_search` never leave via this path.
+        // `reasoning_content` is echoed on assistant turns only when the
+        // resolved provider spec says so.
+        if !self.reasoning {
+            for msg in &mut request.messages {
+                if msg.role == "assistant" {
+                    msg.reasoning_content = None;
+                }
+            }
+        }
+
         let mut body = serde_json::json!({
             "model": model,
             "messages": request.messages,
@@ -1069,13 +1200,13 @@ impl InferenceProvider for OpenAIProvider {
         }
 
         if let Some(schema) = &request.json_schema {
-            body["format"] = schema.clone();
-        }
-
-        body["think"] = serde_json::json!(think_enabled);
-
-        if request.web_search == Some(true) {
-            body["web_search"] = serde_json::json!(true);
+            body["response_format"] = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "amparo_output",
+                    "schema": schema,
+                }
+            });
         }
 
         let req = self
@@ -1525,6 +1656,41 @@ impl PromptCache {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that read or remove `AMPARO_INFERENCE_*` env
+    /// vars — the suite runs in parallel and they would race otherwise.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with exactly the given `AMPARO_INFERENCE_*` vars installed,
+    /// restoring the prior environment afterwards. Callers hold `ENV_LOCK`.
+    fn with_inference_env(vars: &[(&str, &str)], f: impl FnOnce()) {
+        const MANAGED: &[&str] = &[
+            "AMPARO_INFERENCE_URL",
+            "AMPARO_INFERENCE_MODEL",
+            "AMPARO_INFERENCE_KEY",
+            "AMPARO_INFERENCE_PROVIDER",
+            "AMPARO_INFERENCE_TIMEOUT_SECS",
+            "AMPARO_INFERENCE_MAX_TOKENS",
+            "AMPARO_INFERENCE_MODEL_ALLOWLIST",
+        ];
+        let saved: Vec<(String, Option<String>)> = MANAGED
+            .iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(&k, v),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
+
     #[test]
     fn is_cloud_model_identifies_cloud_tags() {
         assert!(is_cloud_model("nemotron-3-super:cloud"));
@@ -1567,11 +1733,50 @@ mod tests {
     fn inference_config_from_env_fails_closed_without_url() {
         // There is no silent localhost default: from_env must error when the
         // required vars are unset.
-        std::env::remove_var("AMPARO_INFERENCE_URL");
-        std::env::remove_var("AMPARO_INFERENCE_MODEL");
-        let err = InferenceConfig::from_env().unwrap_err();
-        assert!(matches!(err, InferenceError::Config(_)));
-        assert!(err.to_string().contains("AMPARO_INFERENCE_URL"));
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_inference_env(&[], || {
+            let err = InferenceConfig::from_env().unwrap_err();
+            assert!(matches!(err, InferenceError::Config(_)));
+            assert!(err.to_string().contains("AMPARO_INFERENCE_URL"));
+        });
+    }
+
+    #[test]
+    fn from_env_resolves_catalog_id_kimi_to_openai_wire() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_inference_env(
+            &[
+                ("AMPARO_INFERENCE_URL", "https://api.moonshot.cn/v1"),
+                ("AMPARO_INFERENCE_MODEL", "kimi-k3"),
+                ("AMPARO_INFERENCE_PROVIDER", "kimi"),
+            ],
+            || {
+                let cfg = InferenceConfig::from_env().unwrap();
+                // The alias resolves to the catalog id and the OpenAI wire.
+                assert_eq!(cfg.provider, ProviderKind::OpenAI);
+                assert_eq!(cfg.provider_id.as_deref(), Some("moonshot"));
+                let provider = cfg.build().unwrap();
+                assert_eq!(provider.default_model(), "kimi-k3");
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_unknown_provider_lists_the_catalog() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_inference_env(
+            &[
+                ("AMPARO_INFERENCE_URL", "https://example.com/v1"),
+                ("AMPARO_INFERENCE_MODEL", "some-model"),
+                ("AMPARO_INFERENCE_PROVIDER", "hal9000"),
+            ],
+            || {
+                let err = InferenceConfig::from_env().unwrap_err();
+                // The exact error the Kimi drill hit now names what IS accepted.
+                assert!(err.to_string().contains("known providers"), "{err}");
+                assert!(err.to_string().contains("moonshot"), "{err}");
+            },
+        );
     }
 
     #[test]
@@ -1581,6 +1786,7 @@ mod tests {
             api_key: String::new(),
             model: "qwen2.5:14b".into(),
             provider: ProviderKind::OpenAI,
+            provider_id: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_tokens_limit: None,
             allowlist: Some(vec!["claude-sonnet-5-20250929".into()]),
@@ -1601,6 +1807,7 @@ mod tests {
             api_key: "sk-test".into(),
             model: "claude-sonnet-5-20250929".into(),
             provider: ProviderKind::Anthropic,
+            provider_id: None,
             timeout_secs: 60,
             max_tokens_limit: Some(4096),
             allowlist: Some(vec!["claude-sonnet-5-20250929".into()]),
@@ -1652,6 +1859,7 @@ mod tests {
             api_key: String::new(),
             model: "qwen2.5:14b".into(),
             provider: ProviderKind::OpenAI,
+            provider_id: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_tokens_limit: None,
             allowlist: Some(vec!["other-model".into()]),
@@ -1678,6 +1886,7 @@ mod tests {
                 content: "hello".into(),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             tools: None,
             max_tokens: Some(100),
@@ -1803,6 +2012,11 @@ mod tests {
 
     #[test]
     fn route_request_empty_models_falls_back() {
+        // `route_request` reads AMPARO_INFERENCE_MODEL as its fallback —
+        // this test pins the no-env default, so it shares the env lock and
+        // clears the var first.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AMPARO_INFERENCE_MODEL");
         let models: Vec<String> = vec![];
         let route = route_request("hello", None, &models, false);
         assert_eq!(route.model, "llama3.1:8b");
@@ -1920,5 +2134,189 @@ mod tests {
             Arc::new(OkProvider("fallback-model".into())),
         );
         assert_eq!(&fallback.default_model(), "primary-model");
+    }
+
+    // ── Request-shape tests (one-shot HTTP mocks) ──────────────────────
+
+    /// One-shot HTTP mock: accepts a single connection, parses request
+    /// line + headers + body, replies with a complete SSE response, and
+    /// returns the captured `(method, path, body)` over a channel.
+    fn one_shot_http(
+        response: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<(String, String, serde_json::Value)>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let mut parts = line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let path = parts.next().unwrap_or("").to_string();
+            let mut content_length = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some(rest) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = rest.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut raw = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut raw).unwrap();
+            }
+            let body =
+                serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+            let _ = tx.send((method, path, body));
+            let bytes = response.as_bytes();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(bytes);
+            let _ = stream.flush();
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// A chat request exercising every extension knob at once: thinking
+    /// mode, structured output, web search, and an assistant turn that
+    /// carries a reasoning trace.
+    fn chat_request_with_extras() -> ChatRequest {
+        ChatRequest {
+            messages: vec![
+                ChatMessage::user("hello"),
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: "hi".into(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: Some("deep trace".into()),
+                },
+            ],
+            tools: None,
+            max_tokens: Some(100),
+            temperature: Some(0.7),
+            stream: Some(true),
+            model: Some("test-model".into()),
+            privacy_level: None,
+            json_schema: Some(serde_json::json!({"type": "object"})),
+            thinking: Some("on".into()),
+            web_search: Some(true),
+            challenge_level: None,
+        }
+    }
+
+    async fn drain(stream: InferenceStream) {
+        use futures_util::StreamExt;
+        let mut stream = stream;
+        while let Some(_item) = stream.next().await {}
+    }
+
+    fn captured_after_drain(
+        rx: &std::sync::mpsc::Receiver<(String, String, serde_json::Value)>,
+    ) -> (String, String, serde_json::Value) {
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn compat_stream_body_is_pure_openai_shape() {
+        let (url, rx) = one_shot_http("data: [DONE]\n\n");
+        let provider = OpenAIProvider::new(
+            url,
+            "sk-test".into(),
+            "kimi-k3".into(),
+            10,
+            None,
+            ProviderKind::OpenAI,
+            false,
+        );
+        let stream = provider
+            .complete_chat_stream(chat_request_with_extras())
+            .await
+            .unwrap();
+        drain(stream).await;
+        let (method, path, body) = captured_after_drain(&rx);
+        assert_eq!(method, "POST");
+        assert!(path.ends_with("/chat/completions"), "{path}");
+        // Strict endpoints (Moonshot/Kimi, DeepSeek, …) 400 on unknown
+        // fields — none of the Ollama/extension knobs leave via this path.
+        assert!(body.get("think").is_none());
+        assert!(body.get("format").is_none());
+        assert!(body.get("web_search").is_none());
+        assert!(body.get("response_format").is_some());
+        // reasoning=false scrubs the assistant trace before serialization.
+        let messages = body["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert!(assistant.get("reasoning_content").is_none());
+    }
+
+    #[tokio::test]
+    async fn compat_stream_echoes_reasoning_only_when_flagged() {
+        let (url, rx) = one_shot_http("data: [DONE]\n\n");
+        let provider = OpenAIProvider::new(
+            url,
+            "sk-test".into(),
+            "kimi-k3".into(),
+            10,
+            None,
+            ProviderKind::OpenAI,
+            true,
+        );
+        let stream = provider
+            .complete_chat_stream(chat_request_with_extras())
+            .await
+            .unwrap();
+        drain(stream).await;
+        let (_, _, body) = captured_after_drain(&rx);
+        let messages = body["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert_eq!(assistant["reasoning_content"], "deep trace");
+        // The trace is only ever on assistant turns.
+        let user = messages.iter().find(|m| m["role"] == "user").unwrap();
+        assert!(user.get("reasoning_content").is_none());
+    }
+
+    #[tokio::test]
+    async fn ollama_native_stream_still_sends_think() {
+        let (url, rx) = one_shot_http("data: [DONE]\n\n");
+        let provider = OpenAIProvider::new(
+            url,
+            String::new(),
+            "qwen3:4b".into(),
+            10,
+            None,
+            ProviderKind::OllamaNative,
+            false,
+        );
+        let stream = provider
+            .complete_chat_stream(chat_request_with_extras())
+            .await
+            .unwrap();
+        drain(stream).await;
+        let (_, path, body) = captured_after_drain(&rx);
+        assert!(path.ends_with("/api/chat"), "{path}");
+        assert_eq!(body["think"], true);
+        // The native path uses `format` for structured output — the
+        // OpenAI-shaped `response_format` never leaves here.
+        assert!(body.get("format").is_some());
+        assert!(body.get("response_format").is_none());
     }
 }

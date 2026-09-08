@@ -610,6 +610,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             })
             .chain([ChatMessage::tool("call-1", "tool output")])
             .collect();

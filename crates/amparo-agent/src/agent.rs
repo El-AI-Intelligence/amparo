@@ -1286,6 +1286,9 @@ impl Agent {
                     Some(turn.tool_calls.clone())
                 },
                 tool_call_id: None,
+                // Echoed verbatim — reasoning providers (Kimi K3, DeepSeek)
+                // require the exact trace back, or tool calling breaks.
+                reasoning_content: turn.reasoning_content.clone(),
             });
             self.events.emit(&AgentEvent::AssistantTurn {
                 step,
@@ -1856,6 +1859,9 @@ impl Agent {
                             .collect()
                     }),
                     tool_call_id: message.tool_call_id.clone(),
+                    // Never scrubbed — it is the provider's own reasoning
+                    // trace, and mutating it breaks continuity on restore.
+                    reasoning_content: message.reasoning_content.clone(),
                 })
                 .collect(),
             loop_state: LoopState {
@@ -2292,6 +2298,10 @@ fn strip_messages(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<PiiPlaceho
             content: sanitised,
             tool_calls: msg.tool_calls.clone(),
             tool_call_id: msg.tool_call_id.clone(),
+            // Reasoning is scrubbed by design of the content pass only —
+            // the trace is the provider's own CoT and must round-trip
+            // verbatim (Kimi K3/DeepSeek continuity).
+            reasoning_content: msg.reasoning_content.clone(),
         });
     }
     (out, merged)
@@ -2354,8 +2364,8 @@ mod tests {
     // ── Test doubles ─────────────────────────────────────────────────────────
 
     use crate::test_support::{
-        registry_with, turn_text, turn_tool_call, AllowAllPolicy, EchoTool, RecordingGate,
-        ScriptedProvider,
+        done, reasoning_delta, registry_with, tool_call_frame, turn_text, turn_tool_call,
+        AllowAllPolicy, EchoTool, RecordingGate, ScriptedProvider,
     };
 
     /// Returns a configured verdict per tool name and records what it saw.
@@ -2437,6 +2447,42 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, AgentStep::FinalAnswer { .. })));
+    }
+
+    #[tokio::test]
+    async fn reasoning_trace_echoes_verbatim_on_the_next_turn() {
+        // Reasoning providers (Moonshot/Kimi K3, DeepSeek, …) require the
+        // assistant turn echoed back exactly as sent — including the
+        // `reasoning_content` trace — or multi-turn tool calling breaks.
+        let provider = ScriptedProvider::new();
+        provider.push_chat(vec![
+            reasoning_delta("thinking hard about"),
+            reasoning_delta(" the answer"),
+            tool_call_frame("call_1", "echo", r#"{"message":"hi"}"#),
+            done(),
+        ]);
+        provider.push_chat(turn_text("The answer is 42."));
+        provider.push_verify("VERIFIED");
+
+        let (registry, calls) = echo_registry();
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove));
+
+        let report = agent.run("what is the answer?").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let requests = provider.recorded_requests();
+        assert_eq!(requests.len(), 2);
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("turn 2 carries the assistant history");
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("thinking hard about the answer")
+        );
     }
 
     #[tokio::test]

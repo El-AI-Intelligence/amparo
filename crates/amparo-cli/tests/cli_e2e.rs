@@ -600,6 +600,32 @@ fn tool_script(tool: &str, arguments: &str) -> Script {
     ]
 }
 
+/// A Kimi-style turn: the reasoning trace streams alongside the tool call,
+/// and the provider requires it echoed back verbatim on the next turn.
+fn reasoning_tool_script(tool: &str, arguments: &str, reasoning: &str) -> Script {
+    vec![
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "", "reasoning_content": reasoning},
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": tool, "arguments": arguments}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    ]
+}
+
 /// A scripted turn that requests `run_command <command>`.
 fn tool_call_script(command: &str) -> Script {
     tool_script("run_command", &format!("{{\"command\":\"{command}\"}}"))
@@ -1086,6 +1112,56 @@ async fn run_executes_approved_tool_end_to_end() {
         "the approved tool ran: {err}"
     );
     assert_eq!(stdout(&out).trim(), "Done.");
+}
+
+#[tokio::test]
+async fn kimi_provider_runs_with_reasoning_echo_and_pure_bodies() {
+    let _guard = LOCK.lock().await;
+    let marker = format!("amparo-cli-e2e-{}", std::process::id());
+    let mock = MockLlm::start(vec![
+        reasoning_tool_script("run_command", &format!("{{\"command\":\"echo {marker}\"}}"), "thinking about echo"),
+        vec![content_frame("Done.")],
+    ])
+    .await;
+    // `kimi` must resolve through the catalog to the OpenAI wire.
+    let env = set_env(
+        &[
+            ("AMPARO_INFERENCE_URL", mock.url().as_str()),
+            ("AMPARO_INFERENCE_MODEL", "kimi-k3"),
+            ("AMPARO_INFERENCE_PROVIDER", "kimi"),
+        ],
+        &["AMPARO_INFERENCE_KEY"],
+    );
+    let prior = set_workspace_env();
+
+    let out = run_with_stdin(&["run", "--allow-all", "run the e2e echo"], b"y\n").await;
+
+    restore_workspace_env(prior);
+    drop(env);
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("[approval] granted"), "{err}");
+    assert_eq!(stdout(&out).trim(), "Done.");
+
+    // Both stream bodies were pure OpenAI shape — strict endpoints like
+    // Moonshot/Kimi 400 on unknown fields.
+    let streamed = mock.stream_requests().await;
+    assert!(!streamed.is_empty(), "stream turns were recorded");
+    for body in &streamed {
+        assert!(body.get("think").is_none(), "body: {body}");
+        assert!(body.get("format").is_none(), "body: {body}");
+        assert!(body.get("web_search").is_none(), "body: {body}");
+    }
+    // The second turn echoes the assistant reasoning trace verbatim.
+    let second = &streamed[streamed.len() - 1];
+    let assistant = second["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant history carried into the next turn");
+    assert_eq!(assistant["reasoning_content"], "thinking about echo");
 }
 
 #[tokio::test]

@@ -468,6 +468,8 @@ pub(crate) fn parse_anthropic_message(data: &Value) -> Result<ChatMessage> {
         .unwrap_or_default();
 
     // An assistant message may carry prose AND tool calls — keep both.
+    // (Anthropic reasoning lives in server-side thinking blocks, so there
+    // is no reasoning_content to carry here.)
     let message = ChatMessage {
         role: "assistant".into(),
         content: text,
@@ -477,6 +479,7 @@ pub(crate) fn parse_anthropic_message(data: &Value) -> Result<ChatMessage> {
             Some(tool_calls)
         },
         tool_call_id: None,
+        reasoning_content: None,
     };
     Ok(message)
 }

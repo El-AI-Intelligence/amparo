@@ -16,6 +16,10 @@ pub struct SseTurn {
     pub content: String,
     pub tool_calls: Vec<AssistantToolCall>,
     pub finish_reason: Option<String>,
+    /// Reasoning trace streamed by the provider (Moonshot/Kimi K3,
+    /// DeepSeek, …). Echoed back verbatim by the agent on the next turn
+    /// when the provider requires it.
+    pub reasoning_content: Option<String>,
 }
 
 impl SseTurn {
@@ -53,6 +57,11 @@ fn apply_delta(line: &str, turn: &mut SseTurn, calls: &mut Vec<AccumCall>) {
     };
     if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
         turn.content.push_str(text);
+    }
+    if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+        turn.reasoning_content
+            .get_or_insert_with(String::new)
+            .push_str(reasoning);
     }
     let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) else {
         return;
@@ -235,6 +244,28 @@ mod tests {
         ];
         let turn = accumulate_turn(stream_of(&frames)).await.unwrap();
         assert!(turn.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_deltas_accumulate() {
+        let frames = [
+            delta(serde_json::json!({"content": "hi", "reasoning_content": "think"})),
+            delta(serde_json::json!({"reasoning_content": "ing..."})),
+            "[DONE]".to_string(),
+        ];
+        let turn = accumulate_turn(stream_of(&frames)).await.unwrap();
+        assert_eq!(turn.content, "hi");
+        assert_eq!(turn.reasoning_content.as_deref(), Some("thinking..."));
+    }
+
+    #[tokio::test]
+    async fn turn_without_reasoning_has_none() {
+        let frames = [
+            delta(serde_json::json!({"content": "plain"})),
+            "[DONE]".to_string(),
+        ];
+        let turn = accumulate_turn(stream_of(&frames)).await.unwrap();
+        assert!(turn.reasoning_content.is_none());
     }
 
     #[tokio::test]
