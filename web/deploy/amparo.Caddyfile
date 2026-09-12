@@ -15,6 +15,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 amparo.ellmstack.dev {
+	# Access log so visits and downloads can be tallied.
+	log {
+		output file /var/log/caddy/amparo-access.log {
+			roll_size 20MiB
+			roll_keep 10
+		}
+	}
+
 	encode zstd gzip
 
 	# ── Update-notification surface ────────────────────────────────────────
