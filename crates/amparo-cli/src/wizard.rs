@@ -5,10 +5,10 @@
 //! Vault memory URL — captured line by line (Enter skips; piped stdin
 //! answers one line per prompt, in order) and written to
 //! `{workspace}/.amparo/profile.json`, mode 0600 — the profile can carry
-//! keys, so it is never world-readable. Each policy/memory step prints a
-//! delegation line: the sibling CLI on PATH pairs this machine
-//! (`guardrail link`, `engram pair`), a missing one gets its install
-//! one-liner.
+//! keys, so it is never world-readable. The policy and memory steps are
+//! optional: their URL prompts validate (a command-shaped answer like
+//! `engram pair` gets the run-it-in-another-window hint instead of being
+//! saved), and Enter skips them entirely.
 //!
 //! The provider step is a picker over [`catalog::CATALOG`] — a number or
 //! any catalog id/alias (`kimi`, `claude`, `ollama`, …) resolves to a
@@ -32,6 +32,7 @@ use amparo_inference::{
     catalog, CloudConfig, InferenceConfig, InferenceProvider, InferenceRequest,
 };
 use amparo_tools::PathPolicy;
+use std::future::Future;
 use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -134,73 +135,6 @@ pub(crate) fn fill_env_gaps(profile: &Profile) {
     }
     set("AMPARO_ENGRAM_URL", &profile.memory_url);
     set("AMPARO_ENGRAM_KEY", &profile.memory_key);
-}
-
-// ---------------------------------------------------------------------------
-// Sibling CLI delegation (M12 W2)
-// ---------------------------------------------------------------------------
-
-/// The Guardrail install one-liner shown when the `guardrail` CLI is not
-/// on PATH — `guardrail link` pairs this machine with a gk_ org key
-/// (verified 2026-09-01).
-pub(crate) const GUARDRAIL_INSTALL_HINT: &str =
-    "curl -fsSL https://downloads.ellmstack.dev/install.sh | bash";
-
-/// The Engram install one-liner shown when the `engram` CLI is not on
-/// PATH — `engram pair` pairs this machine with the memory daemon
-/// (verified 2026-09-01).
-pub(crate) const ENGRAM_INSTALL_HINT: &str =
-    "curl -fsSL https://engram.ellmstack.dev/install.sh | bash";
-
-/// True when `name` resolves to an executable on PATH — the check behind
-/// the wizard's delegation lines: a found sibling CLI delegates setup to
-/// its own flow (`guardrail link`, `engram pair`), a missing one gets the
-/// install one-liner. Windows also probes `.exe`/`.cmd`/`.bat` suffixes.
-pub(crate) fn command_on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let suffixes: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".cmd", ".bat"]
-    } else {
-        &[""]
-    };
-    for dir in std::env::split_paths(&path) {
-        for suffix in suffixes {
-            let candidate = dir.join(format!("{name}{suffix}"));
-            if candidate.is_file() && executable(&candidate) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-#[cfg(unix)]
-fn executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn executable(_path: &Path) -> bool {
-    // Windows has no mode bits — `is_file` on the probed suffix is the
-    // whole check.
-    true
-}
-
-/// One sibling-CLI delegation line: a found CLI delegates setup to its own
-/// flow (`guardrail link`, `engram pair`), a missing one gets the install
-/// one-liner. A pure helper so both branches are unit-pinned without
-/// touching PATH.
-fn delegation_line(cli: &str, pairing: &str, install: &str, on_path: bool) -> String {
-    if on_path {
-        format!("[wizard] found the {cli} CLI — {pairing}")
-    } else {
-        format!("[wizard] no {cli} CLI on PATH — install one with: {install}")
-    }
 }
 
 /// Whether both required inference variables are missing — the wizard's
@@ -400,6 +334,75 @@ fn ask_url(reader: &mut dyn BufRead, default: Option<String>) -> Result<String, 
     }
 }
 
+/// The optional URL prompts (policy, console, memory): validation like
+/// [`ask_url`], except Enter means "skip this one" — the step is
+/// optional, and the caller's fallback (env, existing profile, built-in)
+/// stands. A command-shaped answer (`engram pair`, `guardrail link`, …)
+/// gets the run-it-in-another-window hint instead of being saved as a
+/// URL — the exact trap the first drill hit.
+fn ask_optional_url(reader: &mut dyn BufRead, default: Option<String>) -> Result<String, String> {
+    // A saved value that fails validation is repaired here — it must
+    // never be offered back as a tempting Enter.
+    if let Some(saved) = &default {
+        if catalog::normalize_base_url(saved).is_err() {
+            println!(
+                "[wizard] the saved value '{saved}' isn't a URL — type the real one, or press Enter to drop it"
+            );
+        }
+    }
+    let default = default.filter(|saved| catalog::normalize_base_url(saved).is_ok());
+    loop {
+        let hint = default.as_deref().unwrap_or("none");
+        let answer = ask(reader, &format!("  url [Enter skips — {hint}] › "))?;
+        if answer.is_empty() {
+            return Ok(String::new());
+        }
+        if answer.split_whitespace().count() > 1 {
+            println!(
+                "[wizard] that looks like a command, not a URL — run it in another window, then paste the URL it prints (e.g. http://127.0.0.1:8787). Enter skips."
+            );
+            continue;
+        }
+        match catalog::normalize_base_url(&answer) {
+            Ok(url) => return Ok(url),
+            Err(err) => println!(
+                "[wizard] that doesn't look like a URL — it needs http(s):// and a host ({err}). Enter skips."
+            ),
+        }
+    }
+}
+
+/// One best-effort sniff for an already-installed local model: Ollama
+/// (`GET {url}/api/tags`) and LM Studio (`GET {url}/v1/models`) list
+/// their models without a key, so the wizard can prefill what the user
+/// actually has instead of asking for a catalog id that may not exist.
+/// Silent — an offline server or a different port simply leaves the
+/// catalog default in place. The ask is one fast GET with a short
+/// timeout so the wizard never stalls on it.
+fn sniff_local_model(url: &str, provider_id: &str) -> Option<String> {
+    let (path, pointer): (&str, &str) = match provider_id {
+        "ollama" => ("/api/tags", "/models/0/name"),
+        "lmstudio" => ("/v1/models", "/data/0/id"),
+        _ => return None,
+    };
+    let endpoint = format!("{}{path}", url.trim_end_matches('/'));
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .ok()?;
+        let value: serde_json::Value =
+            client.get(&endpoint).send().await.ok()?.json().await.ok()?;
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    run_short("the local model check", Duration::from_secs(4), fut)
+        .ok()
+        .flatten()
+}
+
 /// The model prompt: prefilled, editable; Enter keeps the default, and
 /// a provider without one (OpenRouter, Ollama, LM Studio, custom)
 /// requires a typed model id.
@@ -463,6 +466,42 @@ fn probe_text(text: &str) -> String {
         .to_string()
 }
 
+/// Runs `fut` to completion without violating the ambient runtime. The
+/// wizard's `run` is sync, but every real call site sits inside the
+/// `#[tokio::main]` runtime — building a nested runtime there panics
+/// ("Cannot start a runtime from within a runtime"). So: when an ambient
+/// runtime exists, the future is spawned onto it and awaited through a
+/// channel; outside any runtime (a sync thread of its own), a throwaway
+/// current-thread runtime drives the future. A timeout, or the ambient
+/// runtime vanishing, maps to an error naming `what`.
+fn run_short<T: Send + 'static>(
+    what: &str,
+    timeout: Duration,
+    fut: impl Future<Output = T> + Send + 'static,
+) -> Result<T, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle.spawn(async move {
+            let _ = tx.send(fut.await);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(value) => Ok(value),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(format!("{what} timed out after {}s", timeout.as_secs()))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(format!("{what} did not finish — the runtime is gone"))
+            }
+        }
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("cannot start {what}: {err}"))?;
+        Ok(runtime.block_on(fut))
+    }
+}
+
 /// The live probe, run after the profile is saved: build the provider
 /// from the captured answers and send one short `complete()`. Best-effort
 /// — a failure prints the reason and how to recover, and never blocks
@@ -495,22 +534,21 @@ fn probe_summary(profile: &Profile) {
             return;
         }
     };
-    // A throwaway current-thread runtime: the wizard's `run` is sync
-    // (called from both the async dispatch and the bare-`amparo` boot
-    // path), so the probe blocks its own thread, never an ambient one.
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            println!("[probe] skipped — cannot start the check: {err}");
-            return;
-        }
-    };
-    match runtime.block_on(probe_provider(provider.as_ref(), model)) {
-        Ok(text) => println!("[probe] ok — {model} answered: {}", probe_text(&text)),
-        Err(reason) => println!("[probe] couldn't reach the model — {reason} (re-run `amparo wizard` to adjust)"),
+    // `run_short` rides the ambient runtime instead of nesting a new one
+    // (the old throwaway runtime panicked the whole boot). The probe has
+    // its own inner 20s timeout; the outer 30s is the safety net.
+    let model_owned = model.clone();
+    let outcome = run_short(
+        "the probe",
+        Duration::from_secs(PROBE_TIMEOUT_SECS + 10),
+        async move { probe_provider(provider.as_ref(), &model_owned).await },
+    );
+    match outcome {
+        Ok(Ok(text)) => println!("[probe] ok — {model} answered: {}", probe_text(&text)),
+        Ok(Err(reason)) => println!(
+            "[probe] couldn't reach the model — {reason} (re-run `amparo wizard` to adjust)"
+        ),
+        Err(reason) => println!("[probe] skipped — {reason}"),
     }
 }
 
@@ -577,9 +615,14 @@ pub(crate) fn run(
         .or_else(|| spec.base_url.map(str::to_string));
     let url = ask_url(reader, url_default)?;
 
+    // The catalog default first, then — for the local providers — a
+    // silent sniff of what is actually installed (Ollama / LM Studio
+    // list their models without a key), so the prefill matches reality
+    // instead of a stale catalog id.
     let model_default =
         env_or(&existing, |p| p.inference_model.clone(), "AMPARO_INFERENCE_MODEL")
-            .or_else(|| spec.default_model.map(str::to_string));
+            .or_else(|| spec.default_model.map(str::to_string))
+            .or_else(|| sniff_local_model(&url, spec.id));
     let model = ask_model(reader, model_default)?;
 
     let key_hint = if existing
@@ -596,30 +639,9 @@ pub(crate) fn run(
     let policy_default = existing.as_ref().and_then(|p| p.policy_url.clone());
     let policy_key_default = existing.as_ref().and_then(|p| p.policy_key.clone());
     println!();
-    println!("▐ step 3/4 — Guardrail Console policy (recommended, never required)");
-    println!("  the wire check URL — routed through the console, org rules apply to every check");
-    println!("  the console URL — the TUI's /policy commands write org rules there");
-    println!("  keys stay local");
-    println!(
-        "{}",
-        delegation_line(
-            "guardrail",
-            "`guardrail link` pairs this machine with an org key",
-            GUARDRAIL_INSTALL_HINT,
-            command_on_path("guardrail")
-        )
-    );
-    let policy_url = ask(
-        reader,
-        &format!(
-            "  engine url [recommended, never required{}] › ",
-            if policy_default.is_some() {
-                " — set"
-            } else {
-                ""
-            }
-        ),
-    )?;
+    println!("▐ step 3/4 — Guardrail Console policy (optional)");
+    println!("  org rules for every check, written through the console — Enter skips, the built-in deny-all stands");
+    let policy_url = ask_optional_url(reader, policy_default.clone())?;
     let policy_key = ask(
         reader,
         &format!(
@@ -634,43 +656,16 @@ pub(crate) fn run(
     let console_default = std::env::var("AMPARO_CONSOLE_POLICY_URL")
         .ok()
         .or_else(|| existing.as_ref().and_then(|p| p.console_url.clone()));
-    let console_url = ask(
-        reader,
-        &format!(
-            "  console url [default {}] › ",
-            console_default
-                .as_deref()
-                .unwrap_or(amparo_tools::DEFAULT_CONSOLE_POLICY_URL)
-        ),
-    )?;
+    let console_url = ask_optional_url(reader, console_default.clone())?;
 
     let memory_default = std::env::var("AMPARO_ENGRAM_URL")
         .ok()
         .or_else(|| existing.as_ref().and_then(|p| p.memory_url.clone()));
     let memory_key_default = existing.as_ref().and_then(|p| p.memory_key.clone());
     println!();
-    println!("▐ step 4/4 — Engram Vault memory (recommended, never required)");
-    println!("  an Engram Vault daemon (engramd) URL — memories that outlive the session");
-    println!(
-        "{}",
-        delegation_line(
-            "engram",
-            "`engram pair` pairs this machine with the memory daemon",
-            ENGRAM_INSTALL_HINT,
-            command_on_path("engram")
-        )
-    );
-    let memory_url = ask(
-        reader,
-        &format!(
-            "  url [recommended, never required{}] › ",
-            if memory_default.is_some() {
-                " — set"
-            } else {
-                ""
-            }
-        ),
-    )?;
+    println!("▐ step 4/4 — Engram Vault memory (optional)");
+    println!("  memories that outlive the session — run `engram pair` in another window, then paste the URL it prints (Enter skips)");
+    let memory_url = ask_optional_url(reader, memory_default.clone())?;
     let memory_key = ask(
         reader,
         &format!(
@@ -686,16 +681,21 @@ pub(crate) fn run(
     // The URL and model were validated (or required) at their prompts;
     // the provider is the resolved catalog id. Skipped answers keep
     // their defaults; key answers keep the existing profile value (an
-    // environment key is never copied silently).
+    // environment key is never copied silently). A saved URL default
+    // that no longer validates is dropped here — `ask_optional_url`
+    // already warned, and `pick` must not resurrect it on Enter.
+    let sane = |value: Option<String>| -> Option<String> {
+        value.filter(|v| catalog::normalize_base_url(v).is_ok())
+    };
     let profile = Profile {
         inference_url: Some(url),
         inference_model: Some(model),
         inference_key: pick(key, existing.as_ref().and_then(|p| p.inference_key.clone())),
         inference_provider: Some(spec.id.to_string()),
-        policy_url: pick(policy_url, policy_default),
+        policy_url: pick(policy_url, sane(policy_default)),
         policy_key: pick(policy_key, policy_key_default),
-        console_url: pick(console_url, console_default),
-        memory_url: pick(memory_url, memory_default),
+        console_url: pick(console_url, sane(console_default)),
+        memory_url: pick(memory_url, sane(memory_default)),
         memory_key: pick(memory_key, memory_key_default),
     };
 
@@ -757,8 +757,9 @@ runs after saving (skipped when stdin is piped). Answers are stored
 locally and never printed back.
 Piped stdin answers one line per prompt, in order: workspace, provider,
 url, model, key, policy url, policy key, console url, memory url, memory key.
-Steps 3 and 4 note the sibling CLI (`guardrail link`, `engram pair`) or
-its install one-liner.
+Steps 3 and 4 are optional: their URL prompts validate, Enter skips, and
+a command-shaped answer (e.g. `engram pair`) gets the run-it-in-another-
+window hint instead of being saved.
 
 The profile fills environment gaps on every later run (the environment
 wins). The TUI boots into the wizard when no LLM is configured anywhere;
@@ -929,74 +930,80 @@ mod tests {
     }
 
     #[test]
-    fn delegation_line_pins_both_branches() {
-        let found = delegation_line(
-            "guardrail",
-            "`guardrail link` pairs this machine with an org key",
-            GUARDRAIL_INSTALL_HINT,
-            true,
-        );
-        assert!(
-            found.contains(
-                "[wizard] found the guardrail CLI — `guardrail link` pairs this machine with an org key"
-            ),
-            "{found}"
-        );
-        let missing = delegation_line(
-            "engram",
-            "`engram pair` pairs this machine with the memory daemon",
-            ENGRAM_INSTALL_HINT,
-            false,
-        );
-        assert!(
-            missing.contains("[wizard] no engram CLI on PATH — install one with: "),
-            "{missing}"
-        );
-        assert!(missing.contains(ENGRAM_INSTALL_HINT), "{missing}");
+    fn run_short_spawns_onto_an_ambient_runtime() {
+        // The regression for "Cannot start a runtime from within a
+        // runtime": inside an ambient tokio runtime the future must be
+        // spawned onto it, never driven by a nested runtime.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let answer = runtime.block_on(async {
+            run_short("check", Duration::from_secs(5), async { 42u32 }).unwrap()
+        });
+        assert_eq!(answer, 42);
     }
 
     #[test]
-    fn command_on_path_finds_executable_files_only() {
-        let dir = std::env::temp_dir().join(format!("amparo-on-path-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let exe = dir.join("fake-guardrail");
-            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let plain = dir.join("fake-engram");
-            std::fs::write(&plain, "not executable").unwrap();
-            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
-            // Keep the system PATH after the temp dir so nothing else in
-            // this process loses its binaries while the probe runs.
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            );
-            assert!(command_on_path("fake-guardrail"));
-            assert!(!command_on_path("fake-engram"));
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(dir.join("fake-guardrail.exe"), "x").unwrap();
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{};{}",
-                    dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            );
-            assert!(command_on_path("fake-guardrail"));
-        }
-        assert!(!command_on_path("never-installed"));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn run_short_times_out_instead_of_hanging() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime.block_on(async {
+            run_short(
+                "check",
+                Duration::from_millis(100),
+                async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    42u32
+                },
+            )
+            .unwrap_err()
+        });
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn run_short_without_a_runtime_uses_a_throwaway_one() {
+        // A plain sync thread (no ambient runtime) still completes — the
+        // bare-`amparo` boot path if it ever runs outside the runtime.
+        let answer = run_short("check", Duration::from_secs(5), async { 7u32 }).unwrap();
+        assert_eq!(answer, 7);
+    }
+
+    #[test]
+    fn optional_url_prompts_skip_validate_and_repair() {
+        // Enter skips — an optional step, never an error.
+        let mut reader: &[u8] = b"\n";
+        assert_eq!(ask_optional_url(&mut reader, None).unwrap(), "");
+        // A command-shaped answer is caught and re-prompted, then a valid
+        // URL lands (the exact `engram pair` trap from the first drill).
+        let mut reader: &[u8] = b"engram pair\nhttp://127.0.0.1:8787\n";
+        assert_eq!(
+            ask_optional_url(&mut reader, None).unwrap(),
+            "http://127.0.0.1:8787"
+        );
+        // A valid default is offered on Enter (the caller's pick keeps
+        // it), and a pasted suffix is normalized away.
+        let mut reader: &[u8] = b"\n";
+        assert_eq!(
+            ask_optional_url(&mut reader, Some("http://localhost:8080".into())).unwrap(),
+            ""
+        );
+        let mut reader: &[u8] = b"https://console.example/path/chat/completions\n";
+        assert_eq!(
+            ask_optional_url(&mut reader, None).unwrap(),
+            "https://console.example/path"
+        );
+        // A saved junk value is dropped on Enter instead of echoed back.
+        let mut reader: &[u8] = b"\n";
+        assert_eq!(
+            ask_optional_url(&mut reader, Some("engram pair".into())).unwrap(),
+            ""
+        );
     }
 
     /// Run the picker over the given lines; the default spec is openai.

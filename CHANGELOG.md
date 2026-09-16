@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 See [VERSIONING.md](VERSIONING.md) for what "stable" means at each stage.
 
+## [Unreleased]
+
+### Added
+
+- The wizard's optional steps (policy, console, memory) validate their
+  URL prompts: a command-shaped answer (`engram pair`,
+  `guardrail link`) gets the run-it-in-another-window hint instead of
+  being saved, Enter skips, and a saved junk value is dropped rather
+  than re-offered as the default.
+- Picking Ollama or LM Studio sniffs the locally installed model list
+  (`/api/tags`, `/v1/models`) to prefill the model prompt with what is
+  actually installed — silent and non-blocking when the server is down.
+
+### Fixed
+
+- The wizard's end-of-run probe could panic the whole boot with
+  "Cannot start a runtime from within a runtime" right after the
+  profile save — the probe now rides the ambient tokio runtime instead
+  of nesting a throwaway one, so an unreachable local model is reported
+  as "[probe] couldn't reach the model" instead of crashing.
+
 ## [0.15.0] — 2026-09-08
 
 ### Added
