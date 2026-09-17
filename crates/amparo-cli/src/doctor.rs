@@ -310,7 +310,8 @@ fn check_sessions(workspace: &Path, problems: &mut Vec<String>) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (mut running, mut complete, mut failed, mut corrupt) = (0usize, 0usize, 0usize, 0usize);
+    let (mut running, mut suspended, mut complete, mut failed, mut killed, mut corrupt) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     for path in files {
         let checkpoint = match std::fs::read_to_string(&path)
             .map_err(|e| e.to_string())
@@ -335,16 +336,22 @@ fn check_sessions(workspace: &Path, problems: &mut Vec<String>) {
                     ));
                 }
             }
+            // Track 2: suspended tasks are parked resume points, killed
+            // ones are terminal archives — both counted, never problems.
+            SessionStatus::Suspended => suspended += 1,
             SessionStatus::Complete => complete += 1,
             SessionStatus::Failed => failed += 1,
+            SessionStatus::Killed => killed += 1,
         }
     }
     println!(
-        "[doctor] sessions: {} checkpoint(s) ({} running, {} complete, {} failed, {} corrupt)",
-        running + complete + failed + corrupt,
+        "[doctor] sessions: {} checkpoint(s) ({} running, {} suspended, {} complete, {} failed, {} killed, {} corrupt)",
+        running + suspended + complete + failed + killed + corrupt,
         running,
+        suspended,
         complete,
         failed,
+        killed,
         corrupt
     );
 }

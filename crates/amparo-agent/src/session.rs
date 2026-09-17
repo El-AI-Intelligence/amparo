@@ -15,6 +15,19 @@
 //! The system prompt is never stored (I5): [`crate::Agent::resume`] re-prepends
 //! the current one, so a prompt change in a new build is what a resumed
 //! task sees, exactly like a fresh run.
+//!
+//! Famulus OS Track 2: the store also carries the task's lifecycle
+//! journal — one append-only JSONL file per task
+//! (`<task_id>.journal.jsonl`) holding the same marker names the kernel
+//! journals (`agent_started`, `agent_suspended`, `agent_resumed`,
+//! `agent_killed`, `budget_exhausted`). A suspend flips the snapshot to
+//! [`SessionStatus::Suspended`] and journals the marker (snapshot
+//! pointer + journal, like the kernel's `AgentHandle`); a resume
+//! reproduces the journal tail after the last suspend; a kill is a
+//! terminal `agent_killed` marker with the task's file retained for
+//! audit. The journal is the source of truth for lifecycle transitions —
+//! checkpoints are snapshots, *not* Engram memories (the
+//! session-boundaries sidecar decision stands).
 
 use crate::events::truncate;
 use amparo_inference::ChatMessage;
@@ -27,16 +40,39 @@ use std::path::{Path, PathBuf};
 /// changes; readers skip files with an unknown version.
 pub const CHECKPOINT_VERSION: u32 = 1;
 
+/// Lifecycle event names shared with the Famulus OS kernel (Track 2) —
+/// the same marker strings the kernel's journal uses, so one reader can
+/// consume amparo sessions and kernel agents alike.
+pub const AGENT_EVENT_STARTED: &str = "agent_started";
+/// Journaled by [`JsonCheckpointStore::suspend`] — the snapshot pointer.
+pub const AGENT_EVENT_SUSPENDED: &str = "agent_suspended";
+/// Journaled by [`crate::Agent::resume`] — carries the reproduced tail.
+pub const AGENT_EVENT_RESUMED: &str = "agent_resumed";
+/// Journaled by [`JsonCheckpointStore::kill`] — terminal, id retained.
+pub const AGENT_EVENT_KILLED: &str = "agent_killed";
+/// Journaled at the max-steps hard stop — exhaustion, not a crash.
+pub const AGENT_EVENT_BUDGET_EXHAUSTED: &str = "budget_exhausted";
+
 /// How a checkpointed task stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     /// The task is mid-loop — a resume point.
     Running,
+    /// The task was parked mid-loop by an explicit suspend (Famulus OS
+    /// Track 2). A `Suspended` checkpoint is a resume point exactly like
+    /// a `Running` one — the journal's `agent_suspended` marker records
+    /// the snapshot pointer.
+    Suspended,
     /// The task finished with a final answer.
     Complete,
     /// The task ended without one.
     Failed,
+    /// The task was terminated by an operator kill (Track 2) — terminal
+    /// like `Complete`/`Failed`, but the `agent_killed` marker
+    /// distinguishes it in the journal and the file is retained for
+    /// audit.
+    Killed,
 }
 
 /// A snapshot of the loop locals the agent carries between turns.
@@ -106,6 +142,30 @@ pub struct Checkpoint {
     pub final_answer: Option<String>,
 }
 
+/// One lifecycle transition in a task's journal (Famulus OS Track 2).
+///
+/// Appended one line per event to `<task_id>.journal.jsonl` next to the
+/// checkpoint file. The journal is the source of truth for lifecycle
+/// transitions — the checkpoint is the snapshot it annotates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleEvent {
+    /// 1-based position within the task's journal.
+    pub sequence: u64,
+    /// One of the [`AGENT_EVENT_*`] marker names.
+    pub event_type: String,
+    /// The task the marker belongs to — the agent handle; maps to the
+    /// kernel's `agent_id`.
+    pub task_id: String,
+    /// Marker-specific extras: a suspend pointer carries `steps_used`,
+    /// exhaustion carries `steps_used`/`max_steps`, a resume carries the
+    /// reproduced `tail_event_types`. Free-form so marker shapes can
+    /// evolve without a schema bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    /// Unix seconds when the marker was appended.
+    pub created_at: u64,
+}
+
 /// The checkpoint storage seam — the agent saves through it, hosts read
 /// through it. Every failure is an [`io::Error`]; the agent warns and
 /// continues (a checkpoint failure must never fail the task).
@@ -123,11 +183,36 @@ pub trait CheckpointStore: Send + Sync {
     fn latest_complete(&self, tenant: &str) -> Option<Checkpoint>;
 
     /// Every `Running` checkpoint for `tenant`, newest first — the
-    /// resume picker's list. The default returns at most one entry
-    /// ([`CheckpointStore::latest_incomplete`]); stores that can
-    /// enumerate their own files (the on-disk store) override it.
+    /// resume picker's list. `Suspended` tasks are resume points too
+    /// (Track 2), so they appear here as well. The default returns at
+    /// most one entry ([`CheckpointStore::latest_incomplete`]); stores
+    /// that can enumerate their own files (the on-disk store) override
+    /// it.
     fn list_incomplete(&self, tenant: &str) -> Vec<Checkpoint> {
         self.latest_incomplete(tenant).into_iter().collect()
+    }
+
+    /// Append one lifecycle marker to the task's journal (Famulus OS
+    /// Track 2). Returns the marker's 1-based journal sequence, or
+    /// `None` when this store has no journal surface — the default, so
+    /// in-memory doubles skip journaling exactly like a missing store
+    /// skips checkpoints.
+    fn journal_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_type: &str,
+        payload: Option<serde_json::Value>,
+    ) -> io::Result<Option<u64>> {
+        let _ = (tenant, task_id, event_type, payload);
+        Ok(None)
+    }
+
+    /// The task's lifecycle journal, oldest first (Track 2). Empty for
+    /// stores without a journal surface.
+    fn read_journal(&self, tenant: &str, task_id: &str) -> Vec<LifecycleEvent> {
+        let _ = (tenant, task_id);
+        Vec::new()
     }
 }
 
@@ -159,9 +244,9 @@ impl JsonCheckpointStore {
             .join(tenant.replace(':', "-"))
     }
 
-    /// Scan `tenant`'s directory for the newest checkpoint matching
-    /// `wanted`; corrupt or foreign files are skipped.
-    fn latest(&self, tenant: &str, wanted: SessionStatus) -> Option<Checkpoint> {
+    /// Scan `tenant`'s directory for the newest checkpoint with one of
+    /// the `wanted` statuses; corrupt or foreign files are skipped.
+    fn latest(&self, tenant: &str, wanted: &[SessionStatus]) -> Option<Checkpoint> {
         let dir = self.dir_for(tenant);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -187,7 +272,7 @@ impl JsonCheckpointStore {
                     continue;
                 }
             };
-            if checkpoint.status != wanted {
+            if !wanted.contains(&checkpoint.status) {
                 continue;
             }
             let better = newest
@@ -226,6 +311,136 @@ impl JsonCheckpointStore {
         fs::rename(&tmp, &final_path)?;
         Ok(())
     }
+
+    /// The task's journal file: `<task_id>.journal.jsonl` next to the
+    /// checkpoint (Famulus OS Track 2).
+    fn journal_file(&self, tenant: &str, task_id: &str) -> PathBuf {
+        self.dir_for(tenant).join(format!("{task_id}.journal.jsonl"))
+    }
+
+    /// Append one marker: count the lines already there (each line is
+    /// one event — a corrupt tail still counts, so sequences stay
+    /// monotonic), write the serialized event plus a newline with
+    /// `O_APPEND`, and harden the file owner-only on creation. A marker
+    /// is one short line, so a crash mid-append corrupts at most the
+    /// tail line — readers skip it.
+    fn append_journal(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_type: &str,
+        payload: Option<serde_json::Value>,
+    ) -> io::Result<u64> {
+        use std::io::Write;
+
+        let path = self.journal_file(tenant, task_id);
+        let dir = self.dir_for(tenant);
+        let created_dir = !dir.exists();
+        fs::create_dir_all(&dir)?;
+        // Harden only a directory this call created — a pre-existing
+        // parent is not ours to re-permission (audit 2026-08-31 MED-6),
+        // same rule as the checkpoint writer.
+        if created_dir {
+            amparo_privacy::perms::owner_only(&dir)?;
+        }
+        let sequence = match fs::read_to_string(&path) {
+            Ok(text) => text.lines().count() as u64 + 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 1,
+            Err(error) => return Err(error),
+        };
+        let event = LifecycleEvent {
+            sequence,
+            event_type: event_type.to_string(),
+            task_id: task_id.to_string(),
+            payload,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let mut line = serde_json::to_vec(&event)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        line.push(b'\n');
+        let created = !path.exists();
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(&line)?;
+        if created {
+            amparo_privacy::perms::owner_only(&path)?;
+        }
+        Ok(sequence)
+    }
+
+    /// Read the task's journal, oldest first. A corrupt or truncated
+    /// line (a crash mid-append) is skipped with a warn, never fatal.
+    fn read_journal_file(&self, tenant: &str, task_id: &str) -> Vec<LifecycleEvent> {
+        let path = self.journal_file(tenant, task_id);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) => return Vec::new(), // no journal file — no events
+        };
+        let mut events = Vec::new();
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<LifecycleEvent>(line) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    tracing::warn!(
+                        "[amparo-agent] skipping corrupt journal line {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        events
+    }
+
+    /// Suspend a task mid-loop (Famulus OS Track 2): the task's
+    /// checkpoint is re-saved with status `Suspended` — the snapshot
+    /// pointer — and the `agent_suspended` marker is journaled carrying
+    /// the snapshot's `steps_used`. A suspend of a task with no
+    /// checkpoint fails with [`io::ErrorKind::NotFound`], like the
+    /// kernel's unknown-agent error.
+    pub fn suspend(&self, tenant: &str, task_id: &str) -> io::Result<u64> {
+        let path = checkpoint_path(&self.root, tenant, task_id);
+        let text = fs::read_to_string(&path)?; // NotFound propagates
+        let mut checkpoint: Checkpoint = serde_json::from_str(&text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        checkpoint.status = SessionStatus::Suspended;
+        self.write(&checkpoint)?;
+        self.append_journal(
+            tenant,
+            task_id,
+            AGENT_EVENT_SUSPENDED,
+            Some(serde_json::json!({ "steps_used": checkpoint.loop_state.steps_used })),
+        )
+    }
+
+    /// Kill a task (Famulus OS Track 2): journal the terminal
+    /// `agent_killed` marker and re-save the checkpoint with status
+    /// `Killed`, so the snapshot stays on disk for audit — the id is
+    /// never reclaimed. Idempotent: a task whose journal already ends
+    /// in `agent_killed` is already dead and the call returns `None`
+    /// without appending. A kill of a task with no checkpoint fails
+    /// with [`io::ErrorKind::NotFound`], like the kernel's
+    /// unknown-agent error.
+    pub fn kill(&self, tenant: &str, task_id: &str) -> io::Result<Option<u64>> {
+        let path = checkpoint_path(&self.root, tenant, task_id);
+        let text = fs::read_to_string(&path)?; // NotFound propagates
+        if self
+            .read_journal_file(tenant, task_id)
+            .last()
+            .is_some_and(|event| event.event_type == AGENT_EVENT_KILLED)
+        {
+            return Ok(None); // already dead — no marker appended
+        }
+        let mut checkpoint: Checkpoint = serde_json::from_str(&text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        checkpoint.status = SessionStatus::Killed;
+        self.write(&checkpoint)?;
+        self.append_journal(tenant, task_id, AGENT_EVENT_KILLED, None).map(Some)
+    }
 }
 
 impl CheckpointStore for JsonCheckpointStore {
@@ -234,11 +449,16 @@ impl CheckpointStore for JsonCheckpointStore {
     }
 
     fn latest_incomplete(&self, tenant: &str) -> Option<Checkpoint> {
-        self.latest(tenant, SessionStatus::Running)
+        // Suspended tasks are resume points too (Track 2) — the resume
+        // picker lists them alongside Running ones.
+        self.latest(
+            tenant,
+            &[SessionStatus::Running, SessionStatus::Suspended],
+        )
     }
 
     fn latest_complete(&self, tenant: &str) -> Option<Checkpoint> {
-        self.latest(tenant, SessionStatus::Complete)
+        self.latest(tenant, &[SessionStatus::Complete])
     }
 
     fn list_incomplete(&self, tenant: &str) -> Vec<Checkpoint> {
@@ -267,7 +487,10 @@ impl CheckpointStore for JsonCheckpointStore {
                     continue;
                 }
             };
-            if checkpoint.status == SessionStatus::Running {
+            if matches!(
+                checkpoint.status,
+                SessionStatus::Running | SessionStatus::Suspended
+            ) {
                 running.push(checkpoint);
             }
         }
@@ -276,6 +499,30 @@ impl CheckpointStore for JsonCheckpointStore {
             (b.started_at, &b.task_id).cmp(&(a.started_at, &a.task_id))
         });
         running
+    }
+
+    fn journal_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_type: &str,
+        payload: Option<serde_json::Value>,
+    ) -> io::Result<Option<u64>> {
+        self.append_journal(tenant, task_id, event_type, payload)
+            .map(Some)
+    }
+
+    fn read_journal(&self, tenant: &str, task_id: &str) -> Vec<LifecycleEvent> {
+        self.read_journal_file(tenant, task_id)
+    }
+}
+
+impl JsonCheckpointStore {
+    /// The newest `Killed` checkpoint for `tenant`, if any — the audit
+    /// path for terminated tasks (Famulus OS Track 2): a killed task's
+    /// snapshot stays readable, its id never reclaimed.
+    pub fn latest_killed(&self, tenant: &str) -> Option<Checkpoint> {
+        self.latest(tenant, &[SessionStatus::Killed])
     }
 }
 
@@ -287,6 +534,25 @@ pub fn checkpoint_path(root: &Path, tenant: &str, task_id: &str) -> PathBuf {
         .join("sessions")
         .join(tenant.replace(':', "-"))
         .join(format!("{task_id}.json"))
+}
+
+/// The journal tail a resume reproduces (Famulus OS Track 2): the event
+/// types from the last `agent_suspended` marker onward — the marker
+/// trails the snapshot pointer, exactly like the kernel's journal, where
+/// a suspend captures the checkpoint first and the marker lands after
+/// it, inside the replay window. The kernel's resume reports the same
+/// tail from its event log; here the journal is the log. When the task
+/// was never suspended (a crash-resume from a `Running` snapshot), the
+/// whole journal is the tail — the marker list a reader replays to reach
+/// the current state.
+pub fn tail_after_last_suspend(events: &[LifecycleEvent]) -> Vec<String> {
+    let last_suspend = events
+        .iter()
+        .rposition(|event| event.event_type == AGENT_EVENT_SUSPENDED);
+    events[last_suspend.map_or(0, |index| index)..]
+        .iter()
+        .map(|event| event.event_type.clone())
+        .collect()
 }
 
 /// How many user/assistant messages the continuity context carries.
@@ -656,5 +922,230 @@ mod tests {
             "each message is truncated, so the string stays bounded: {}",
             context.len()
         );
+    }
+
+    // ── Famulus OS Track 2: lifecycle journal, suspend, kill ────────────────
+
+    fn lifecycle(sequence: u64, event_type: &str) -> LifecycleEvent {
+        LifecycleEvent {
+            sequence,
+            event_type: event_type.to_string(),
+            task_id: "sess-1".to_string(),
+            payload: None,
+            created_at: 100,
+        }
+    }
+
+    #[test]
+    fn journal_appends_in_order_and_reads_back() {
+        let root = temp_root("journal");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        let first = store
+            .journal_event(
+                "cli",
+                "sess-1",
+                AGENT_EVENT_STARTED,
+                Some(serde_json::json!({ "steps_total": 12 })),
+            )
+            .unwrap()
+            .expect("a journaled store returns the sequence");
+        assert_eq!(first, 1);
+        store
+            .journal_event("cli", "sess-1", AGENT_EVENT_SUSPENDED, None)
+            .unwrap();
+        store
+            .journal_event("cli", "sess-1", AGENT_EVENT_RESUMED, None)
+            .unwrap();
+
+        let events = store.read_journal("cli", "sess-1");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![AGENT_EVENT_STARTED, AGENT_EVENT_SUSPENDED, AGENT_EVENT_RESUMED]
+        );
+        assert_eq!(
+            events[0].payload.as_ref().and_then(|p| p.get("steps_total")),
+            Some(&serde_json::json!(12))
+        );
+        assert_eq!(events[0].task_id, "sess-1");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn suspend_flips_the_checkpoint_and_journals_the_pointer() {
+        let root = temp_root("suspend");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        let mut c = checkpoint("cli", "sess-1", 100, SessionStatus::Running);
+        c.loop_state.steps_used = 2;
+        store.save(&c).unwrap();
+
+        let sequence = store.suspend("cli", "sess-1").unwrap();
+        assert_eq!(sequence, 1);
+
+        // The parked snapshot is a resume point — with the suspend status
+        // visible, not a silent Running rewrite.
+        let got = store.latest_incomplete("cli").expect("a resume point");
+        assert_eq!(got.task_id, "sess-1");
+        assert_eq!(got.status, SessionStatus::Suspended);
+        let journal = store.read_journal("cli", "sess-1");
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].event_type, AGENT_EVENT_SUSPENDED);
+        assert_eq!(
+            journal[0].payload.as_ref().and_then(|p| p.get("steps_used")),
+            Some(&serde_json::json!(2)),
+            "the marker carries the snapshot pointer"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn suspend_of_an_unknown_task_errors() {
+        let store = JsonCheckpointStore::new(temp_root("suspend-missing"));
+        let error = store
+            .suspend("cli", "nobody")
+            .expect_err("an unknown task cannot suspend");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn kill_is_terminal_idempotent_and_retains_the_snapshot() {
+        let root = temp_root("kill");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        store
+            .save(&checkpoint("cli", "sess-1", 100, SessionStatus::Running))
+            .unwrap();
+
+        let first = store.kill("cli", "sess-1").unwrap().expect("first kill journals");
+        assert_eq!(first, 1);
+        // Terminal: no resume point remains, the audit snapshot does.
+        assert!(store.latest_incomplete("cli").is_none());
+        let killed = store.latest_killed("cli").expect("the killed snapshot");
+        assert_eq!(killed.status, SessionStatus::Killed);
+        assert_eq!(killed.task_id, "sess-1");
+
+        // A second kill is a no-op — no duplicate marker.
+        assert!(store.kill("cli", "sess-1").unwrap().is_none());
+        let journal = store.read_journal("cli", "sess-1");
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].event_type, AGENT_EVENT_KILLED);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kill_after_a_suspend_keeps_the_whole_trail() {
+        let root = temp_root("kill-suspended");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        store
+            .save(&checkpoint("cli", "sess-1", 100, SessionStatus::Running))
+            .unwrap();
+        store.suspend("cli", "sess-1").unwrap();
+        store.kill("cli", "sess-1").unwrap();
+
+        let journal = store.read_journal("cli", "sess-1");
+        assert_eq!(
+            journal
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![AGENT_EVENT_SUSPENDED, AGENT_EVENT_KILLED]
+        );
+        assert!(store.latest_incomplete("cli").is_none());
+        assert!(store.latest_killed("cli").is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kill_of_an_unknown_task_errors() {
+        let store = JsonCheckpointStore::new(temp_root("kill-missing"));
+        let error = store
+            .kill("cli", "nobody")
+            .expect_err("an unknown task cannot be killed");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_corrupt_journal_tail_is_skipped_on_read() {
+        let root = temp_root("corrupt-journal");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        store
+            .journal_event("cli", "sess-1", AGENT_EVENT_STARTED, None)
+            .unwrap();
+        // A crash mid-append leaves a truncated line — it must not hide
+        // the valid markers before it.
+        let path = root
+            .join(".amparo")
+            .join("sessions")
+            .join("cli")
+            .join("sess-1.journal.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("{\"sequence\":2,\"event_ty");
+        fs::write(&path, text).unwrap();
+
+        let events = store.read_journal("cli", "sess-1");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, AGENT_EVENT_STARTED);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tail_after_last_suspend_reports_events_after_the_pointer() {
+        let events = vec![
+            lifecycle(1, AGENT_EVENT_STARTED),
+            lifecycle(2, AGENT_EVENT_SUSPENDED),
+            lifecycle(3, AGENT_EVENT_RESUMED),
+            lifecycle(4, AGENT_EVENT_SUSPENDED),
+            lifecycle(5, AGENT_EVENT_BUDGET_EXHAUSTED),
+        ];
+        // The pointer is the LAST suspend, and the tail starts at the
+        // marker itself — it trails the snapshot, like the kernel's
+        // journal where the suspend marker lands after the capture.
+        assert_eq!(
+            tail_after_last_suspend(&events),
+            vec![AGENT_EVENT_SUSPENDED, AGENT_EVENT_BUDGET_EXHAUSTED]
+        );
+
+        // Never suspended: the whole journal is the tail (crash-resume).
+        let no_suspend = vec![lifecycle(1, AGENT_EVENT_STARTED)];
+        assert_eq!(
+            tail_after_last_suspend(&no_suspend),
+            vec![AGENT_EVENT_STARTED]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_journal_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("journal-perms");
+        let _ = fs::remove_dir_all(&root);
+        let store = JsonCheckpointStore::new(&root);
+        store
+            .journal_event("cli", "sess-1", AGENT_EVENT_STARTED, None)
+            .unwrap();
+        let path = root
+            .join(".amparo")
+            .join("sessions")
+            .join("cli")
+            .join("sess-1.journal.jsonl");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "journal file must be owner-only"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

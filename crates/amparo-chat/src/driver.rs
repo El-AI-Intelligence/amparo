@@ -2316,9 +2316,20 @@ mod tests {
         );
 
         // Both tasks checkpointed under the tenant — one format, both hosts.
+        // Track 2: each task also carries its lifecycle journal, so the
+        // dir holds one checkpoint + one journal per task.
         let session_dir = root.join("users/mock-user_1/.amparo/sessions/mock-user_1");
         let files: Vec<_> = std::fs::read_dir(&session_dir).unwrap().flatten().collect();
-        assert_eq!(files.len(), 2, "both tasks checkpointed: {files:?}");
+        let checkpoints = files
+            .iter()
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+            .count();
+        let journals = files
+            .iter()
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            .count();
+        assert_eq!(checkpoints, 2, "both tasks checkpointed: {files:?}");
+        assert_eq!(journals, 2, "each task journals its lifecycle: {files:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2389,17 +2400,27 @@ mod tests {
         );
 
         // Per-tenant session dirs: two checkpoints for user_a, one for
-        // user_b — the continuity scan reads only its own tenant.
+        // user_b — the continuity scan reads only its own tenant. Track 2
+        // pairs each checkpoint with its lifecycle journal, so count the
+        // `.json` checkpoints, not raw entries.
         let a_dir = root.join("users/mock-user_a/.amparo/sessions/mock-user_a");
         let b_dir = root.join("users/mock-user_b/.amparo/sessions/mock-user_b");
         let a_files: Vec<_> = std::fs::read_dir(&a_dir).unwrap().flatten().collect();
         let b_files: Vec<_> = std::fs::read_dir(&b_dir).unwrap().flatten().collect();
+        let a_checkpoints = a_files
+            .iter()
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+            .count();
+        let b_checkpoints = b_files
+            .iter()
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+            .count();
         assert_eq!(
-            a_files.len(),
+            a_checkpoints,
             2,
             "both of user_a's tasks checkpointed: {a_files:?}"
         );
-        assert_eq!(b_files.len(), 1, "user_b's task checkpointed: {b_files:?}");
+        assert_eq!(b_checkpoints, 1, "user_b's task checkpointed: {b_files:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -93,8 +93,9 @@ pub use preflight::{classify, classify_tier, BlastRadius};
 pub use principal::{mint_agent_id, ANONYMOUS_AGENT_ID};
 pub use qc::{QcCouncil, QcFinding, QcInput, QcReport, QcStats, QcVerdict};
 pub use session::{
-    continuity_context, Checkpoint, CheckpointStore, JsonCheckpointStore, LoopState, SessionStatus,
-    CONTINUITY_TAIL,
+    continuity_context, tail_after_last_suspend, Checkpoint, CheckpointStore, JsonCheckpointStore,
+    LifecycleEvent, LoopState, SessionStatus, AGENT_EVENT_BUDGET_EXHAUSTED, AGENT_EVENT_KILLED,
+    AGENT_EVENT_RESUMED, AGENT_EVENT_STARTED, AGENT_EVENT_SUSPENDED, CONTINUITY_TAIL,
 };
 pub use spawn::{SpawnAgentTool, SubAgentSummary, SPAWN_AGENT};
 pub use tokens::{estimate_tokens, format_cost_line};

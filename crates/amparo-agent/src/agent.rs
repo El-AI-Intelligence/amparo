@@ -24,7 +24,10 @@ use crate::cases::{evidence_section, CaseLibrary};
 use crate::events::{truncate, AgentEvent, EventSink, InMemoryEventSink};
 use crate::preflight::classify;
 use crate::qc::{qc_prompt_section, QcCouncil, QcInput};
-use crate::session::{Checkpoint, CheckpointStore, LoopState, SessionStatus};
+use crate::session::{
+    Checkpoint, CheckpointStore, LoopState, SessionStatus, AGENT_EVENT_BUDGET_EXHAUSTED,
+    AGENT_EVENT_RESUMED, AGENT_EVENT_STARTED,
+};
 use crate::spawn::{SpawnAgentTool, SPAWN_AGENT};
 use crate::sse::accumulate_turn;
 use crate::tokens::estimate_tokens;
@@ -871,6 +874,17 @@ impl Agent {
             tenant: self.checkpoint_tenant.clone(),
             started_at: now.as_secs(),
         };
+        // The lifecycle journal opens with the birth marker (Famulus OS
+        // Track 2) — the same event name the kernel journals, carrying
+        // this run's step budget.
+        self.journal_lifecycle(
+            &session,
+            AGENT_EVENT_STARTED,
+            Some(serde_json::json!({
+                "steps_total": self.config.max_steps,
+                "steps_remaining": self.config.max_steps,
+            })),
+        );
         self.run_loop(
             prompt,
             safe_prompt,
@@ -888,7 +902,9 @@ impl Agent {
     /// conversation is already PII-stripped (I6), so the checkpoint's
     /// prompt doubles as the safe prompt. The iteration budget is the
     /// remainder: `max_steps - steps_used`; an exhausted budget fails
-    /// with "Max steps reached" like any run.
+    /// with "Max steps reached" like any run. The lifecycle journal
+    /// records the resume (Famulus OS Track 2): `agent_resumed` carries
+    /// the tail it reproduced — every transition after the last suspend.
     pub async fn resume(&self, checkpoint: Checkpoint) -> AgentReport {
         let conversation = std::iter::once(ChatMessage::system(SYSTEM_PROMPT))
             .chain(checkpoint.conversation.into_iter())
@@ -898,6 +914,16 @@ impl Agent {
             task_id: checkpoint.task_id.clone(),
             steps_used: starting_steps,
         });
+        // The journal tail this resume reproduces (Famulus OS Track 2):
+        // every lifecycle transition after the last suspend marker. The
+        // checkpoint's tenant is authoritative — it is the resume point's
+        // home, exactly where persist_checkpoint writes.
+        let resume_tail = match &self.checkpoints {
+            Some(store) => crate::session::tail_after_last_suspend(
+                &store.read_journal(&checkpoint.tenant, &checkpoint.task_id),
+            ),
+            None => Vec::new(),
+        };
         let vars = LoopVars {
             steps: Vec::new(),
             last_tool_name: checkpoint.loop_state.last_tool_name,
@@ -924,6 +950,17 @@ impl Agent {
             tenant: Some(checkpoint.tenant),
             started_at: checkpoint.started_at,
         };
+        // The journal records the resume with the tail it reproduced
+        // (Famulus OS Track 2) — the kernel's resume reports the same
+        // shape from its event log.
+        self.journal_lifecycle(
+            &session,
+            AGENT_EVENT_RESUMED,
+            Some(serde_json::json!({
+                "steps_used": starting_steps,
+                "tail_event_types": resume_tail,
+            })),
+        );
         self.run_loop(
             checkpoint.prompt.clone(),
             checkpoint.prompt,
@@ -1780,6 +1817,18 @@ impl Agent {
         self.events.emit(&AgentEvent::TaskFailed {
             message: message.clone(),
         });
+        // Budget exhaustion is a journaled event, not a crash (Famulus
+        // OS Track 2) — the marker makes the max-steps hard stop visible
+        // in the lifecycle journal, and the Failed checkpoint below
+        // archives the snapshot.
+        self.journal_lifecycle(
+            &session,
+            AGENT_EVENT_BUDGET_EXHAUSTED,
+            Some(serde_json::json!({
+                "steps_used": steps_used,
+                "max_steps": self.config.max_steps,
+            })),
+        );
         self.persist_checkpoint(
             &session,
             SessionStatus::Failed,
@@ -1805,6 +1854,29 @@ impl Agent {
             verification,
             tokens_estimated,
             tool_calls,
+        }
+    }
+
+    /// Journal one lifecycle marker for the session (Famulus OS
+    /// Track 2): `agent_started` at a fresh run, `agent_resumed` at a
+    /// resume, `budget_exhausted` at the max-steps hard stop. With no
+    /// store or tenant attached this is a no-op, and a failing append
+    /// only warns — journaling must never fail the task (the checkpoint
+    /// doctrine).
+    fn journal_lifecycle(
+        &self,
+        session: &SessionHandle,
+        event_type: &str,
+        payload: Option<serde_json::Value>,
+    ) {
+        let (Some(store), Some(tenant)) = (&self.checkpoints, &session.tenant) else {
+            return;
+        };
+        if let Err(error) = store.journal_event(tenant, &session.task_id, event_type, payload) {
+            tracing::warn!(
+                "[amparo-agent] lifecycle journal failed for {}: {error}",
+                session.task_id
+            );
         }
     }
 
@@ -4034,6 +4106,10 @@ mod tests {
     // ── M7 W6: checkpoints and resume ────────────────────────────────────────
 
     use crate::JsonCheckpointStore;
+    use crate::{
+        AGENT_EVENT_BUDGET_EXHAUSTED, AGENT_EVENT_RESUMED, AGENT_EVENT_STARTED,
+        AGENT_EVENT_SUSPENDED,
+    };
 
     fn running_checkpoint(task_id: &str, steps_used: usize) -> Checkpoint {
         Checkpoint {
@@ -4251,6 +4327,129 @@ mod tests {
         assert!(events.snapshot().iter().any(
             |e| matches!(e, AgentEvent::TaskFailed { message } if message == "Max steps reached")
         ));
+    }
+
+    // ── Famulus OS Track 2: lifecycle journal wiring ────────────────────────
+
+    #[tokio::test]
+    async fn a_completed_run_journals_only_the_birth_marker() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+        let (registry, _) = echo_registry();
+        let root =
+            std::env::temp_dir().join(format!("amparo-agent-track2-complete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Arc::new(JsonCheckpointStore::new(&root));
+        let agent = Agent::new(provider, registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_checkpoints(store.clone(), "cli")
+            .with_task_id("sess-track2-complete");
+        let report = agent.run("hi").await;
+        assert_eq!(report.status, TaskStatus::Complete);
+
+        // A natural completion is an archive, not a kill — the journal
+        // holds the birth marker and nothing else.
+        let journal = store.read_journal("cli", "sess-track2-complete");
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].event_type, AGENT_EVENT_STARTED);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn run_journals_birth_and_exhaustion_markers() {
+        let provider = ScriptedProvider::new();
+        for i in 0..10 {
+            provider.push_chat(turn_tool_call(
+                &format!("call_{i}"),
+                "echo",
+                r#"{"message":"x"}"#,
+            ));
+        }
+        let (registry, _) = echo_registry();
+        let root =
+            std::env::temp_dir().join(format!("amparo-agent-track2-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Arc::new(JsonCheckpointStore::new(&root));
+        let config = AgentConfig {
+            max_steps: 2,
+            ..Default::default()
+        };
+        let agent = Agent::new(provider.clone(), registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_config(config)
+            .with_checkpoints(store.clone(), "cli")
+            .with_task_id("sess-track2-budget");
+        let report = agent.run("do a thing").await;
+        assert_eq!(report.status, TaskStatus::Failed);
+
+        let journal = store.read_journal("cli", "sess-track2-budget");
+        assert_eq!(
+            journal
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![AGENT_EVENT_STARTED, AGENT_EVENT_BUDGET_EXHAUSTED]
+        );
+        assert_eq!(
+            journal[0].payload.as_ref().and_then(|p| p.get("steps_total")),
+            Some(&serde_json::json!(2)),
+            "the birth marker carries the step budget"
+        );
+        assert_eq!(
+            journal[1].payload.as_ref().and_then(|p| p.get("max_steps")),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            journal[1].payload.as_ref().and_then(|p| p.get("steps_used")),
+            Some(&serde_json::json!(2))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resume_journals_the_resumed_marker_with_the_suspend_tail() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_text("Done."));
+        provider.push_verify("VERIFIED");
+        let (registry, _) = echo_registry();
+        let root =
+            std::env::temp_dir().join(format!("amparo-agent-track2-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Arc::new(JsonCheckpointStore::new(&root));
+
+        // Park the task mid-loop the way an operator suspend would: the
+        // store flips the snapshot and journals the suspend marker.
+        store.save(&running_checkpoint("sess-1", 2)).unwrap();
+        store.suspend("cli", "sess-1").unwrap();
+        let parked = store
+            .latest_incomplete("cli")
+            .expect("a parked task is a resume point");
+        assert_eq!(parked.status, SessionStatus::Suspended);
+
+        let agent = Agent::new(provider, registry, Arc::new(AllowAllPolicy))
+            .with_approval(Arc::new(AutoApprove))
+            .with_checkpoints(store.clone(), "cli");
+        let report = agent.resume(parked).await;
+        assert_eq!(report.status, TaskStatus::Complete);
+
+        let journal = store.read_journal("cli", "sess-1");
+        assert_eq!(
+            journal
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![AGENT_EVENT_SUSPENDED, AGENT_EVENT_RESUMED]
+        );
+        assert_eq!(
+            journal[1]
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("tail_event_types")),
+            Some(&serde_json::json!([AGENT_EVENT_SUSPENDED])),
+            "the resume reports the tail it reproduced"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── M7 W8: chat continuity ─────────────────────────────────────────────
