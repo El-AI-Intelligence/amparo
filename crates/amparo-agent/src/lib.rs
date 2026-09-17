@@ -66,6 +66,7 @@ pub mod events;
 pub mod fanout_approval;
 pub mod ledger_sink;
 pub mod preflight;
+pub mod principal;
 pub mod qc;
 pub mod session;
 pub mod spawn;
@@ -89,6 +90,7 @@ pub use events::{
 };
 pub use ledger_sink::{LedgerSink, NETWORK_TOOLS};
 pub use preflight::{classify, classify_tier, BlastRadius};
+pub use principal::{mint_agent_id, ANONYMOUS_AGENT_ID};
 pub use qc::{QcCouncil, QcFinding, QcInput, QcReport, QcStats, QcVerdict};
 pub use session::{
     continuity_context, Checkpoint, CheckpointStore, JsonCheckpointStore, LoopState, SessionStatus,

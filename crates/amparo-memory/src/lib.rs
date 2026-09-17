@@ -176,6 +176,12 @@ pub struct ContextSlot {
     pub metadata: serde_json::Value,
     /// When the slot was created, used for stable ordering.
     pub created_at: DateTime<Utc>,
+    /// Optional kernel-minted agent principal (`agent:<fnv1a-hex>`) whose
+    /// session produced this slot (WIRE-SPEC §11). Absent for slots with no
+    /// agent attribution; old serialized slots without the field read as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 impl ContextSlot {
@@ -196,6 +202,7 @@ impl ContextSlot {
             source,
             metadata: serde_json::json!({}),
             created_at: Utc::now(),
+            agent_id: None,
         }
     }
 
@@ -208,6 +215,13 @@ impl ContextSlot {
     /// Attaches optional metadata to the slot.
     pub fn with_metadata(mut self, meta: serde_json::Value) -> Self {
         self.metadata = meta;
+        self
+    }
+
+    /// Attaches the kernel-minted agent principal this slot is attributed to
+    /// (`agent:<fnv1a-hex>`, WIRE-SPEC §11).
+    pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.agent_id = Some(agent_id.into());
         self
     }
 
@@ -459,6 +473,7 @@ fn compact_slot(slot: &ContextSlot) -> ContextSlot {
         source: ContextSource::CompactedHistory,
         metadata: slot.metadata.clone(),
         created_at: slot.created_at,
+        agent_id: slot.agent_id.clone(),
     }
 }
 
@@ -816,5 +831,40 @@ mod tests {
         let ctx = assembler.assemble(vec![]).unwrap();
         assert_eq!(ctx.slots.len(), 0);
         assert_eq!(ctx.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_agent_id_round_trips() {
+        // A kernel-minted principal rides the stored slot through serde
+        // unchanged, and survives compaction.
+        let slot = ContextSlot::new(ContextRole::User, "Hello!", ContextSource::CurrentTurn)
+            .with_agent_id("agent:6cabf493b1ddbd");
+        let json = serde_json::to_string(&slot).unwrap();
+        assert!(
+            json.contains("\"agent_id\":\"agent:6cabf493b1ddbd\""),
+            "the stored slot carries the agent id: {json}"
+        );
+        let back: ContextSlot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_id.as_deref(), Some("agent:6cabf493b1ddbd"));
+        assert_eq!(
+            compact_slot(&slot).agent_id.as_deref(),
+            Some("agent:6cabf493b1ddbd"),
+            "compaction keeps the attribution"
+        );
+    }
+
+    #[test]
+    fn test_absent_agent_id_stays_none() {
+        let slot = ContextSlot::new(ContextRole::User, "Hello!", ContextSource::CurrentTurn);
+        assert_eq!(slot.agent_id, None);
+        let json = serde_json::to_string(&slot).unwrap();
+        assert!(
+            !json.contains("agent_id"),
+            "absent agent ids are skipped, not stored as null: {json}"
+        );
+        // The skipped shape is byte-identical to a slot serialized before the
+        // field existed, so old stored slots deserialize as None.
+        let back: ContextSlot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_id, None);
     }
 }

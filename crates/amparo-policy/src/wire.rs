@@ -23,6 +23,11 @@ pub const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 60;
 pub const AUDIT_ONLY_MARKER: &str = "audit-only";
 
 /// The request body per the wire spec.
+///
+/// `agent_id` is the kernel-minted opaque principal (`agent:<fnv1a-hex>`)
+/// this check is attributed to. It is an additive field (WIRE-SPEC §11):
+/// callers never synthesize it client-side — it is derived from the kernel's
+/// own hash function — and unregistered callers send `"anonymous"` or omit it.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckRequest {
     /// The registry tool name (`run_command`, `write_file`, …).
@@ -41,6 +46,10 @@ pub struct CheckRequest {
     /// Optional session id attached to every check to correlate engine-side audit rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Optional kernel-minted agent principal (`agent:<fnv1a-hex>`) naming the
+    /// agent this check is attributed to (WIRE-SPEC §11).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 fn default_source() -> String {
@@ -84,6 +93,7 @@ pub struct WirePolicyEngine {
     base_url: String,
     api_key: Option<String>,
     session_id: Option<String>,
+    agent_id: Option<String>,
     timeout: Duration,
 }
 
@@ -99,6 +109,7 @@ impl WirePolicyEngine {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
             session_id: None,
+            agent_id: None,
             timeout: Duration::from_secs(DEFAULT_CHECK_TIMEOUT_SECS),
         }
     }
@@ -106,6 +117,13 @@ impl WirePolicyEngine {
     /// Attach a session id to every check (correlates engine-side audit rows).
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Attach a kernel-minted agent principal (`agent:<fnv1a-hex>`) to every
+    /// check (WIRE-SPEC §11; attributes engine-side audit rows to the agent).
+    pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.agent_id = Some(agent_id.into());
         self
     }
 
@@ -212,6 +230,7 @@ impl PolicyEngine for WirePolicyEngine {
             source: default_source(),
             blocking: false,
             session_id: self.session_id.clone(),
+            agent_id: self.agent_id.clone(),
         };
         match self.check(&request).await {
             Ok(resp) => self.map_decision(&resp),
@@ -481,6 +500,43 @@ mod tests {
         assert!(
             !raw[0].contains("session_id"),
             "absent session ids are skipped, not sent as null: {}",
+            raw[0]
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_id_flows_into_the_check_request() {
+        let (url, server, bodies) =
+            mock_engine_recording(&json!({"verdict":"allow","enforced":true}).to_string()).await;
+        let d = WirePolicyEngine::new(url, None)
+            .with_agent_id("agent:1a2b3c4d5e6f70")
+            .judge_tool("run_command", "ls", &[])
+            .await;
+        assert_eq!(d.verdict, PolicyVerdict::Allow);
+        let raw = bodies.lock().await;
+        assert_eq!(raw.len(), 1);
+        assert!(
+            raw[0].contains("\"agent_id\":\"agent:1a2b3c4d5e6f70\""),
+            "the check request carries the agent id: {}",
+            raw[0]
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_agent_id_omits_the_field() {
+        let (url, server, bodies) =
+            mock_engine_recording(&json!({"verdict":"allow","enforced":true}).to_string()).await;
+        let d = WirePolicyEngine::new(url, None)
+            .judge_tool("run_command", "ls", &[])
+            .await;
+        assert_eq!(d.verdict, PolicyVerdict::Allow);
+        let raw = bodies.lock().await;
+        assert_eq!(raw.len(), 1);
+        assert!(
+            !raw[0].contains("agent_id"),
+            "absent agent ids are skipped, not sent as null: {}",
             raw[0]
         );
         server.await.unwrap();

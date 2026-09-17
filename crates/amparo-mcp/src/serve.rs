@@ -11,8 +11,9 @@
 //! the terminal by default.
 
 use amparo_agent::{
-    format_event, valid_approval_endpoint, Agent, AgentConfig, AgentEvent, ApprovalGate,
-    AutoApprove, AutoDeny, EventSink, JsonCheckpointStore, SpawnAgentTool, WebApprovalGate,
+    format_event, mint_agent_id, valid_approval_endpoint, Agent, AgentConfig, AgentEvent,
+    ApprovalGate, AutoApprove, AutoDeny, EventSink, JsonCheckpointStore, SpawnAgentTool,
+    WebApprovalGate,
 };
 use amparo_inference::InferenceConfig;
 use amparo_policy::{
@@ -219,7 +220,9 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
             // given), and the audit-mode notice prints once per process.
             let engine = WirePolicyEngine::new(url.clone(), api_key);
             let engine = match &flags.session_id {
-                Some(id) => engine.with_session_id(id.clone()),
+                Some(id) => engine
+                    .with_session_id(id.clone())
+                    .with_agent_id(mint_agent_id(id)),
                 None => engine,
             };
             Arc::new(AuditNoticeEngine::new(engine))

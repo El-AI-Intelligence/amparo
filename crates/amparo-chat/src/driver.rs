@@ -401,15 +401,20 @@ impl ChatDriver {
 
     /// The policy engine for one task: the shared engine, or a fresh
     /// [`WirePolicyEngine`] session-tagged `platform:user_id` (correlates
-    /// engine-side audit rows with the chat user).
+    /// engine-side audit rows with the chat user) and carrying the
+    /// kernel-minted `agent_id` for that same session (WIRE-SPEC §11).
     fn task_policy(&self, chat: &ChatRef) -> Arc<dyn PolicyEngine> {
         match &self.policy_source {
             PolicySource::Shared(engine) => Arc::clone(engine),
-            PolicySource::Wire { base_url, api_key } => Arc::new(AuditNoticeEngine::with_flag(
-                WirePolicyEngine::new(base_url.clone(), api_key.clone())
-                    .with_session_id(format!("{}:{}", chat.platform, chat.user_id)),
-                Arc::clone(&self.audit_notice),
-            )),
+            PolicySource::Wire { base_url, api_key } => {
+                let session_id = format!("{}:{}", chat.platform, chat.user_id);
+                Arc::new(AuditNoticeEngine::with_flag(
+                    WirePolicyEngine::new(base_url.clone(), api_key.clone())
+                        .with_session_id(session_id.clone())
+                        .with_agent_id(amparo_agent::mint_agent_id(&session_id)),
+                    Arc::clone(&self.audit_notice),
+                ))
+            }
         }
     }
 

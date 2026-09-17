@@ -17,8 +17,8 @@
 //! stdout carries the final answer only; the report goes to stderr.
 
 use amparo_agent::{
-    format_cost_line, valid_approval_endpoint, Agent, AgentConfig, AgentReport, ApprovalGate,
-    AutoApprove, AutoDeny, CaseLibrary, CheckpointStore, EventSink, FanoutSink,
+    format_cost_line, mint_agent_id, valid_approval_endpoint, Agent, AgentConfig, AgentReport,
+    ApprovalGate, AutoApprove, AutoDeny, CaseLibrary, CheckpointStore, EventSink, FanoutSink,
     JsonCheckpointStore, LedgerSink, SpawnAgentTool, TaskStatus, WebApprovalGate,
 };
 use amparo_chat::{
@@ -738,7 +738,9 @@ pub(crate) async fn wire_with(
                 };
                 (
                     Arc::new(AuditNoticeEngine::with_printer(
-                        WirePolicyEngine::new(url.clone(), api_key).with_session_id(session_id),
+                        WirePolicyEngine::new(url.clone(), api_key)
+                            .with_session_id(session_id.clone())
+                            .with_agent_id(mint_agent_id(&session_id)),
                         Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         surface.notice,
                     )),
