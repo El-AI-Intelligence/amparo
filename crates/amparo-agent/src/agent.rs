@@ -457,6 +457,13 @@ pub struct Agent {
     /// delegation link. Provenance and display only — delegation never
     /// changes the gate (the one rule).
     parent_task_id: Option<String>,
+    /// The kernel-minted agent principal (M3) the host computed for the
+    /// wire session this agent runs under ([`crate::mint_agent_id`]) —
+    /// the same value the host's wire checks carry, journaled with each
+    /// lifecycle marker. `None` lets the loop fall back to minting from
+    /// the task id, which is only the wire session id itself in hosts
+    /// that pass no separate session.
+    agent_id: Option<String>,
     /// The one-shot continuity context the next fresh task receives
     /// (M7 W8): built by the host from the tenant's latest complete
     /// checkpoint, injected as one user-role message between the system
@@ -479,6 +486,10 @@ struct SessionHandle {
     /// The parent task's id when this task is a sub-agent (M8) —
     /// persisted into checkpoints so the chain survives a resume.
     parent_task_id: Option<String>,
+    /// The kernel-minted agent principal (M3) for this session — the
+    /// same value every wire check for the session carries, journaled
+    /// with each lifecycle marker so the journal names the agent.
+    agent_id: Option<String>,
     tenant: Option<String>,
     started_at: u64,
 }
@@ -587,6 +598,7 @@ impl Agent {
             checkpoint_tenant: None,
             task_id: None,
             parent_task_id: None,
+            agent_id: None,
             continuity: None,
             qc: QcCouncil::new(),
             config: AgentConfig::default(),
@@ -668,6 +680,18 @@ impl Agent {
     /// same loop, the same gate chain, the same ceiling (the one rule).
     pub fn with_parent_task_id(mut self, parent_task_id: impl Into<String>) -> Self {
         self.parent_task_id = Some(parent_task_id.into());
+        self
+    }
+
+    /// Stamp the lifecycle journal with the kernel-minted agent principal
+    /// (M3) the host computed for this run's wire session
+    /// ([`crate::mint_agent_id`]) — the same value the host's wire checks
+    /// carry, so the journal, ledger and notebook all name one principal.
+    /// `None` (the default) lets the loop fall back to minting from the
+    /// task id, which matches the wire only when the task id IS the wire
+    /// session id (the `amparo run` default and hosts with no session).
+    pub fn with_agent_id(mut self, agent_id: Option<String>) -> Self {
+        self.agent_id = agent_id;
         self
     }
 
@@ -865,11 +889,22 @@ impl Agent {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
+        let task_id = self
+            .task_id
+            .clone()
+            .unwrap_or_else(|| format!("sess-{}-{}", now.as_nanos(), std::process::id()));
         let session = SessionHandle {
-            task_id: self
-                .task_id
+            // The M3 stamp: the host-computed wire principal wins —
+            // when the host's wire session id is a different string
+            // from the task id (`--session-id`, chat's
+            // `platform:user_id`), the journal still names the
+            // principal the policy checks do. The task-id mint stays
+            // as the fallback for hosts that pass no session.
+            agent_id: self
+                .agent_id
                 .clone()
-                .unwrap_or_else(|| format!("sess-{}-{}", now.as_nanos(), std::process::id())),
+                .or_else(|| Some(crate::mint_agent_id(&task_id))),
+            task_id,
             parent_task_id: self.parent_task_id.clone(),
             tenant: self.checkpoint_tenant.clone(),
             started_at: now.as_secs(),
@@ -945,6 +980,14 @@ impl Agent {
             tool_calls: 0,
         };
         let session = SessionHandle {
+            // A resume keeps the host's principal when the host passed
+            // one (the CLI recomputes it from the same flags), so the
+            // journal names the same principal the original run did —
+            // even when that is not the task-id mint.
+            agent_id: self
+                .agent_id
+                .clone()
+                .or_else(|| Some(crate::mint_agent_id(&checkpoint.task_id))),
             task_id: checkpoint.task_id,
             parent_task_id: checkpoint.parent_task_id,
             tenant: Some(checkpoint.tenant),
@@ -1872,7 +1915,13 @@ impl Agent {
         let (Some(store), Some(tenant)) = (&self.checkpoints, &session.tenant) else {
             return;
         };
-        if let Err(error) = store.journal_event(tenant, &session.task_id, event_type, payload) {
+        if let Err(error) = store.journal_event(
+            tenant,
+            &session.task_id,
+            session.agent_id.as_deref(),
+            event_type,
+            payload,
+        ) {
             tracing::warn!(
                 "[amparo-agent] lifecycle journal failed for {}: {error}",
                 session.task_id

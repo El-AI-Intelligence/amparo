@@ -686,12 +686,19 @@ pub(crate) async fn wire_with(
     );
     let provider = config.build().map_err(|e| e.to_string())?;
 
+    // The M3 principal: minted once from the wire session id (the flag
+    // when given, the task id otherwise — the same string the wire
+    // checks below carry) and stamped on every journal surface, so the
+    // notebook, ledger, Engram captures and lifecycle markers all name
+    // the one principal the canonical engine judged.
+    let agent_id = mint_agent_id(flags.session_id.as_deref().unwrap_or(&parent_task_id));
+
     // The memory backend (M11 W1): resolved once per process — the
     // Engram adapter when configured and reachable, the built-in store
     // otherwise (with one `[memory]` warning on the degrade path). The
     // banner names the store that actually resolved, never the one that
     // was merely requested.
-    let memory = resolve_memory_backend().await;
+    let memory = resolve_memory_backend(Some(agent_id.clone())).await;
     let memory_desc = match memory.name() {
         "engram" => {
             let url = std::env::var("AMPARO_ENGRAM_URL")
@@ -877,7 +884,7 @@ pub(crate) async fn wire_with(
                 skills = Some(library);
             }
         }
-        Some(Arc::new(NotebookSink::new(store, "cli")))
+        Some(Arc::new(NotebookSink::new(store, "cli", Some(agent_id.clone()))))
     } else {
         None
     };
@@ -898,6 +905,7 @@ pub(crate) async fn wire_with(
             "cli",
             Some(parent_task_id.clone()),
             None,
+            Some(agent_id.clone()),
         ))),
         Err(e) => {
             (surface.line)(&format!(
@@ -941,6 +949,7 @@ pub(crate) async fn wire_with(
         // chain share one id, so children chain off the parent's real
         // session id.
         .with_task_id(parent_task_id.clone())
+        .with_agent_id(Some(agent_id.clone()))
         .with_config(agent_config);
     if let Some(library) = case_library {
         agent = agent.with_case_library(library);
@@ -988,6 +997,7 @@ pub(crate) async fn wire_with(
         &workspace_root,
         Arc::clone(&memory),
         surface.clone(),
+        agent_id.clone(),
     )
     .await;
 
@@ -1060,6 +1070,7 @@ async fn scan_schedules(
     workspace_root: &std::path::Path,
     memory: Arc<dyn Memory>,
     surface: Surface,
+    agent_id: String,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let store = Arc::new(JsonScheduleStore::new(schedule_dir(workspace_root)));
     let tasks: Vec<ScheduledTask> = store
@@ -1097,9 +1108,11 @@ async fn scan_schedules(
         let root = workspace_root.to_path_buf();
         let memory = Arc::clone(&memory);
         let surface = surface.clone();
+        let agent_id = agent_id.clone();
         handles.push(tokio::spawn(async move {
             fire_promise(
-                provider, policy, approval, &flags, &root, store, memory, surface, task,
+                provider, policy, approval, &flags, &root, store, memory, surface, agent_id,
+                task,
             )
             .await;
         }));
@@ -1124,6 +1137,7 @@ async fn fire_promise(
     store: Arc<JsonScheduleStore>,
     memory: Arc<dyn Memory>,
     surface: Surface,
+    agent_id: String,
     mut task: ScheduledTask,
 ) {
     let fire_id = new_task_id();
@@ -1139,6 +1153,11 @@ async fn fire_promise(
             "cli",
             Some(fire_id.clone()),
             None,
+            // The fire runs under the operator's wire engine, whose
+            // checks carry the parent run's session principal — so
+            // the rows stamp that same principal, the one the
+            // canonical engine actually judged.
+            Some(agent_id.clone()),
         ))),
         Err(e) => {
             (surface.line)(&format!(
@@ -1165,6 +1184,7 @@ async fn fire_promise(
         .with_path_policy(Arc::new(PathPolicy::from_env()))
         .with_checkpoints(Arc::new(JsonCheckpointStore::new(workspace_root)), "cli")
         .with_task_id(fire_id)
+        .with_agent_id(Some(agent_id))
         .with_config(AgentConfig {
             trust_ceiling: flags.trust_ceiling,
             ..AgentConfig::default()

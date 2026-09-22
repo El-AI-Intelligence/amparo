@@ -336,7 +336,7 @@ pub async fn build_driver(
     // Engram adapter when configured and reachable, the built-in store
     // otherwise. The allowlist arm shares this registry; the directory
     // arm's per-task registries get the same store from the driver.
-    let memory = resolve_memory_backend().await;
+    let memory = resolve_memory_backend(None).await;
     let mut registry = default_registry_with_memory(Arc::clone(&memory));
     // M7b: the sandbox tool is host-registered, like use_skill. This
     // registry is also the driver's legacy shared registry, so the

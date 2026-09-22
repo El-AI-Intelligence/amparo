@@ -66,6 +66,10 @@ struct SinkState {
 pub struct NotebookSink {
     store: Arc<dyn Memory>,
     tenant_id: String,
+    /// The kernel-minted agent principal (M3): stamped on every record
+    /// this sink writes, so a record answers "which agent ran this"
+    /// beside its tenant.
+    agent_id: Option<String>,
     /// The in-flight task states, outermost first: a sub-agent's
     /// `TaskStarted` pushes on top of its parent's still-buffering state,
     /// so interleaved events feed the task they belong to (M8).
@@ -78,10 +82,15 @@ impl NotebookSink {
     ///
     /// The host must run the agent loop inside a tokio runtime — the record
     /// write is spawned onto one.
-    pub fn new(store: Arc<dyn Memory>, tenant_id: impl Into<String>) -> Self {
+    pub fn new(
+        store: Arc<dyn Memory>,
+        tenant_id: impl Into<String>,
+        agent_id: Option<String>,
+    ) -> Self {
         Self {
             store,
             tenant_id: tenant_id.into(),
+            agent_id,
             state: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
         }
@@ -125,6 +134,7 @@ impl NotebookSink {
         let record = RunRecord {
             version: 1,
             tenant_id: self.tenant_id.clone(),
+            agent_id: self.agent_id.clone(),
             started_at: state.started_at,
             duration_ms: state.started_instant.elapsed().as_millis() as u64,
             task_text: stripped_task.clone(),
@@ -276,7 +286,7 @@ mod tests {
 
     fn sink(tenant: &str) -> (Arc<NotebookSink>, Arc<InMemoryStore>) {
         let store = Arc::new(InMemoryStore::new());
-        let sink = Arc::new(NotebookSink::new(store.clone() as Arc<dyn Memory>, tenant));
+        let sink = Arc::new(NotebookSink::new(store.clone() as Arc<dyn Memory>, tenant, None));
         (sink, store)
     }
 
@@ -591,6 +601,7 @@ mod tests {
         let sink = Arc::new(NotebookSink::new(
             Arc::new(FailingStore) as Arc<dyn Memory>,
             "cli",
+            None,
         ));
         start(&sink, "task");
         sink.emit(&AgentEvent::TaskComplete {

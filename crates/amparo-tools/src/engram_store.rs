@@ -34,6 +34,11 @@ pub struct EngramStore {
     client: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    /// The kernel-minted agent principal (M3) whose memory writes this
+    /// adapter performs — sent as the capture payload's `agent_id`, so
+    /// engramd stores the writing agent beside the row. `None` at hosts
+    /// that resolve the backend before a session exists.
+    agent_id: Option<String>,
 }
 
 impl EngramStore {
@@ -61,7 +66,19 @@ loopback address)"
             client,
             base_url,
             api_key,
+            agent_id: None,
         }
+    }
+
+    /// Stamp every capture this adapter makes with `agent_id` (M3) — the
+    /// kernel-minted principal ([`amparo_agent::mint_agent_id`]) of the
+    /// session doing the writing. engramd's `POST /memories` body carries
+    /// `agent_id` natively (its `CaptureBody` field of the same name), so
+    /// the stamp is a first-class column, not a header side-channel.
+    /// `None` leaves the field off the payload entirely.
+    pub fn with_agent_id(mut self, agent_id: Option<String>) -> Self {
+        self.agent_id = agent_id;
+        self
     }
 
     /// Probes the daemon's `GET /health`. [`resolve_memory_backend`]
@@ -149,9 +166,15 @@ impl Memory for EngramStore {
     }
 
     async fn store(&self, content: String) -> Result<String, String> {
+        // The M3 stamp rides only when a session minted one: an absent
+        // `agent_id` is left off rather than sent as null.
+        let mut body = serde_json::json!({ "content": content });
+        if let Some(agent_id) = &self.agent_id {
+            body["agent_id"] = serde_json::json!(agent_id);
+        }
         let resp = self
             .post("memories")
-            .json(&serde_json::json!({ "content": content }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| format!("engram store failed: {e}"))?;
@@ -213,13 +236,13 @@ pub(crate) fn non_loopback_http(url: &str) -> bool {
 /// When Engram is selected but the daemon is unreachable, one `[memory]`
 /// warning is printed and the built-in store stands in — Engram is
 /// recommended, never required, and its absence must never strand a run.
-pub async fn resolve_memory_backend() -> Arc<dyn Memory> {
+pub async fn resolve_memory_backend(agent_id: Option<String>) -> Arc<dyn Memory> {
     if std::env::var("AMPARO_MEMORY_BACKEND").ok().as_deref() != Some("engram") {
         return Arc::new(InMemoryStore::new());
     }
     let url = std::env::var("AMPARO_ENGRAM_URL").unwrap_or_else(|_| DEFAULT_ENGRAM_URL.to_string());
     let key = std::env::var("AMPARO_ENGRAM_KEY").ok();
-    let store = EngramStore::new(url, key);
+    let store = EngramStore::new(url, key).with_agent_id(agent_id);
     if store.probe().await {
         Arc::new(store)
     } else {
@@ -358,6 +381,48 @@ mod tests {
                 .store("remember this".into())
                 .await,
             Ok("mem-1".to_string())
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn store_stamps_the_minted_agent_id_on_the_capture_body() {
+        // M3: the capture carries the kernel-minted agent principal as
+        // engramd's own `agent_id` field, so the vault row names the
+        // agent that wrote it — not just the tenant.
+        let (url, handle) = mock_engramd(|raw| {
+            assert!(
+                raw.contains("\"agent_id\":\"agent:6cabf493b1ddbd\""),
+                "agent_id not stamped on the capture: {raw}"
+            );
+            (200, mem("mem-2", "deploys to hetzner", "2026-08-31T00:00:00Z"))
+        })
+        .await;
+        assert_eq!(
+            EngramStore::new(url, None)
+                .with_agent_id(Some("agent:6cabf493b1ddbd".to_string()))
+                .store("deploys to hetzner".into())
+                .await,
+            Ok("mem-2".to_string())
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn store_omits_agent_id_when_no_session_minted_one() {
+        // A host that resolved the backend before a session existed
+        // sends no stamp at all — an absent field, never a null one.
+        let (url, handle) = mock_engramd(|raw| {
+            assert!(
+                !raw.contains("agent_id"),
+                "unexpected agent_id on an unstamped capture: {raw}"
+            );
+            (200, mem("mem-3", "no session", "2026-08-31T00:00:00Z"))
+        })
+        .await;
+        assert_eq!(
+            EngramStore::new(url, None).store("no session".into()).await,
+            Ok("mem-3".to_string())
         );
         handle.abort();
     }

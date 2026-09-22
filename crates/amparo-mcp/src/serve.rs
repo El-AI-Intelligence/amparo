@@ -243,7 +243,7 @@ pub async fn run(flags: ServeFlags) -> Result<(), ServeError> {
     // The memory backend (M11 W1): the Engram adapter when configured
     // and reachable, the built-in store otherwise (with one `[memory]`
     // warning on the degrade path).
-    let memory = resolve_memory_backend().await;
+    let memory = resolve_memory_backend(None).await;
     let mut registry: ToolRegistry = default_registry_with_memory(memory);
     // M7b: eval_wasm is served over MCP too; approval defaults to
     // AutoDeny here, so it is refused until an operator allows.

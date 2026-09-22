@@ -156,6 +156,10 @@ pub struct LifecycleEvent {
     /// The task the marker belongs to — the agent handle; maps to the
     /// kernel's `agent_id`.
     pub task_id: String,
+    /// The kernel-minted agent principal this task maps to (M3) — the
+    /// wire `agent_id` of the agent whose lifecycle the marker records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// Marker-specific extras: a suspend pointer carries `steps_used`,
     /// exhaustion carries `steps_used`/`max_steps`, a resume carries the
     /// reproduced `tail_event_types`. Free-form so marker shapes can
@@ -201,10 +205,11 @@ pub trait CheckpointStore: Send + Sync {
         &self,
         tenant: &str,
         task_id: &str,
+        agent_id: Option<&str>,
         event_type: &str,
         payload: Option<serde_json::Value>,
     ) -> io::Result<Option<u64>> {
-        let _ = (tenant, task_id, event_type, payload);
+        let _ = (tenant, task_id, agent_id, event_type, payload);
         Ok(None)
     }
 
@@ -328,6 +333,7 @@ impl JsonCheckpointStore {
         &self,
         tenant: &str,
         task_id: &str,
+        agent_id: Option<&str>,
         event_type: &str,
         payload: Option<serde_json::Value>,
     ) -> io::Result<u64> {
@@ -352,6 +358,7 @@ impl JsonCheckpointStore {
             sequence,
             event_type: event_type.to_string(),
             task_id: task_id.to_string(),
+            agent_id: agent_id.map(|id| id.to_string()),
             payload,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -409,9 +416,14 @@ impl JsonCheckpointStore {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         checkpoint.status = SessionStatus::Suspended;
         self.write(&checkpoint)?;
+        // No session is in scope on this store-level entry point: the
+        // suspend is keyed by (tenant, task_id) alone, and the wire
+        // session id is not always the task id (chat mints from
+        // `platform:user_id`), so no M3 stamp is invented here.
         self.append_journal(
             tenant,
             task_id,
+            None,
             AGENT_EVENT_SUSPENDED,
             Some(serde_json::json!({ "steps_used": checkpoint.loop_state.steps_used })),
         )
@@ -439,7 +451,10 @@ impl JsonCheckpointStore {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         checkpoint.status = SessionStatus::Killed;
         self.write(&checkpoint)?;
-        self.append_journal(tenant, task_id, AGENT_EVENT_KILLED, None).map(Some)
+        // As with suspend: no session here, so the M3 stamp stays
+        // absent rather than guessed.
+        self.append_journal(tenant, task_id, None, AGENT_EVENT_KILLED, None)
+            .map(Some)
     }
 }
 
@@ -505,10 +520,11 @@ impl CheckpointStore for JsonCheckpointStore {
         &self,
         tenant: &str,
         task_id: &str,
+        agent_id: Option<&str>,
         event_type: &str,
         payload: Option<serde_json::Value>,
     ) -> io::Result<Option<u64>> {
-        self.append_journal(tenant, task_id, event_type, payload)
+        self.append_journal(tenant, task_id, agent_id, event_type, payload)
             .map(Some)
     }
 
@@ -931,6 +947,7 @@ mod tests {
             sequence,
             event_type: event_type.to_string(),
             task_id: "sess-1".to_string(),
+            agent_id: None,
             payload: None,
             created_at: 100,
         }
@@ -945,6 +962,7 @@ mod tests {
             .journal_event(
                 "cli",
                 "sess-1",
+                Some("agent:6cabf493b1ddbd"),
                 AGENT_EVENT_STARTED,
                 Some(serde_json::json!({ "steps_total": 12 })),
             )
@@ -952,10 +970,10 @@ mod tests {
             .expect("a journaled store returns the sequence");
         assert_eq!(first, 1);
         store
-            .journal_event("cli", "sess-1", AGENT_EVENT_SUSPENDED, None)
+            .journal_event("cli", "sess-1", None, AGENT_EVENT_SUSPENDED, None)
             .unwrap();
         store
-            .journal_event("cli", "sess-1", AGENT_EVENT_RESUMED, None)
+            .journal_event("cli", "sess-1", None, AGENT_EVENT_RESUMED, None)
             .unwrap();
 
         let events = store.read_journal("cli", "sess-1");
@@ -978,6 +996,9 @@ mod tests {
             Some(&serde_json::json!(12))
         );
         assert_eq!(events[0].task_id, "sess-1");
+        // The M3 stamp round-trips through the journal file.
+        assert_eq!(events[0].agent_id.as_deref(), Some("agent:6cabf493b1ddbd"));
+        assert_eq!(events[1].agent_id, None);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1082,7 +1103,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let store = JsonCheckpointStore::new(&root);
         store
-            .journal_event("cli", "sess-1", AGENT_EVENT_STARTED, None)
+            .journal_event("cli", "sess-1", None, AGENT_EVENT_STARTED, None)
             .unwrap();
         // A crash mid-append leaves a truncated line — it must not hide
         // the valid markers before it.
@@ -1134,7 +1155,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let store = JsonCheckpointStore::new(&root);
         store
-            .journal_event("cli", "sess-1", AGENT_EVENT_STARTED, None)
+            .journal_event("cli", "sess-1", None, AGENT_EVENT_STARTED, None)
             .unwrap();
         let path = root
             .join(".amparo")

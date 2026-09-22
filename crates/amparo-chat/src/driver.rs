@@ -547,7 +547,15 @@ impl ChatDriver {
             // promotion could miss this task's record (M6e).
             let notebook_sink: Option<Arc<NotebookSink>> = notebook
                 .as_ref()
-                .map(|store| Arc::new(NotebookSink::new(Arc::clone(store), tenant_key.clone())));
+                .map(|store| {
+                    Arc::new(NotebookSink::new(
+                        Arc::clone(store),
+                        tenant_key.clone(),
+                        // The chat's session id is `platform:user_id` —
+                        // the same string `task_policy` mints from.
+                        Some(amparo_agent::mint_agent_id(&tenant_key)),
+                    ))
+                });
             // The host names the task (M8): the ledger's stamp and the
             // swarm chain share one id, so a child's rows chain off the
             // parent's real session id.
@@ -566,6 +574,7 @@ impl ChatDriver {
                     tenant_key.clone(),
                     Some(task_id.clone()),
                     None,
+                    Some(amparo_agent::mint_agent_id(&tenant_key)),
                 ))),
                 Err(e) => {
                     eprintln!(
@@ -588,8 +597,10 @@ impl ChatDriver {
                 .latest_complete(&tenant_key)
                 .and_then(|checkpoint| continuity_context(&checkpoint));
             // The case-library closure below moves `tenant_key` — keep a
-            // copy for the checkpoint tenant tag.
+            // copy for the checkpoint tenant tag and one for the M3
+            // principal the lifecycle journal stamps.
             let checkpoint_tenant = tenant_key.clone();
+            let agent_id = amparo_agent::mint_agent_id(&tenant_key);
             let mut sinks: Vec<Arc<dyn EventSink>> = vec![chat_sink];
             if let Some(nb) = &notebook_sink {
                 sinks.push(Arc::clone(nb) as Arc<dyn EventSink>);
@@ -704,6 +715,7 @@ impl ChatDriver {
                 // through the tenant-tagged store; the continuity context
                 // (if any) carries the prior task's tail into this one.
                 .with_checkpoints(checkpoint_store, checkpoint_tenant.clone())
+                .with_agent_id(Some(agent_id))
                 .with_continuity(continuity);
             if let Some(privacy) = privacy {
                 agent = agent.with_privacy(privacy);
@@ -987,6 +999,14 @@ impl ChatDriver {
                 task.tenant.clone(),
                 Some(new_task_id()),
                 None,
+                // The fire runs under the chat's wire policy, whose
+                // checks carry the `platform:user_id` principal — the
+                // rows stamp that same principal, the one the
+                // canonical engine actually judged.
+                Some(amparo_agent::mint_agent_id(&format!(
+                    "{}:{}",
+                    chat.platform, chat.user_id
+                ))),
             ))),
             Err(e) => {
                 eprintln!(
@@ -1032,6 +1052,13 @@ impl ChatDriver {
             .with_approval(gate)
             .with_path_policy(Arc::clone(&path_policy))
             .with_checkpoints(checkpoint_store, task.tenant.clone())
+            // The fire runs under the chat's wire policy, which carries
+            // the `platform:user_id` principal — the lifecycle journal
+            // stamps that same principal.
+            .with_agent_id(Some(amparo_agent::mint_agent_id(&format!(
+                "{}:{}",
+                chat.platform, chat.user_id
+            ))))
             .with_config(AgentConfig {
                 trust_ceiling,
                 ..AgentConfig::default()

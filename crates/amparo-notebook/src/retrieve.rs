@@ -148,6 +148,7 @@ mod tests {
         let record = RunRecord {
             version: 1,
             tenant_id: tenant.to_string(),
+            agent_id: None,
             started_at: started_at.to_string(),
             duration_ms: 1000,
             task_text: task.to_string(),

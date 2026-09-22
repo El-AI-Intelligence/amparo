@@ -29,6 +29,10 @@ pub struct RunRecord {
     /// The namespace this record belongs to (I2). The chat driver tags
     /// `platform:user_id`; the CLI tags `cli`.
     pub tenant_id: String,
+    /// The kernel-minted agent principal that ran this task (M3).
+    /// Absent on records written before M3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// When the task began, RFC 3339 (UTC).
     pub started_at: String,
     /// Wall-clock duration of the whole task, in milliseconds, measured by
@@ -237,6 +241,7 @@ mod tests {
         let record = RunRecord {
             version: 1,
             tenant_id: "cli".to_string(),
+            agent_id: None,
             started_at: "2026-08-28T00:00:00Z".to_string(),
             duration_ms: 12,
             task_text: "do the thing".to_string(),

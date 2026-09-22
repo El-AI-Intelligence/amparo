@@ -809,6 +809,7 @@ mod tests {
             "tenant",
             Some("sess-123".to_string()),
             None,
+            None,
         ));
         let sink: Arc<dyn EventSink> = Arc::new(FanoutSink::new(vec![
             Arc::clone(&events) as Arc<dyn EventSink>,

@@ -57,6 +57,10 @@ pub struct LedgerSink {
     /// The parent task id (M8): the delegation chain, stamped on every
     /// row beside `task_id`.
     parent_task_id: Option<String>,
+    /// The kernel-minted agent principal (M3): the "which agent"
+    /// answer stamped on every row beside the task chain, so a swarm's
+    /// ledger separates two agents that share a tenant.
+    agent_id: Option<String>,
     /// The running-task frames, innermost last (M8 W4): the sink is
     /// shared by a parent and every child it spawns, so each row is
     /// stamped from the frame of the agent whose call executed — a
@@ -71,17 +75,22 @@ impl LedgerSink {
     /// A sink appending rows tagged with `tenant_id` through `store`.
     /// `task_id`/`parent_task_id` (M8) stamp the delegation chain on
     /// every row — `None` at the single-task hosts that generate no ids.
+    /// `agent_id` (M3) is the kernel-minted agent principal
+    /// ([`crate::mint_agent_id`]) that ran the task, stamped on every
+    /// row beside the chain — `None` where the host knows no session.
     pub fn new(
         store: LedgerStore,
         tenant_id: impl Into<String>,
         task_id: Option<String>,
         parent_task_id: Option<String>,
+        agent_id: Option<String>,
     ) -> Self {
         Self {
             store,
             tenant_id: tenant_id.into(),
             task_id,
             parent_task_id,
+            agent_id,
             frames: Mutex::new(Vec::new()),
             calls: Mutex::new(HashMap::new()),
             warn_on_write: AtomicBool::new(false),
@@ -210,6 +219,7 @@ impl EventSink for LedgerSink {
                             tenant: self.tenant_id.clone(),
                             task_id,
                             parent_task_id,
+                            agent_id: self.agent_id.clone(),
                             kind: LedgerKind::NetworkCall,
                             tool: Some(tracker.tool),
                             site: tracker.site,
@@ -229,6 +239,7 @@ impl EventSink for LedgerSink {
                         tenant: self.tenant_id.clone(),
                         task_id,
                         parent_task_id,
+                        agent_id: self.agent_id.clone(),
                         kind: LedgerKind::NetworkCall,
                         tool: Some(tracker.tool),
                         site: tracker.site,
@@ -246,6 +257,7 @@ impl EventSink for LedgerSink {
                     tenant: self.tenant_id.clone(),
                     task_id,
                     parent_task_id,
+                    agent_id: self.agent_id.clone(),
                     kind: LedgerKind::PiiStrip,
                     tool: None,
                     site: None,
@@ -295,7 +307,7 @@ mod tests {
 
     fn sink(dir: &PathBuf) -> LedgerSink {
         let store = LedgerStore::open(dir.join("ledger.jsonl")).unwrap();
-        LedgerSink::new(store, "cli", None, None)
+        LedgerSink::new(store, "cli", None, None, None)
     }
 
     fn request(sink: &LedgerSink, id: &str, name: &str, args: serde_json::Value) {
@@ -472,6 +484,7 @@ mod tests {
             "cli",
             Some("sess-123.1".to_string()),
             Some("sess-123".to_string()),
+            Some("agent:test".to_string()),
         );
         request(
             &sink,
@@ -489,6 +502,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].task_id.as_deref(), Some("sess-123.1"));
         assert_eq!(rows[0].parent_task_id.as_deref(), Some("sess-123"));
+        // The M3 stamp rides beside the chain on every row.
+        assert_eq!(rows[0].agent_id.as_deref(), Some("agent:test"));
     }
 
     #[test]
@@ -499,7 +514,7 @@ mod tests {
         // them name the child's chain — not the parent's ids.
         let dir = temp_dir();
         let store = LedgerStore::open(dir.join("ledger.jsonl")).unwrap();
-        let sink = LedgerSink::new(store, "cli", Some("sess-123".to_string()), None);
+        let sink = LedgerSink::new(store, "cli", Some("sess-123".to_string()), None, None);
 
         request(
             &sink,
@@ -542,7 +557,7 @@ mod tests {
     fn grandchild_rows_name_the_full_chain_and_task_failed_pops() {
         let dir = temp_dir();
         let store = LedgerStore::open(dir.join("ledger.jsonl")).unwrap();
-        let sink = LedgerSink::new(store, "cli", Some("sess-123".to_string()), None);
+        let sink = LedgerSink::new(store, "cli", Some("sess-123".to_string()), None, None);
 
         sink.emit(&AgentEvent::TaskStarted {
             prompt: "child".into(),
@@ -584,7 +599,7 @@ mod tests {
         // spawned from the resumed task chains off the task itself.
         let dir = temp_dir();
         let store = LedgerStore::open(dir.join("ledger.jsonl")).unwrap();
-        let sink = LedgerSink::new(store, "cli", Some("sess-123".to_string()), None);
+        let sink = LedgerSink::new(store, "cli", Some("sess-123".to_string()), None, None);
 
         sink.emit(&AgentEvent::TaskResumed {
             task_id: "sess-123".to_string(),

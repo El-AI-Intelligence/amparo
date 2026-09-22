@@ -82,6 +82,11 @@ pub struct LedgerRow {
     /// tasks and pre-M8 rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    /// The kernel-minted agent principal (`agent:<fnv1a-hex>`, WIRE-SPEC
+    /// §11) that executed this row's call (M3) — the "which agent" answer
+    /// beside the task chain. Absent on rows written before M3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// The row's kind.
     pub kind: LedgerKind,
     /// `NetworkCall`: the tool name. `PiiStrip`: absent.
@@ -356,6 +361,7 @@ impl LedgerStore {
                     .unwrap_or_else(|| "ledger".to_string()),
                 task_id: None,
                 parent_task_id: None,
+                agent_id: None,
                 kind: LedgerKind::Rotated,
                 tool: None,
                 site: None,
@@ -496,6 +502,7 @@ mod tests {
             tenant: "cli".to_string(),
             task_id: None,
             parent_task_id: None,
+            agent_id: None,
             kind,
             tool: None,
             site: None,
