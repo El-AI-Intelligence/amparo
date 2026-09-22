@@ -324,14 +324,14 @@ use crate::filesystem::{EditFileTool, ListDirTool, PatchFileTool, ReadFileTool, 
 use crate::git::{
     GitBlameTool, GitBranchTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool,
 };
-use crate::memory::{Memory, MemorySearchTool};
+use crate::memory::{InMemoryStore, Memory, MemorySearchTool, MemoryWriteTool};
 use crate::notification::SendNotificationTool;
 use crate::paths::PathPolicy;
 use crate::shell::RunCommandTool;
 use crate::testing::RunTestsTool;
 use crate::web::{FetchUrlTool, WebSearchTool};
 
-/// Create the default registry with all 20 built-in tools, the 14
+/// Create the default registry with all 21 built-in tools, the 14
 /// workspace-bound ones rooted at `policy` — plus the blackboard, rooted
 /// at the policy's workspace root, and `send_notification` on its stderr
 /// default transport (hosts re-register it with their own seam).
@@ -349,7 +349,13 @@ pub fn default_registry_with_policy(policy: Arc<PathPolicy>) -> ToolRegistry {
     registry.register(Arc::new(EditFileTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(PatchFileTool::with_policy(Arc::clone(&policy))));
     registry.register(Arc::new(RunCommandTool::with_policy(Arc::clone(&policy))));
-    registry.register(Arc::new(MemorySearchTool::new()));
+    // Memory (read + write share ONE store — a write not the search tool
+    // made would be unfindable). The write tool PII-strips before
+    // persistence (I1/I3); the gate chain in amparo-agent decides whether
+    // a call executes.
+    let mem: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+    registry.register(Arc::new(MemorySearchTool::with_store(Arc::clone(&mem))));
+    registry.register(Arc::new(MemoryWriteTool::with_store(mem)));
     // The blackboard (M10): one store shared by both tools and, through
     // the registry clone handed to sub-agents, by the whole delegation
     // chain. Rooted at the workspace — the same policy every other
@@ -398,7 +404,8 @@ pub fn default_registry_with_policy_and_memory(
     memory: Arc<dyn Memory>,
 ) -> ToolRegistry {
     let mut registry = default_registry_with_policy(policy);
-    registry.register(Arc::new(MemorySearchTool::with_store(memory)));
+    registry.register(Arc::new(MemorySearchTool::with_store(Arc::clone(&memory))));
+    registry.register(Arc::new(MemoryWriteTool::with_store(memory)));
     registry
 }
 
@@ -507,6 +514,39 @@ mod tests {
                 required
             );
         }
+    }
+
+    #[tokio::test]
+    async fn memory_store_and_search_round_trip_one_store() {
+        let reg = default_registry();
+        let names: Vec<String> = reg.list_schemas().iter().map(|s| s.name.clone()).collect();
+        assert!(names.contains(&"memory_store".to_string()));
+        assert!(names.contains(&"memory_search".to_string()));
+
+        let store = reg.get_executor("memory_store").unwrap();
+        let search = reg.get_executor("memory_search").unwrap();
+        let write = store
+            .execute(&ToolCall {
+                id: "m1".to_string(),
+                name: "memory_store".to_string(),
+                arguments: serde_json::json!({"content": "registry round-trip 0x4D3"}),
+            })
+            .await;
+        assert!(write.success);
+
+        let hits = search
+            .execute(&ToolCall {
+                id: "m2".to_string(),
+                name: "memory_search".to_string(),
+                arguments: serde_json::json!({"query": "0x4D3"}),
+            })
+            .await;
+        assert!(hits.success);
+        assert_eq!(hits.output["count"], 1);
+        assert!(hits.output["results"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("0x4D3"));
     }
 
     #[tokio::test]
