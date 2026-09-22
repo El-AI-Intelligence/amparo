@@ -933,9 +933,41 @@ impl OpenAIProvider {
             .trim_end_matches('/')
             .to_string();
 
+        // Ollama's chat template wants tool-call arguments as a JSON
+        // object; the agent loop carries the OpenAI string form. Parse
+        // the string into an object at the wire so the echoed assistant
+        // history round-trips — ollama 400s on the escaped string.
+        let messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                let mut value =
+                    serde_json::to_value(m).unwrap_or(serde_json::Value::Null);
+                if let Some(tcs) = value
+                    .get_mut("tool_calls")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    for tc in tcs.iter_mut() {
+                        if let Some(f) = tc.get_mut("function") {
+                            if let Some(args) = f.get_mut("arguments") {
+                                if let Some(s) = args.as_str() {
+                                    if let Ok(parsed) =
+                                        serde_json::from_str::<serde_json::Value>(s)
+                                    {
+                                        *args = parsed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                value
+            })
+            .collect();
+
         let mut body = serde_json::json!({
             "model": model,
-            "messages": request.messages,
+            "messages": messages,
             "stream": true,
             "think": think,
             "options": {
@@ -978,7 +1010,8 @@ impl OpenAIProvider {
         //   {"message":{"role":"assistant","content":"!"},"done":false}\n
         //   {"done":true,"total_duration":...}\n
         //
-        // Convert to SSE format that the daemon/frontend expects:
+        // Tool calls ride `message.tool_calls` (arguments as a complete
+        // object). Convert to SSE format that the daemon/frontend expects:
         //   data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n
         //   data: {"choices":[{"delta":{"content":"!"}}]}\n\n
         //   data: [DONE]\n\n
@@ -988,6 +1021,11 @@ impl OpenAIProvider {
         let stream = resp.bytes_stream();
         let sse_stream = {
             let mut line_buf = String::new();
+            // Per-index record of the tool call already forwarded:
+            // (name sent, last arguments JSON string). Ollama can repeat
+            // a complete call on later lines; the dedup keeps the SSE
+            // consumer from double-accumulating.
+            let mut emitted_tool_calls: Vec<(bool, String)> = Vec::new();
             stream.flat_map(move |chunk_result| {
                 let mut sse_events: Vec<std::result::Result<bytes::Bytes, InferenceError>> =
                     Vec::new();
@@ -1019,9 +1057,103 @@ impl OpenAIProvider {
                                         .get("content")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
+                                    let mut delta = serde_json::json!({
+                                        "content": content
+                                    });
+                                    // Ollama carries the assistant's tool
+                                    // calls on `message.tool_calls`, with
+                                    // `arguments` as a complete object. The
+                                    // SSE consumer speaks OpenAI shape
+                                    // (index + string arguments), so
+                                    // translate here — this is the only
+                                    // place native tool calls survive the
+                                    // NDJSON→SSE conversion.
+                                    if let Some(tcs) = msg
+                                        .get("tool_calls")
+                                        .and_then(|v| v.as_array())
+                                    {
+                                        let mut tc_deltas: Vec<serde_json::Value> =
+                                            Vec::new();
+                                        for (pos, tc) in tcs.iter().enumerate() {
+                                            let Some(f) = tc.get("function") else {
+                                                continue;
+                                            };
+                                            let Some(name) =
+                                                f.get("name").and_then(|v| v.as_str())
+                                            else {
+                                                continue;
+                                            };
+                                            let args = match f.get("arguments") {
+                                                Some(serde_json::Value::String(s)) => {
+                                                    s.clone()
+                                                }
+                                                Some(v) => {
+                                                    serde_json::to_string(v)
+                                                        .unwrap_or_default()
+                                                }
+                                                None => String::new(),
+                                            };
+                                            let index = f
+                                                .get("index")
+                                                .and_then(|v| v.as_u64())
+                                                .or_else(|| {
+                                                    tc.get("index")
+                                                        .and_then(|v| v.as_u64())
+                                                })
+                                                .unwrap_or(pos as u64)
+                                                as usize;
+                                            while emitted_tool_calls.len() <= index {
+                                                emitted_tool_calls
+                                                    .push((false, String::new()));
+                                            }
+                                            let (name_sent, last_args) =
+                                                &mut emitted_tool_calls[index];
+                                            if *name_sent && *last_args == args {
+                                                continue;
+                                            }
+                                            let mut tc_delta = serde_json::Map::new();
+                                            tc_delta.insert(
+                                                "index".into(),
+                                                serde_json::json!(index),
+                                            );
+                                            if let Some(id) =
+                                                tc.get("id").and_then(|v| v.as_str())
+                                            {
+                                                tc_delta.insert(
+                                                    "id".into(),
+                                                    serde_json::json!(id),
+                                                );
+                                            }
+                                            let mut fn_delta = serde_json::Map::new();
+                                            if !*name_sent {
+                                                fn_delta.insert(
+                                                    "name".into(),
+                                                    serde_json::json!(name),
+                                                );
+                                                *name_sent = true;
+                                            }
+                                            if *last_args != args {
+                                                fn_delta.insert(
+                                                    "arguments".into(),
+                                                    serde_json::json!(args),
+                                                );
+                                                *last_args = args;
+                                            }
+                                            tc_delta.insert(
+                                                "function".into(),
+                                                serde_json::Value::Object(fn_delta),
+                                            );
+                                            tc_deltas
+                                                .push(serde_json::Value::Object(tc_delta));
+                                        }
+                                        if !tc_deltas.is_empty() {
+                                            delta["tool_calls"] =
+                                                serde_json::Value::Array(tc_deltas);
+                                        }
+                                    }
                                     let sse_payload = serde_json::json!({
                                         "choices": [{
-                                            "delta": { "content": content }
+                                            "delta": delta
                                         }]
                                     });
                                     let sse_line = format!(
@@ -1084,10 +1216,49 @@ impl InferenceProvider for OpenAIProvider {
                 )));
             }
             let native: serde_json::Value = self.response_json(response).await?;
-            // Normalize native response to OpenAI shape for uniform extraction below
+            // Normalize native response to OpenAI shape for uniform
+            // extraction below — tool calls ride `message.tool_calls` with
+            // `arguments` as an object, so flatten them to the string form
+            // OpenAI callers expect.
+            let mut message = serde_json::json!({
+                "content": native["message"]["content"].as_str().unwrap_or("")
+            });
+            if let Some(tcs) = native["message"]
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+            {
+                let mut norm: Vec<serde_json::Value> = Vec::new();
+                for tc in tcs {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("type".into(), serde_json::json!("function"));
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        entry.insert("id".into(), serde_json::json!(id));
+                    }
+                    let mut fn_entry = serde_json::Map::new();
+                    if let Some(f) = tc.get("function") {
+                        if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                            fn_entry.insert("name".into(), serde_json::json!(n));
+                        }
+                        let args = match f.get("arguments") {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(v) => {
+                                serde_json::to_string(v).unwrap_or_default()
+                            }
+                            None => String::new(),
+                        };
+                        fn_entry.insert("arguments".into(), serde_json::json!(args));
+                    }
+                    entry
+                        .insert("function".into(), serde_json::Value::Object(fn_entry));
+                    norm.push(serde_json::Value::Object(entry));
+                }
+                if !norm.is_empty() {
+                    message["tool_calls"] = serde_json::Value::Array(norm);
+                }
+            }
             serde_json::json!({
                 "choices": [{
-                    "message": { "content": native["message"]["content"].as_str().unwrap_or("") },
+                    "message": message,
                     "finish_reason": if native["done"].as_bool() == Some(true) { "stop" } else { "length" }
                 }],
                 "usage": {
@@ -2318,5 +2489,108 @@ mod tests {
         // OpenAI-shaped `response_format` never leaves here.
         assert!(body.get("format").is_some());
         assert!(body.get("response_format").is_none());
+    }
+
+    #[tokio::test]
+    async fn ollama_native_stream_translates_tool_calls_to_openai_deltas() {
+        // Real-world ollama NDJSON: content streams word-by-word, then the
+        // complete tool call lands on one line (arguments as an object),
+        // and a later line can repeat it. The converter must forward the
+        // call once, as an OpenAI-shaped delta with string arguments.
+        let response = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"on it\",",
+            "\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"index\":0,",
+            "\"name\":\"read_file\",\"arguments\":{\"path\":\"/a\"}}}]},",
+            "\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\",",
+            "\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"index\":0,",
+            "\"name\":\"read_file\",\"arguments\":{\"path\":\"/a\"}}}]},",
+            "\"done\":false}\n",
+            "{\"done\":true}\n",
+        );
+        let (url, _rx) = one_shot_http(response);
+        let provider = OpenAIProvider::new(
+            url,
+            String::new(),
+            "qwen3:4b".into(),
+            10,
+            None,
+            ProviderKind::OllamaNative,
+            false,
+        );
+        let stream = provider
+            .complete_chat_stream(chat_request_with_extras())
+            .await
+            .unwrap();
+
+        use futures_util::StreamExt;
+        let mut stream = stream;
+        let mut sse_frames: Vec<String> = Vec::new();
+        while let Some(item) = stream.next().await {
+            sse_frames.push(String::from_utf8_lossy(&item.unwrap()).to_string());
+        }
+
+        let tool_frames: Vec<&String> = sse_frames
+            .iter()
+            .filter(|f| f.contains("\"tool_calls\""))
+            .collect();
+        // The repeated line must not produce a second emission.
+        assert_eq!(tool_frames.len(), 1, "frames: {sse_frames:?}");
+        let data = tool_frames[0]
+            .trim()
+            .strip_prefix("data: ")
+            .unwrap()
+            .trim_end();
+        let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+        let delta = &payload["choices"][0]["delta"];
+        assert_eq!(delta["content"], "on it");
+        let tcs = delta["tool_calls"].as_array().unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["index"], 0);
+        assert_eq!(tcs[0]["id"], "call_1");
+        assert_eq!(tcs[0]["function"]["name"], "read_file");
+        assert_eq!(tcs[0]["function"]["arguments"], "{\"path\":\"/a\"}");
+        // The [DONE] terminator still arrives after the tool call.
+        assert!(sse_frames.last().unwrap().contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn ollama_native_stream_sends_arguments_as_objects_in_history() {
+        let (url, rx) = one_shot_http("data: [DONE]\n\n");
+        let provider = OpenAIProvider::new(
+            url,
+            String::new(),
+            "qwen3:4b".into(),
+            10,
+            None,
+            ProviderKind::OllamaNative,
+            false,
+        );
+        let mut request = chat_request_with_extras();
+        request.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(vec![AssistantToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"/a"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        let stream = provider.complete_chat_stream(request).await.unwrap();
+        drain(stream).await;
+        let (_, _, body) = captured_after_drain(&rx);
+        let msgs = body["messages"].as_array().unwrap();
+        let assistant = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .unwrap();
+        let args = &assistant["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_object(), "arguments must be an object: {args}");
+        assert_eq!(args["path"], "/a");
     }
 }
