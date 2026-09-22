@@ -189,7 +189,7 @@ mod tests {
     use amparo_tools::RollbackSpec;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// One connection = one request/response (the MockPolicy shape).
@@ -288,6 +288,7 @@ mod tests {
                 undo: "restore the previous contents of note.txt".to_string(),
                 markers: vec!["note.txt.amparo-bak".to_string()],
             }),
+            agent_id: None,
         }
     }
 
@@ -327,6 +328,29 @@ mod tests {
             "the gate polled until the decision: {}",
             gets.load(Ordering::SeqCst)
         );
+    }
+
+    #[tokio::test]
+    async fn post_carries_agent_id_on_the_wire() {
+        // F1 attribution pass-through: a minted principal is serialized
+        // into the POST body verbatim for the router to journal.
+        let seen = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&seen);
+        let server = Responder::start(move |line, body| {
+            if line.starts_with("POST") {
+                *captured.lock().unwrap() = body;
+                return (200, pending_ack());
+            }
+            (200, decided(true))
+        })
+        .await;
+        let gate = WebApprovalGate::new(server.url()).with_poll_interval(Duration::from_millis(5));
+        let mut request = request();
+        request.agent_id = Some("agent:a68243d36fde56".to_string());
+        assert!(gate.request(&request).await);
+        let body: Value =
+            serde_json::from_str(&seen.lock().unwrap()).expect("the POST body is JSON");
+        assert_eq!(body["agent_id"], "agent:a68243d36fde56");
     }
 
     #[tokio::test]

@@ -480,6 +480,7 @@ async fn rest_retries_429_and_carries_approval_components() {
         blast_radius: Some(BlastRadius::Network),
         session_label: None,
         rollback: None,
+        agent_id: None,
     };
 
     let msg = transport

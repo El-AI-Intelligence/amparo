@@ -196,6 +196,7 @@ mod tests {
             blast_radius: radius,
             session_label: None,
             rollback: None,
+            agent_id: None,
         }
     }
 

@@ -159,6 +159,7 @@ mod tests {
             blast_radius: Some(BlastRadius::Network),
             session_label: None,
             rollback: None,
+            agent_id: None,
         }
     }
 

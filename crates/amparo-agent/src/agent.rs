@@ -23,6 +23,7 @@ use crate::approval::{ApprovalGate, ApprovalRequest, AutoDeny};
 use crate::cases::{evidence_section, CaseLibrary};
 use crate::events::{truncate, AgentEvent, EventSink, InMemoryEventSink};
 use crate::preflight::classify;
+use crate::principal::ANONYMOUS_AGENT_ID;
 use crate::qc::{qc_prompt_section, QcCouncil, QcInput};
 use crate::session::{
     Checkpoint, CheckpointStore, LoopState, SessionStatus, AGENT_EVENT_BUDGET_EXHAUSTED,
@@ -2114,6 +2115,15 @@ impl Agent {
                 // the pre-call state, not the state the call itself is
                 // about to create.
                 rollback: self.registry.rollback_for(call),
+                // F1 attribution: the kernel-minted principal (M3) so
+                // the approval journal names who is asking. `None`
+                // when the host passed no session and for the
+                // anonymous principal — the router journals those
+                // callers as anonymous.
+                agent_id: self
+                    .agent_id
+                    .clone()
+                    .filter(|id| id != ANONYMOUS_AGENT_ID),
             };
             self.events.emit(&AgentEvent::ApprovalRequested {
                 call_id: call.id.clone(),
@@ -3265,6 +3275,47 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, AgentStep::ToolResult(r) if !r.success)));
+    }
+
+    #[tokio::test]
+    async fn approval_request_carries_the_agent_principal() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+
+        let (registry, _) = echo_registry();
+        let policy = RecordingPolicy::new(&[("echo", PolicyVerdict::Escalate)]);
+        let gate = RecordingGate::new(false);
+        let agent = Agent::new(provider.clone(), registry, policy)
+            .with_approval(gate.clone())
+            // F1 attribution: the host-computed wire principal rides
+            // the approval request into the journal.
+            .with_agent_id(Some("agent:a68243d36fde56".to_string()));
+
+        let _ = agent.run("do a thing").await;
+        let request = &gate.requests()[0];
+        assert_eq!(request.agent_id.as_deref(), Some("agent:a68243d36fde56"));
+    }
+
+    #[tokio::test]
+    async fn approval_request_omits_the_principal_when_unminted() {
+        let provider = ScriptedProvider::new();
+        provider.push_chat(turn_tool_call("call_1", "echo", r#"{"message":"hi"}"#));
+
+        let (registry, _) = echo_registry();
+        let policy = RecordingPolicy::new(&[("echo", PolicyVerdict::Escalate)]);
+        let gate = RecordingGate::new(false);
+        let agent = Agent::new(provider.clone(), registry, policy).with_approval(gate.clone());
+
+        let _ = agent.run("do a thing").await;
+        let request = &gate.requests()[0];
+        assert_eq!(request.agent_id, None);
+        // The wire omits the key entirely — the router journals these
+        // callers as anonymous.
+        let value = serde_json::to_value(request).expect("request serializes");
+        assert!(
+            value.get("agent_id").is_none(),
+            "no agent_id key on the wire when unminted"
+        );
     }
 
     #[tokio::test]

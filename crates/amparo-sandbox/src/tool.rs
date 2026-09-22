@@ -272,13 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_stays_at_20_without_eval_wasm() {
+    fn default_registry_stays_at_21_without_eval_wasm() {
         // eval_wasm is registered host-side only — the default registry
-        // is untouched by the sandbox crate. (20 = the 17 base tools
-        // plus the blackboard pair and send_notification, M10.)
+        // is untouched by the sandbox crate. (21 = the 17 base tools
+        // plus the blackboard pair, send_notification and memory_store,
+        // M3 defect #3.)
         let reg = default_registry();
         let schemas = reg.list_schemas();
-        assert_eq!(schemas.len(), 20, "default registry count changed");
+        assert_eq!(schemas.len(), 21, "default registry count changed");
         assert!(
             schemas.iter().all(|s| s.name != EVAL_WASM),
             "eval_wasm must not be in the default registry"

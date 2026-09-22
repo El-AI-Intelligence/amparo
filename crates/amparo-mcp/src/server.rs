@@ -314,6 +314,7 @@ impl McpServer {
                     blast_radius,
                     session_label: session_label.clone(),
                     rollback: rollback.clone(),
+                    agent_id: None,
                 };
                 if !self.approval.request(&request).await {
                     return fail(
@@ -339,6 +340,7 @@ impl McpServer {
                 blast_radius,
                 session_label,
                 rollback,
+                agent_id: None,
             };
             if !self.approval.request(&request).await {
                 return fail(

@@ -724,6 +724,7 @@ async fn adopt(name: &str, flags: &SkillFlags) -> Result<(), String> {
         blast_radius: None,
         session_label: None,
         rollback: None,
+        agent_id: None,
     };
     if !approval.request(&request).await {
         return Err(format!(

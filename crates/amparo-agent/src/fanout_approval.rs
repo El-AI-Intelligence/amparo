@@ -320,6 +320,7 @@ mod tests {
             blast_radius: Some(BlastRadius::Destructive),
             session_label: Some("sub-agent sess-123.1 of task sess-123".to_string()),
             rollback: None,
+            agent_id: None,
         }
     }
 

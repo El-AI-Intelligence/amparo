@@ -61,6 +61,15 @@ pub struct ApprovalRequest {
     /// never executes a rollback itself (that would be auto-policy,
     /// I1).
     pub rollback: Option<RollbackSpec>,
+    /// The kernel-minted agent principal (M3, Famulus F1 attribution):
+    /// who is asking — `agent:<fnv1a-hex>` — so the approval journal
+    /// can attribute the decision to the caller. `None` at the
+    /// non-agent construction sites and when the host passes no
+    /// session; the wire then omits the key and the router journals
+    /// the caller as anonymous. Display-only, like
+    /// [`ApprovalRequest::blast_radius`] — never a gate input (I1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// The approval seam.

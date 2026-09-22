@@ -3230,6 +3230,7 @@ mod tests {
             blast_radius: None,
             session_label: Some("sess-481".to_string()),
             rollback: None,
+            agent_id: None,
         }
     }
 

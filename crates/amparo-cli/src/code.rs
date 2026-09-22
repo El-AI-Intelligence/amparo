@@ -2483,6 +2483,7 @@ mod tests {
             blast_radius: None,
             session_label: None,
             rollback: None,
+            agent_id: None,
         }
     }
 
