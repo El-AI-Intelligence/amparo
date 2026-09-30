@@ -71,7 +71,7 @@ loopback address)"
     }
 
     /// Stamp every capture this adapter makes with `agent_id` (M3) — the
-    /// kernel-minted principal ([`amparo_agent::mint_agent_id`]) of the
+    /// kernel-minted principal (`amparo_agent::mint_agent_id`) of the
     /// session doing the writing. engramd's `POST /memories` body carries
     /// `agent_id` natively (its `CaptureBody` field of the same name), so
     /// the stamp is a first-class column, not a header side-channel.

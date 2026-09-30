@@ -151,7 +151,7 @@ pub struct Checkpoint {
 pub struct LifecycleEvent {
     /// 1-based position within the task's journal.
     pub sequence: u64,
-    /// One of the [`AGENT_EVENT_*`] marker names.
+    /// One of the `AGENT_EVENT_*` marker names.
     pub event_type: String,
     /// The task the marker belongs to — the agent handle; maps to the
     /// kernel's `agent_id`.
