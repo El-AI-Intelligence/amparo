@@ -1,0 +1,40 @@
+[Unit]
+Description=Amparo web surface (operator UI over the shipped amparo binary)
+Documentation=https://amparo.ellmstack.dev
+After=network.target
+
+[Service]
+Type=simple
+User=amparo
+Group=amparo
+# Bind loopback-only: TLS terminates at Caddy (amparo.ellmstack.dev).
+# The server spawns one `amparo run` per task (serialized per workspace);
+# the gate chain lives in that child process, never in this app.
+ExecStart=/usr/bin/node /srv/amparo/app/server.mjs
+# AMPARO_WEB_TOKEN (required), AMPARO_PORT, AMPARO_OPERATOR, and the
+# AMPARO_INFERENCE_* / AMPARO_POLICY_KEY values passed through to spawned
+# runs. 0600 root:amparo.
+EnvironmentFile=-/etc/amparo-web/amparo-web.env
+Restart=always
+RestartSec=5
+
+# ── Sandboxing (modeled on engramd-sync.service) ────────────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+# The workspace state root is the only writable path: tasks, checkpoints,
+# ledger, schedule and notebook all live under it.
+ReadWritePaths=/srv/amparo/workspaces
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# NOTE: no RestrictNamespaces — spawned `amparo run` sandboxes tool
+# subprocesses with namespaces (m7b). Everything else mirrors the sync relay.
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

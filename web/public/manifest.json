@@ -1,0 +1,9 @@
+{
+  "name": "Amparo — operator surface",
+  "short_name": "Amparo",
+  "description": "Operator surface for the Amparo agent — observatory, not a chatbot.",
+  "start_url": "/app",
+  "display": "standalone",
+  "background_color": "#0b0f14",
+  "theme_color": "#0b0f14"
+}

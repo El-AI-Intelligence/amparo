@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Amparo by EL AI Intelligence — operator surface</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#0b0f14">
+  <script src="/sw-reg.js" defer></script>
+</head>
+<body>
+  <header>
+    <div class="brand-group">
+      <a class="brand" href="/">Amparo<span class="cursor" aria-hidden="true">█</span></a>
+      <a class="brand-company" href="https://elai-intelligence.com" aria-label="EL AI Intelligence">
+        <img class="wm-dark" src="/img/elai-wordmark-white.png" alt="EL AI Intelligence">
+        <img class="wm-light" src="/img/elai-wordmark.png" alt="EL AI Intelligence">
+      </a>
+      <span class="subtitle">operator surface — observatory, not a chatbot</span>
+    </div>
+    <nav id="nav">
+      <a href="#/run" data-route="run">Run</a>
+      <a href="#/approvals" data-route="approvals">Approvals <span id="approval-badge" class="badge hidden"></span></a>
+      <a href="#/privacy" data-route="privacy">Privacy ledger</a>
+      <a href="#/sessions" data-route="sessions">Sessions</a>
+      <a href="#/schedule" data-route="schedule">Schedule</a>
+      <a href="#/notebook" data-route="notebook">Notebook</a>
+    </nav>
+  </header>
+
+  <section id="auth-gate" class="hidden">
+    <form id="token-form">
+      <label for="token-input">operator token</label>
+      <input id="token-input" type="password" autocomplete="off" required>
+      <button type="submit">connect</button>
+      <p id="token-error" class="error"></p>
+      <p class="note">Held in memory only — never stored. Re-enter after reload.</p>
+    </form>
+  </section>
+
+  <main id="view" class="hidden"></main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
